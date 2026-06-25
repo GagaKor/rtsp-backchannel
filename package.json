@@ -1,0 +1,21 @@
+{
+  "name": "onvif-backchannel-poc",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "ONVIF RTSP backchannel audio uplink PoC (MACS F7) — send G.711 audio to a camera speaker",
+  "scripts": {
+    "discover": "node --experimental-transform-types src/discover.ts",
+    "audiocheck": "node --experimental-transform-types src/audiocheck.ts",
+    "streams": "node --experimental-transform-types src/streams.ts",
+    "m1": "node --experimental-transform-types src/m1.ts",
+    "m3": "node --experimental-transform-types src/m3.ts",
+    "play": "node --experimental-transform-types src/cli.ts",
+    "test": "node --experimental-transform-types --test",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}

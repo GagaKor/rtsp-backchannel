@@ -1,0 +1,12 @@
+node_modules/
+*.log
+.DS_Store
+out/
+*.wav.g711
+
+# binaries / captures (not code)
+test.mp3
+*.mp3
+*.pcapng
+*.etl
+*.aiff
