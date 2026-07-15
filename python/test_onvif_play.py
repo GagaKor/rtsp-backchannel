@@ -123,10 +123,19 @@ class FakeRtsp:
 
 
 class FakeClock:
-    def __init__(self, now_ns=1_000_000_000, sleep_overshoot_ns=0):
+    def __init__(
+        self,
+        now_ns=1_000_000_000,
+        sleep_overshoot_ns=0,
+        *,
+        inject_on_sleep=None,
+        injected_overshoot_ns=0,
+    ):
         self.start_ns = now_ns
         self.now_ns = now_ns
         self.sleep_overshoot_ns = sleep_overshoot_ns
+        self.inject_on_sleep = inject_on_sleep
+        self.injected_overshoot_ns = injected_overshoot_ns
         self.sleeps = []
         self.sleep_deadlines_ns = []
 
@@ -141,8 +150,15 @@ class FakeClock:
 
     def sleep(self, seconds):
         self.sleeps.append(seconds)
+        injected_ns = (
+            self.injected_overshoot_ns
+            if len(self.sleeps) == self.inject_on_sleep
+            else 0
+        )
         self.now_ns += (
-            round(seconds * 1_000_000_000) + self.sleep_overshoot_ns
+            round(seconds * 1_000_000_000)
+            + self.sleep_overshoot_ns
+            + injected_ns
         )
         self.sleep_deadlines_ns.append(self.now_ns)
 
@@ -1170,6 +1186,96 @@ class RtpSenderMainTest(unittest.TestCase):
         )
         self.assertEqual(self.clock.now_ns - self.clock.start_ns, 30_000_000)
 
+    def test_rebase_timing_log_prevents_catch_up_and_preserves_timestamps(self):
+        clock = FakeClock(
+            inject_on_sleep=1, injected_overshoot_ns=45_000_000
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            timing_log = pathlib.Path(directory) / "send-timing.jsonl"
+            packets, _, _, _ = self.run_main(
+                "--ms", "80",
+                "--packet-ms", "20",
+                "--pacer", "rebase",
+                "--timing-log", str(timing_log),
+                clock=clock,
+            )
+            rows = [json.loads(line) for line in timing_log.read_text().splitlines()]
+
+        self.assertEqual(
+            [parse_rtp_packet(packet).timestamp for packet in packets],
+            [0x778899AA + index * 160 for index in range(4)],
+        )
+        self.assertEqual([row["packet_index"] for row in rows], list(range(4)))
+        self.assertEqual([row["samples"] for row in rows], [160] * 4)
+        self.assertEqual([row["sample_rate"] for row in rows], [8000] * 4)
+        self.assertEqual([row["packet_duration_ns"] for row in rows], [20_000_000] * 4)
+        self.assertEqual([row["pacer"] for row in rows], ["rebase"] * 4)
+        self.assertEqual([row["interval_ns"] for row in rows], [None, 65_000_000, 20_000_000, 20_000_000])
+        self.assertEqual([row["rebased"] for row in rows], [False, True, False, False])
+        self.assertEqual(rows[1]["target_monotonic_ns"], rows[1]["actual_monotonic_ns"])
+        self.assertEqual(rows[1]["lateness_ns"], 0)
+        rendered = json.dumps(rows)
+        self.assertNotIn("fake-user", rendered)
+        self.assertNotIn("fake-password", rendered)
+
+    def test_legacy_timing_log_demonstrates_immediate_catch_up(self):
+        clock = FakeClock(
+            inject_on_sleep=1, injected_overshoot_ns=45_000_000
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            timing_log = pathlib.Path(directory) / "send-timing.jsonl"
+            self.run_main(
+                "--ms", "80",
+                "--packet-ms", "20",
+                "--pacer", "legacy",
+                "--timing-log", str(timing_log),
+                clock=clock,
+            )
+            rows = [json.loads(line) for line in timing_log.read_text().splitlines()]
+
+        self.assertEqual(rows[1]["lateness_ns"], 45_000_000)
+        self.assertEqual(rows[2]["interval_ns"], 0)
+        self.assertEqual(rows[3]["interval_ns"], 0)
+        self.assertFalse(any(row["rebased"] for row in rows))
+
+    def test_timing_log_is_not_published_when_rtp_send_fails(self):
+        class FailingSendRtsp(FakeRtsp):
+            sends = 0
+
+            def send_interleaved(self, channel, payload):
+                if channel == 6:
+                    self.sends += 1
+                    if self.sends == 2:
+                        raise RuntimeError("injected RTP send failure")
+                super().send_interleaved(channel, payload)
+
+        with tempfile.TemporaryDirectory() as directory:
+            timing_log = pathlib.Path(directory) / "send-timing.jsonl"
+            timing_log.write_text("stale complete log\n")
+            with self.assertRaisesRegex(RuntimeError, "injected RTP send failure"):
+                self.run_main(
+                    "--ms", "40",
+                    "--timing-log", str(timing_log),
+                    rtsp_type=FailingSendRtsp,
+                )
+
+            self.assertFalse(timing_log.exists())
+            self.assertFalse(list(timing_log.parent.glob(f".{timing_log.name}.*.tmp")))
+
+    def test_invalid_arguments_remove_stale_timing_log_before_network(self):
+        with tempfile.TemporaryDirectory() as directory:
+            timing_log = pathlib.Path(directory) / "send-timing.jsonl"
+            timing_log.write_text("stale complete log\n")
+            with patch.object(onvif_play, "onvif_stream_uri") as resolver, \
+                    redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+                onvif_play.main([
+                    "--packet-ms", "0",
+                    "--timing-log", str(timing_log),
+                ])
+
+            resolver.assert_not_called()
+            self.assertFalse(timing_log.exists())
+
     def test_aac_packetization_is_isolated_from_g711_packet_controls(self):
         frames = [b"\x11\x22", b"\x33"]
 
@@ -1210,6 +1316,32 @@ class RtpSenderMainTest(unittest.TestCase):
                     report_timestamps,
                     [0x778899AA, (0x778899AA + 2048) & 0xFFFFFFFF],
                 )
+
+    def test_aac_uses_the_same_rebase_pacer_and_timing_schema(self):
+        clock = FakeClock(
+            inject_on_sleep=1, injected_overshoot_ns=150_000_000
+        )
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            onvif_play, "file_aac", return_value=[b"a", b"b", b"c"]
+        ):
+            timing_log = pathlib.Path(directory) / "aac-timing.jsonl"
+            packets, _, _, _ = self.run_main(
+                "--codec", "aac",
+                "--file", "fake.aac",
+                "--pacer", "rebase",
+                "--timing-log", str(timing_log),
+                rtsp_type=FakeAacRtsp,
+                clock=clock,
+            )
+            rows = [json.loads(line) for line in timing_log.read_text().splitlines()]
+
+        self.assertEqual([row["samples"] for row in rows], [1024] * 3)
+        self.assertTrue(rows[1]["rebased"])
+        self.assertEqual(rows[2]["interval_ns"], 128_000_000)
+        self.assertEqual(
+            [parse_rtp_packet(packet).timestamp for packet in packets],
+            [0x778899AA, 0x77889DAA, 0x7788A1AA],
+        )
 
     def test_rtcp_maps_first_periodic_and_final_reports_to_send_timeline(self):
         packets, reports, _, _ = self.run_main(
@@ -1294,6 +1426,34 @@ class RtpSenderMainTest(unittest.TestCase):
         self.assertEqual(
             fields[-1][6],
             (final_packet.timestamp + final_packet.payload_size) & 0xFFFFFFFF,
+        )
+
+    def test_rtcp_media_clock_excludes_rebased_wall_clock_gap(self):
+        clock = FakeClock(
+            inject_on_sleep=1, injected_overshoot_ns=45_000_000
+        )
+
+        packets, reports, _, _ = self.run_main(
+            "--ms", "80",
+            "--packet-ms", "20",
+            "--pacer", "rebase",
+            "--rtcp-interval", "0.01",
+            clock=clock,
+        )
+
+        self.assertEqual(len(packets), 4)
+        report_timestamps = [
+            struct.unpack_from("!BBHIIIIII", report)[6] for report in reports
+        ]
+        self.assertEqual(
+            report_timestamps,
+            [
+                0x778899AA,
+                0x778899AA + 160,
+                0x778899AA + 320,
+                0x778899AA + 480,
+                0x778899AA + 640,
+            ],
         )
 
     def test_rtcp_before_any_rtp_uses_initial_timestamp_and_zero_counters(self):
@@ -1381,7 +1541,11 @@ class RtpSenderMainTest(unittest.TestCase):
             resolver.assert_not_called()
             self.assertIn(message, stderr.getvalue())
 
-    def test_pacer_only_accepts_legacy(self):
+    def test_pacer_defaults_to_legacy_accepts_rebase_and_rejects_unknown_modes(self):
+        parser = onvif_play.build_argument_parser()
+        self.assertEqual(parser.parse_args([]).pacer, "legacy")
+        self.assertEqual(parser.parse_args(["--pacer", "rebase"]).pacer, "rebase")
+
         with patch.object(
             sys, "argv", ["onvif_play.py", "--pacer", "adaptive"]
         ), patch.object(onvif_play, "onvif_stream_uri") as resolver, \

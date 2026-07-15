@@ -9,6 +9,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
+from io import StringIO
 from unittest import mock
 
 from tools.capture_gst_backchannel import (
@@ -36,6 +38,8 @@ from tools.rtp_reference import (
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 RTP_REFERENCE = ROOT / "tools" / "rtp_reference.py"
 CAPTURE_TOOL = ROOT / "tools" / "capture_gst_backchannel.py"
+RUN_PACER_TOOL = ROOT / "tools" / "run_rtp_pacer.py"
+SUMMARIZE_TIMING_TOOL = ROOT / "tools" / "summarize_send_timing.py"
 
 
 def make_rtp_packet(
@@ -185,6 +189,452 @@ class RtpPacketizerTests(unittest.TestCase):
 
         self.assertEqual((packetizer.sequence, packetizer.timestamp), (2, 3))
         self.assertEqual(packetizer.ssrc, 1)
+
+
+class FakePacerClock:
+    def __init__(
+        self,
+        now_ns=1_000_000_000,
+        *,
+        overshoot_ns=0,
+        inject_on_sleep=None,
+        injected_overshoot_ns=0,
+    ):
+        self.start_ns = now_ns
+        self.now_ns = now_ns
+        self.overshoot_ns = overshoot_ns
+        self.inject_on_sleep = inject_on_sleep
+        self.injected_overshoot_ns = injected_overshoot_ns
+        self.sleeps = []
+
+    def monotonic_ns(self):
+        return self.now_ns
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        extra_ns = self.overshoot_ns
+        if len(self.sleeps) == self.inject_on_sleep:
+            extra_ns += self.injected_overshoot_ns
+        self.now_ns += round(seconds * 1_000_000_000) + extra_ns
+
+
+class RtpPacerTests(unittest.TestCase):
+    def setUp(self):
+        self.module = importlib.import_module("backchannel_rtp")
+        self.pacer_type = self.module.RtpPacer
+
+    def make_pacer(self, clock, mode="rebase", sample_rate=8000):
+        return self.pacer_type(
+            sample_rate,
+            mode=mode,
+            monotonic_ns=clock.monotonic_ns,
+            sleeper=clock.sleep,
+        )
+
+    def test_first_packet_is_immediate_and_fixed_packets_use_absolute_deadlines(self):
+        clock = FakePacerClock()
+        pacer = self.make_pacer(clock)
+
+        timings = [pacer.wait(160) for _ in range(4)]
+
+        self.assertEqual(
+            [timing.target_monotonic_ns - clock.start_ns for timing in timings],
+            [0, 20_000_000, 40_000_000, 60_000_000],
+        )
+        self.assertEqual(
+            [timing.actual_monotonic_ns - clock.start_ns for timing in timings],
+            [0, 20_000_000, 40_000_000, 60_000_000],
+        )
+        self.assertEqual(
+            [timing.interval_ns for timing in timings],
+            [None, 20_000_000, 20_000_000, 20_000_000],
+        )
+        self.assertEqual(clock.sleeps, [0.02, 0.02, 0.02])
+
+    def test_repeated_small_oversleeps_do_not_accumulate_drift(self):
+        clock = FakePacerClock(overshoot_ns=1_000_000)
+        pacer = self.make_pacer(clock)
+
+        timings = [pacer.wait(160) for _ in range(5)]
+
+        self.assertEqual(
+            [timing.target_monotonic_ns - clock.start_ns for timing in timings],
+            [0, 20_000_000, 40_000_000, 60_000_000, 80_000_000],
+        )
+        self.assertEqual(
+            [timing.actual_monotonic_ns - timing.target_monotonic_ns for timing in timings],
+            [0, 1_000_000, 1_000_000, 1_000_000, 1_000_000],
+        )
+        self.assertAlmostEqual(clock.sleeps[0], 0.02)
+        for sleep in clock.sleeps[1:]:
+            self.assertAlmostEqual(sleep, 0.019)
+
+    def test_legacy_catches_up_immediately_after_packet_1500_oversleep(self):
+        clock = FakePacerClock(
+            inject_on_sleep=1500, injected_overshoot_ns=45_000_000
+        )
+        pacer = self.make_pacer(clock, mode="legacy")
+
+        timings = [pacer.wait(160) for _ in range(1503)]
+
+        self.assertEqual(timings[1500].lateness_ns, 45_000_000)
+        self.assertFalse(timings[1500].rebased)
+        self.assertEqual(timings[1501].interval_ns, 0)
+        self.assertEqual(timings[1502].interval_ns, 0)
+
+    def test_rebase_prevents_immediate_catch_up_after_packet_1500_oversleep(self):
+        clock = FakePacerClock(
+            inject_on_sleep=1500, injected_overshoot_ns=45_000_000
+        )
+        pacer = self.make_pacer(clock, mode="rebase")
+
+        timings = [pacer.wait(160) for _ in range(1503)]
+
+        self.assertTrue(timings[1500].rebased)
+        self.assertEqual(timings[1500].lateness_ns, 0)
+        self.assertEqual(timings[1501].interval_ns, 20_000_000)
+        self.assertEqual(timings[1502].interval_ns, 20_000_000)
+
+    def test_variable_tail_finish_waits_exact_final_media_duration(self):
+        for mode in ("legacy", "rebase"):
+            with self.subTest(mode=mode):
+                clock = FakePacerClock()
+                pacer = self.make_pacer(clock, mode=mode)
+
+                first = pacer.wait(160)
+                tail = pacer.wait(40)
+                finished_ns = pacer.finish()
+
+                self.assertEqual(first.actual_monotonic_ns, clock.start_ns)
+                self.assertEqual(tail.actual_monotonic_ns - clock.start_ns, 20_000_000)
+                self.assertEqual(finished_ns - clock.start_ns, 25_000_000)
+                self.assertAlmostEqual(clock.sleeps[-1], 0.005)
+
+    def test_wall_clock_rebase_never_changes_rtp_timestamp_progression_or_wrap(self):
+        clock = FakePacerClock(
+            inject_on_sleep=1, injected_overshoot_ns=45_000_000
+        )
+        pacer = self.make_pacer(clock, mode="rebase")
+        packetizer = self.module.RtpPacketizer(
+            8, ssrc=1, sequence=2, timestamp=0xFFFFFF60
+        )
+
+        timestamps = []
+        for _ in range(4):
+            pacer.wait(160)
+            timestamps.append(parse_rtp_packet(packetizer.build(b"x", 160)).timestamp)
+
+        self.assertEqual(timestamps, [0xFFFFFF60, 0, 160, 320])
+        self.assertEqual(packetizer.timestamp, 480)
+
+    def test_rejects_invalid_rates_samples_modes_and_dependencies(self):
+        clock = FakePacerClock()
+        for rate in (0, -1, 8000.0, True):
+            with self.subTest(rate=rate), self.assertRaises((TypeError, ValueError)):
+                self.pacer_type(rate)
+        for mode in ("adaptive", "", None):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                self.pacer_type(8000, mode=mode)
+        with self.assertRaises(TypeError):
+            self.pacer_type(8000, monotonic_ns=1)
+        with self.assertRaises(TypeError):
+            self.pacer_type(8000, sleeper=1)
+
+        pacer = self.make_pacer(clock)
+        for samples in (0, -1, 1.5, True, 1 << 32):
+            with self.subTest(samples=samples), self.assertRaises((TypeError, ValueError)):
+                pacer.wait(samples)
+
+    def test_clock_moving_backward_fails_explicitly(self):
+        readings = iter((100, 99))
+        pacer = self.pacer_type(
+            8000,
+            monotonic_ns=lambda: next(readings),
+            sleeper=lambda _seconds: None,
+        )
+
+        pacer.wait(160)
+        with self.assertRaisesRegex(RuntimeError, "monotonic clock moved backward"):
+            pacer.wait(160)
+
+
+class RunRtpPacerToolTests(unittest.TestCase):
+    def setUp(self):
+        self.runner = importlib.import_module("tools.run_rtp_pacer")
+
+    def test_run_writes_fixed_sample_timestamps_and_injection_marker(self):
+        clock = FakePacerClock()
+        with tempfile.TemporaryDirectory() as directory:
+            output = pathlib.Path(directory) / "timing.jsonl"
+            rows = self.runner.run_pacer(
+                duration=0.08,
+                sample_rate=8000,
+                packet_samples=160,
+                mode="rebase",
+                inject_after_packet=0,
+                inject_ms=45,
+                output=output,
+                monotonic_ns=clock.monotonic_ns,
+                sleeper=clock.sleep,
+            )
+            published = [json.loads(line) for line in output.read_text().splitlines()]
+
+        self.assertEqual(published, rows)
+        self.assertEqual([row["packet_index"] for row in rows], [0, 1, 2, 3])
+        self.assertEqual([row["rtp_timestamp"] for row in rows], [0, 160, 320, 480])
+        self.assertEqual([row["samples"] for row in rows], [160] * 4)
+        self.assertEqual(rows[1]["injected_after_packet"], 0)
+        self.assertEqual(rows[1]["injected_oversleep_ns"], 45_000_000)
+        self.assertTrue(rows[1]["rebased"])
+        self.assertEqual(rows[2]["interval_ns"], 20_000_000)
+        self.assertEqual(clock.now_ns - clock.start_ns, 125_000_000)
+
+    def test_legacy_runner_records_catch_up_after_injection(self):
+        clock = FakePacerClock()
+        with tempfile.TemporaryDirectory() as directory:
+            rows = self.runner.run_pacer(
+                duration=0.08,
+                sample_rate=8000,
+                packet_samples=160,
+                mode="legacy",
+                inject_after_packet=0,
+                inject_ms=45,
+                output=pathlib.Path(directory) / "timing.jsonl",
+                monotonic_ns=clock.monotonic_ns,
+                sleeper=clock.sleep,
+            )
+
+        self.assertEqual(rows[1]["lateness_ns"], 45_000_000)
+        self.assertEqual(rows[2]["interval_ns"], 0)
+
+    def test_run_rejects_bounds_and_injection_pairs_before_publishing(self):
+        cases = (
+            ({"duration": 0}, "duration"),
+            ({"duration": 21601}, "duration"),
+            ({"sample_rate": 0}, "sample_rate"),
+            ({"packet_samples": 0}, "packet_samples"),
+            ({"duration": 1, "sample_rate": 1_000_001, "packet_samples": 1}, "packet count"),
+            ({"inject_after_packet": 0, "inject_ms": 0}, "inject_ms"),
+            ({"inject_after_packet": None, "inject_ms": 1}, "inject-after"),
+            ({"inject_after_packet": -1, "inject_ms": 1}, "inject-after"),
+            ({"inject_after_packet": 4, "inject_ms": 1}, "inject-after"),
+            ({"inject_after_packet": 0, "inject_ms": 60_001}, "inject_ms"),
+        )
+        defaults = {
+            "duration": 0.08,
+            "sample_rate": 8000,
+            "packet_samples": 160,
+            "mode": "legacy",
+            "inject_after_packet": None,
+            "inject_ms": 0,
+        }
+        for overrides, message in cases:
+            with self.subTest(overrides=overrides), tempfile.TemporaryDirectory() as directory:
+                output = pathlib.Path(directory) / "timing.jsonl"
+                output.write_text("stale\n")
+                arguments = {**defaults, **overrides, "output": output}
+                with self.assertRaisesRegex(ValueError, message):
+                    self.runner.run_pacer(**arguments)
+                self.assertFalse(output.exists())
+
+    def test_run_failure_removes_stale_output_and_temporary_file(self):
+        def failing_sleep(_seconds):
+            raise RuntimeError("sleep failed")
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = pathlib.Path(directory) / "timing.jsonl"
+            output.write_text("stale\n")
+            with self.assertRaisesRegex(RuntimeError, "sleep failed"):
+                self.runner.run_pacer(
+                    duration=0.04,
+                    sample_rate=8000,
+                    packet_samples=160,
+                    mode="legacy",
+                    inject_after_packet=None,
+                    inject_ms=0,
+                    output=output,
+                    sleeper=failing_sleep,
+                )
+
+            self.assertFalse(output.exists())
+            self.assertFalse(list(output.parent.glob(f".{output.name}.*.tmp")))
+
+    def test_direct_help_runs_without_pythonpath(self):
+        environment = os.environ.copy()
+        environment.pop("PYTHONPATH", None)
+        completed = subprocess.run(
+            [sys.executable, str(RUN_PACER_TOOL), "--help"],
+            cwd=ROOT,
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("--inject-after-packet", completed.stdout)
+        self.assertIn("--pacer", completed.stdout)
+
+
+class SummarizeSendTimingToolTests(unittest.TestCase):
+    def setUp(self):
+        self.summarizer = importlib.import_module("tools.summarize_send_timing")
+        self.runner = importlib.import_module("tools.run_rtp_pacer")
+
+    def make_rows(self, directory, mode):
+        clock = FakePacerClock()
+        return self.runner.run_pacer(
+            duration=0.08,
+            sample_rate=8000,
+            packet_samples=160,
+            mode=mode,
+            inject_after_packet=0,
+            inject_ms=45,
+            output=pathlib.Path(directory) / f"{mode}.jsonl",
+            monotonic_ns=clock.monotonic_ns,
+            sleeper=clock.sleep,
+        )
+
+    def test_summary_reports_required_metrics_and_rebase_passes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rows = self.make_rows(directory, "rebase")
+            summary = self.summarizer.summarize_timing(rows)
+
+        self.assertEqual(summary["packet_count"], 4)
+        self.assertEqual(summary["rtp_timestamp_delta_histogram"], {"160": 3})
+        self.assertEqual(
+            summary["interval_ns"],
+            {"min": 20_000_000, "p50": 20_000_000, "p95": 65_000_000,
+             "p99": 65_000_000, "max": 65_000_000},
+        )
+        self.assertEqual(
+            summary["absolute_deadline_error_ns"],
+            {"p50": 0, "p95": 0, "p99": 0, "max": 0},
+        )
+        self.assertEqual(summary["rebase_count"], 1)
+        self.assertEqual(summary["rebase_indexes"], [1])
+        self.assertEqual(summary["injected_interval_ns"]["p50"], 65_000_000)
+        self.assertEqual(summary["post_oversleep_interval_ns"]["p50"], 20_000_000)
+        self.assertEqual(
+            summary["checks"],
+            {
+                "no_unexpected_timestamp_deltas": True,
+                "no_post_severe_interval_below_75_percent": True,
+                "p99_deadline_error_within_bound": True,
+            },
+        )
+        self.assertEqual(summary["deadline_error_limit_ns"], 2_000_000)
+        self.assertTrue(summary["pass"])
+
+    def test_legacy_summary_exposes_catch_up_and_deadline_error_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rows = self.make_rows(directory, "legacy")
+            summary = self.summarizer.summarize_timing(rows)
+
+        self.assertEqual(summary["rebase_count"], 0)
+        self.assertEqual(summary["post_oversleep_interval_ns"]["min"], 0)
+        self.assertFalse(
+            summary["checks"]["no_post_severe_interval_below_75_percent"]
+        )
+        self.assertFalse(summary["checks"]["p99_deadline_error_within_bound"])
+        self.assertFalse(summary["pass"])
+
+    def test_timestamp_mismatch_and_configured_jitter_bound_are_reported(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rows = self.make_rows(directory, "rebase")
+        rows[2]["rtp_timestamp"] += 1
+        for row in rows:
+            row["configured_jitter_bound_ns"] = 3_000_000
+
+        summary = self.summarizer.summarize_timing(rows)
+
+        self.assertEqual(summary["deadline_error_limit_ns"], 4_000_000)
+        self.assertEqual(
+            summary["unexpected_timestamp_deltas"],
+            [
+                {"packet_index": 2, "expected": 160, "actual": 161},
+                {"packet_index": 3, "expected": 160, "actual": 159},
+            ],
+        )
+        self.assertFalse(summary["checks"]["no_unexpected_timestamp_deltas"])
+
+    def test_gst_inter_arrival_is_labeled_not_comparable_to_deadline_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rows = self.make_rows(directory, "rebase")
+            gst_path = pathlib.Path(directory) / "gst-summary.json"
+            gst_path.write_text(json.dumps({
+                "packet_count": 4,
+                "inter_arrival_ns": {"p99": 9_000_000},
+            }))
+            gst = self.summarizer.load_gst_summary(gst_path)
+            summary = self.summarizer.summarize_timing(rows, gst_summary=gst)
+
+        self.assertEqual(summary["deadline_error_limit_ns"], 2_000_000)
+        self.assertEqual(summary["gst_reference"]["comparison"], "not_comparable")
+        self.assertIn("inter-arrival", summary["gst_reference"]["note"])
+        self.assertIn("deadline-error", summary["gst_reference"]["note"])
+
+    def test_cli_atomically_writes_summary_and_direct_help_works(self):
+        environment = os.environ.copy()
+        environment.pop("PYTHONPATH", None)
+        with tempfile.TemporaryDirectory() as directory:
+            self.make_rows(directory, "rebase")
+            timing = pathlib.Path(directory) / "rebase.jsonl"
+            output = pathlib.Path(directory) / "summary.json"
+            completed = subprocess.run(
+                [sys.executable, str(SUMMARIZE_TIMING_TOOL),
+                 "--input", str(timing), "--output", str(output)],
+                cwd=ROOT,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertTrue(json.loads(output.read_text())["pass"])
+            self.assertFalse(list(output.parent.glob(f".{output.name}.*.tmp")))
+
+        help_result = subprocess.run(
+            [sys.executable, str(SUMMARIZE_TIMING_TOOL), "--help"],
+            cwd=ROOT,
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(help_result.returncode, 0, help_result.stderr)
+        self.assertIn("--gst-summary", help_result.stdout)
+
+    def test_malformed_and_oversized_jsonl_remove_stale_output(self):
+        cases = (
+            (b"not-json\n", "malformed JSONL"),
+            (b"[]\n", "not a JSON object"),
+            (b"{" + b'"x":"' + b"a" * 20_000 + b'"}\n', "line 1 exceeds"),
+        )
+        for contents, message in cases:
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as directory:
+                timing = pathlib.Path(directory) / "timing.jsonl"
+                output = pathlib.Path(directory) / "summary.json"
+                timing.write_bytes(contents)
+                output.write_text("stale\n")
+                stderr = StringIO()
+                with redirect_stderr(stderr):
+                    result = self.summarizer.main([
+                        "--input", str(timing), "--output", str(output)
+                    ])
+
+                self.assertEqual(result, 1)
+                self.assertIn(message, stderr.getvalue())
+                self.assertFalse(output.exists())
+
+    def test_row_count_is_bounded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "timing.jsonl"
+            path.write_text("{}\n{}\n{}\n")
+            with mock.patch.object(self.summarizer, "MAX_TIMING_ROWS", 2):
+                with self.assertRaisesRegex(ValueError, "row count exceeds 2"):
+                    self.summarizer.load_timing_jsonl(path)
 
 
 class ParseRtpPacketTests(unittest.TestCase):

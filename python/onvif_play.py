@@ -9,7 +9,12 @@ Python equivalent of the TS PoC (m3/cli) for cross-verification.
 import argparse, base64, datetime, hashlib, math, os, pathlib, queue, re, socket, ssl, stat, struct, subprocess, threading, time, urllib.parse, urllib.request
 
 import backchannel_audio
-from backchannel_rtp import RtpPacketizer
+from backchannel_rtp import (
+    RtpPacer,
+    RtpPacketizer,
+    atomic_write_jsonl,
+    remove_output,
+)
 
 DEV = "http://www.onvif.org/ver10/device/wsdl"
 MED = "http://www.onvif.org/ver10/media/wsdl"
@@ -846,8 +851,10 @@ def build_argument_parser():
                     help="marker policy for G.711/L16 packets")
     ap.add_argument("--packet-ms", type=float, default=20,
                     help="packet duration in milliseconds for G.711/L16")
-    ap.add_argument("--pacer", choices=["legacy"], default="legacy",
+    ap.add_argument("--pacer", choices=["legacy", "rebase"], default="legacy",
                     help="RTP pacing implementation")
+    ap.add_argument("--timing-log", type=pathlib.Path,
+                    help="atomically write per-packet pacing JSONL")
     ap.add_argument("--transport", choices=["tcp", "udp"], default="tcp",
                     help="backchannel RTP transport: tcp(interleaved) or udp")
     ap.add_argument("--codec", choices=["pcmu", "pcma", "l16", "aac"], default="pcma",
@@ -860,6 +867,7 @@ def build_argument_parser():
 def main(argv=None):
     ap = build_argument_parser()
     a = ap.parse_args(argv)
+    remove_output(a.timing_log)
     if not math.isfinite(a.volume) or not 0.0 <= a.volume <= 1.0:
         ap.error("--volume must be finite and between 0.0 and 1.0")
     if a.rtcp_interval < 0:
@@ -983,17 +991,31 @@ def main(argv=None):
         sent = 0
         octets_sent = 0
         total_samples_sent = 0
-        nxt = time.monotonic()
-        mono_start = nxt
+        timing_rows = []
+        pacer = RtpPacer(
+            a.sample_rate,
+            mode=a.pacer,
+            monotonic_ns=time.monotonic_ns,
+            sleeper=time.sleep,
+        )
+        mono_start_ns = time.monotonic_ns()
+        mono_start = mono_start_ns / 1_000_000_000
         wall_start = time.time()
-        last_rtcp = float("-inf")
+        last_rtcp_ns = None
         cname = f"py-poc@{socket.gethostname()}"
 
-        def send_rtcp(now):
-            elapsed = max(0.0, now - mono_start)
-            mapped_samples = min(
-                math.floor(elapsed * a.sample_rate), total_samples_sent
-            )
+        def send_rtcp(now_ns):
+            elapsed = max(0, now_ns - mono_start_ns) / 1_000_000_000
+            if pacer.rebase_count:
+                mapped_samples = pacer.stream_samples_at(now_ns)
+            else:
+                mapped_samples = min(
+                    math.floor(
+                        max(0.0, now_ns / 1_000_000_000 - mono_start)
+                        * a.sample_rate
+                    ),
+                    total_samples_sent,
+                )
             report_timestamp = (
                 initial_timestamp + mapped_samples
             ) & 0xFFFFFFFF
@@ -1005,16 +1027,15 @@ def main(argv=None):
         if a.codec == "aac":
             packet_source = ((aac_rfc3640_payload(frame), 1024, True)
                              for frame in aac_frames)
-            frame_seconds = 1024 / a.sample_rate
         else:
             bytes_per_frame = samples_per_frame * bytes_per_sample
             packet_source = ((stream_payload[off:off + bytes_per_frame],
                               len(stream_payload[off:off + bytes_per_frame]) // bytes_per_sample,
                               off <= audio_start_offset < off + bytes_per_frame)
                              for off in range(0, len(stream_payload), bytes_per_frame))
-            frame_seconds = a.packet_ms / 1000
 
         for chunk, samples_in_packet, audio_marker in packet_source:
+            timing = pacer.wait(samples_in_packet)
             if a.codec == "aac":
                 # RFC 3640 packetization is experimental and keeps its prior AU marker policy.
                 marker = audio_marker
@@ -1022,27 +1043,43 @@ def main(argv=None):
                 marker = sent == 0 or audio_marker
             else:
                 marker = sent == 0
+            rtp_timestamp = packetizer.timestamp
             rtp = packetizer.build(chunk, samples_in_packet, marker)
             backchannel.send_rtp(rtp)
+            timing_rows.append({
+                "packet_index": sent,
+                "rtp_timestamp": rtp_timestamp,
+                "samples": samples_in_packet,
+                "sample_rate": a.sample_rate,
+                "pacer": a.pacer,
+                "packet_duration_ns": (
+                    samples_in_packet * 1_000_000_000 // a.sample_rate
+                ),
+                "configured_jitter_bound_ns": 0,
+                "target_monotonic_ns": timing.target_monotonic_ns,
+                "actual_monotonic_ns": timing.actual_monotonic_ns,
+                "lateness_ns": timing.lateness_ns,
+                "interval_ns": timing.interval_ns,
+                "rebased": timing.rebased,
+            })
             sent += 1
             octets_sent += len(chunk)
             total_samples_sent += samples_in_packet
-            now = time.monotonic()
-            if a.rtcp_interval > 0 and (sent == 1 or now - last_rtcp >= a.rtcp_interval):
-                send_rtcp(now)
-                last_rtcp = now
-            packet_seconds = frame_seconds
-            if a.codec != "aac" and samples_in_packet < samples_per_frame:
-                packet_seconds = samples_in_packet / a.sample_rate
-            nxt += packet_seconds
-            d = nxt - time.monotonic()
-            if d > 0:
-                time.sleep(d)
+            now_ns = time.monotonic_ns()
+            if a.rtcp_interval > 0 and (
+                last_rtcp_ns is None
+                or now_ns - last_rtcp_ns >= a.rtcp_interval * 1_000_000_000
+            ):
+                send_rtcp(now_ns)
+                last_rtcp_ns = now_ns
+        pacer.finish()
         if a.rtcp_interval > 0:
-            send_rtcp(time.monotonic())
+            send_rtcp(time.monotonic_ns())
         print(f"  ✓ {sent} RTP 프레임 송신 완료 ({a.transport}) — 카메라 스피커에서 재생됐다면 성공")
     finally:
         backchannel.close()
+    if a.timing_log is not None:
+        atomic_write_jsonl(a.timing_log, timing_rows)
 
 
 if __name__ == "__main__":
