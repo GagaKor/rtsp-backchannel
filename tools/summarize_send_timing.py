@@ -111,6 +111,19 @@ def _validate_rows(rows):
                 f"timing row {index} lateness_ns does not match actual-target"
             )
         interval_ns = row.get("interval_ns")
+        if interval_ns is not None:
+            if isinstance(interval_ns, bool) or not isinstance(interval_ns, int):
+                raise ValueError(
+                    f"timing row {index} interval_ns must be an integer or null"
+                )
+            if interval_ns < 0:
+                raise ValueError(
+                    f"timing row {index} interval_ns must be nonnegative"
+                )
+        if previous_actual_ns is not None and actual_ns < previous_actual_ns:
+            raise ValueError(
+                f"timing row {index} actual_monotonic_ns must be nondecreasing"
+            )
         expected_interval = (
             None if previous_actual_ns is None else actual_ns - previous_actual_ns
         )

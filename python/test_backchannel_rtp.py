@@ -495,6 +495,45 @@ class SummarizeSendTimingToolTests(unittest.TestCase):
             sleeper=clock.sleep,
         )
 
+    @staticmethod
+    def decreasing_timing_rows(interval_ns):
+        return [
+            {
+                "packet_index": 0,
+                "rtp_timestamp": 0,
+                "samples": 160,
+                "target_monotonic_ns": 100,
+                "actual_monotonic_ns": 100,
+                "lateness_ns": 0,
+                "interval_ns": None,
+                "rebased": False,
+            },
+            {
+                "packet_index": 1,
+                "rtp_timestamp": 160,
+                "samples": 160,
+                "target_monotonic_ns": 99,
+                "actual_monotonic_ns": 99,
+                "lateness_ns": 0,
+                "interval_ns": interval_ns,
+                "rebased": False,
+            },
+        ]
+
+    def test_rejects_decreasing_actual_send_timestamps(self):
+        rows = self.decreasing_timing_rows(interval_ns=0)
+
+        with self.assertRaisesRegex(
+            ValueError, "actual_monotonic_ns must be nondecreasing"
+        ):
+            self.summarizer.summarize_timing(rows)
+
+    def test_rejects_negative_interval_even_when_timestamp_difference_matches(self):
+        rows = self.decreasing_timing_rows(interval_ns=-1)
+
+        with self.assertRaisesRegex(ValueError, "interval_ns must be nonnegative"):
+            self.summarizer.summarize_timing(rows)
+
     def test_summary_reports_required_metrics_and_rebase_passes(self):
         with tempfile.TemporaryDirectory() as directory:
             rows = self.make_rows(directory, "rebase")
