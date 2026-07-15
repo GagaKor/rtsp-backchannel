@@ -25,6 +25,7 @@ from tools.capture_gst_backchannel import (
 )
 from tools.rtp_reference import (
     MAX_RTP_PACKET_SIZE,
+    extract_payloads,
     load_manifest,
     parse_rtp_packet,
     read_length_prefixed_packets,
@@ -339,6 +340,93 @@ class CaptureFileTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "manifest line 1 is not a JSON object"):
                 load_manifest(path)
+
+
+class ExtractPayloadTests(unittest.TestCase):
+    def test_extracts_two_payloads_using_extension_and_padding_boundaries(self):
+        packets = [
+            make_rtp_packet(
+                b"first",
+                sequence=10,
+                extension=(0xBEDE, b"\x10\x20\x30\x40"),
+                padding=4,
+            ),
+            make_rtp_packet(b"second", sequence=11, padding=8),
+        ]
+
+        self.assertEqual(extract_payloads(packets), b"firstsecond")
+
+    def test_rejects_empty_malformed_wrong_payload_type_and_ssrc_change(self):
+        cases = {
+            "empty input": ([], "at least one RTP packet"),
+            "malformed": ([b"short"], "packet 0.*shorter than"),
+            "wrong payload type": (
+                [make_rtp_packet(payload_type=0)],
+                "packet 0 payload type 0 does not match 8",
+            ),
+            "SSRC change": (
+                [make_rtp_packet(ssrc=1), make_rtp_packet(ssrc=2)],
+                "packet 1 SSRC.*does not match",
+            ),
+        }
+        for name, (packets, message) in cases.items():
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, message):
+                extract_payloads(packets)
+
+    def test_can_explicitly_allow_ssrc_changes(self):
+        packets = [
+            make_rtp_packet(b"one", ssrc=1),
+            make_rtp_packet(b"two", ssrc=2),
+        ]
+
+        self.assertEqual(
+            extract_payloads(packets, allow_ssrc_change=True), b"onetwo"
+        )
+
+    def test_extract_payload_cli_atomically_replaces_output_and_reports_json(self):
+        packets = [
+            make_rtp_packet(b"one", sequence=1),
+            make_rtp_packet(b"two", sequence=2),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            directory = pathlib.Path(directory)
+            capture = directory / "packets.bin"
+            output = directory / "payload.pcma"
+            capture.write_bytes(
+                b"".join(struct.pack("!I", len(packet)) + packet for packet in packets)
+            )
+            output.write_bytes(b"stale")
+            environment = os.environ.copy()
+            environment.pop("PYTHONPATH", None)
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(RTP_REFERENCE),
+                    "extract-payload",
+                    str(capture),
+                    "--output",
+                    str(output),
+                ],
+                cwd=ROOT,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(output.read_bytes(), b"onetwo")
+            self.assertEqual(
+                json.loads(completed.stdout),
+                {
+                    "bytes": 6,
+                    "packet_count": 2,
+                    "payload_type": 8,
+                    "sha256": hashlib.sha256(b"onetwo").hexdigest(),
+                },
+            )
+            self.assertFalse(list(directory.glob(f".{output.name}.*.tmp")))
 
 
 class SummaryCliTests(unittest.TestCase):

@@ -14,10 +14,11 @@ import sys
 import tempfile
 from collections import Counter
 from dataclasses import dataclass
-from typing import Iterator
+from typing import Iterable, Iterator
 
 
 MAX_RTP_PACKET_SIZE = 65535
+MAX_EXTRACTED_PAYLOAD_BYTES = 128 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -105,6 +106,52 @@ def parse_rtp_packet(packet: bytes) -> RtpPacketMeta:
         payload_size=len(payload),
         payload_sha256=hashlib.sha256(payload).hexdigest(),
     )
+
+
+def extract_payloads(
+    packets: Iterable[bytes],
+    payload_type: int = 8,
+    *,
+    allow_ssrc_change: bool = False,
+) -> bytes:
+    """Validate RTP packets and concatenate their payloads in input order."""
+    if isinstance(payload_type, bool) or not isinstance(payload_type, int):
+        raise TypeError("payload type must be an integer")
+    if not 0 <= payload_type <= 127:
+        raise ValueError("payload type must be between 0 and 127")
+    if not isinstance(allow_ssrc_change, bool):
+        raise TypeError("allow_ssrc_change must be a boolean")
+
+    output = bytearray()
+    expected_ssrc = None
+    packet_count = 0
+    for packet_count, packet in enumerate(packets, start=1):
+        packet_index = packet_count - 1
+        try:
+            metadata = parse_rtp_packet(packet)
+        except (TypeError, ValueError, struct.error) as error:
+            raise ValueError(f"malformed RTP packet {packet_index}: {error}") from error
+        if metadata.payload_type != payload_type:
+            raise ValueError(
+                f"packet {packet_index} payload type {metadata.payload_type} "
+                f"does not match {payload_type}"
+            )
+        if expected_ssrc is None:
+            expected_ssrc = metadata.ssrc
+        elif not allow_ssrc_change and metadata.ssrc != expected_ssrc:
+            raise ValueError(
+                f"packet {packet_index} SSRC {metadata.ssrc} does not match "
+                f"initial SSRC {expected_ssrc}"
+            )
+        payload_end = len(packet) - metadata.padding_size
+        output.extend(packet[metadata.header_size:payload_end])
+        if len(output) > MAX_EXTRACTED_PAYLOAD_BYTES:
+            raise ValueError(
+                f"extracted payload exceeds {MAX_EXTRACTED_PAYLOAD_BYTES} byte limit"
+            )
+    if packet_count == 0:
+        raise ValueError("at least one RTP packet is required")
+    return bytes(output)
 
 
 def read_length_prefixed_packets(path: pathlib.Path) -> Iterator[bytes]:
@@ -270,12 +317,38 @@ def _atomic_write_text(path: pathlib.Path, content: str) -> None:
         raise
 
 
+def _atomic_write_bytes(path: pathlib.Path, content: bytes) -> None:
+    path = pathlib.Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as temporary:
+            temporary.write(content)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_name, path)
+    except BaseException:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
 def _build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
     summarize = subparsers.add_parser("summarize", help="summarize a manifest JSONL")
     summarize.add_argument("manifest", type=pathlib.Path)
     summarize.add_argument("--output", type=pathlib.Path)
+    extract = subparsers.add_parser(
+        "extract-payload", help="extract concatenated payload bytes from RTP packets"
+    )
+    extract.add_argument("packets", type=pathlib.Path)
+    extract.add_argument("--output", type=pathlib.Path, required=True)
+    extract.add_argument("--payload-type", type=int, default=8)
     return parser
 
 
@@ -291,6 +364,31 @@ def main(argv: list[str] | None = None) -> int:
             sys.stdout.write(rendered)
         else:
             _atomic_write_text(arguments.output, rendered)
+        return 0
+    if arguments.command == "extract-payload":
+        packet_count = 0
+
+        def counted_packets() -> Iterator[bytes]:
+            nonlocal packet_count
+            for packet in read_length_prefixed_packets(arguments.packets):
+                packet_count += 1
+                yield packet
+
+        payload = extract_payloads(
+            counted_packets(), payload_type=arguments.payload_type
+        )
+        _atomic_write_bytes(arguments.output, payload)
+        json.dump(
+            {
+                "bytes": len(payload),
+                "packet_count": packet_count,
+                "payload_type": arguments.payload_type,
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            },
+            sys.stdout,
+            sort_keys=True,
+        )
+        sys.stdout.write("\n")
         return 0
     raise AssertionError(f"unhandled command: {arguments.command}")
 

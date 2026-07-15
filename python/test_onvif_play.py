@@ -14,6 +14,7 @@ from io import StringIO
 from unittest.mock import patch
 
 import onvif_play
+import backchannel_audio
 from tools import replay_rtp_reference
 from tools.rtp_reference import parse_rtp_packet
 
@@ -1390,6 +1391,116 @@ class RtpSenderMainTest(unittest.TestCase):
 
         resolver.assert_not_called()
         self.assertIn("invalid choice", stderr.getvalue())
+
+    def test_encoder_defaults_to_ffmpeg(self):
+        arguments = onvif_play.build_argument_parser().parse_args([])
+
+        self.assertEqual(arguments.encoder, "ffmpeg")
+
+    def test_pcma_file_modes_decode_once_then_select_terminal_encoder(self):
+        decoded = struct.pack("<hhh", -1000, 0, 1000)
+        for encoder_name, expected in (
+            ("ffmpeg", b"ffm"),
+            ("gst-compatible", b"gst"),
+        ):
+            with self.subTest(encoder=encoder_name), patch.object(
+                backchannel_audio, "decode_source", return_value=decoded
+            ) as decode, patch.object(
+                backchannel_audio, "encode_pcma_ffmpeg", return_value=b"ffm"
+            ) as ffmpeg_encoder, patch.object(
+                backchannel_audio,
+                "encode_pcma_gst_compatible",
+                return_value=b"gst",
+            ) as gst_encoder:
+                actual = onvif_play.file_audio(
+                    "source.wav", "pcma", 0.05, 8000, encoder=encoder_name
+                )
+
+            self.assertEqual(actual, expected)
+            decode.assert_called_once_with("source.wav", 8000)
+            if encoder_name == "ffmpeg":
+                ffmpeg_encoder.assert_called_once_with(decoded, 0.05, 8000)
+                gst_encoder.assert_not_called()
+            else:
+                gst_encoder.assert_called_once_with(decoded, 0.05)
+                ffmpeg_encoder.assert_not_called()
+
+    def test_pcma_input_bypasses_conversion_and_preserves_payload_after_preroll(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pcma_path = pathlib.Path(directory) / "captured.pcma"
+            captured = bytes(range(1, 201))
+            pcma_path.write_bytes(captured)
+            with patch.object(
+                backchannel_audio,
+                "decode_source",
+                side_effect=AssertionError("decode called"),
+            ), patch.object(
+                backchannel_audio,
+                "encode_pcma_ffmpeg",
+                side_effect=AssertionError("ffmpeg encode called"),
+            ), patch.object(
+                backchannel_audio,
+                "encode_pcma_gst_compatible",
+                side_effect=AssertionError("compatible encode called"),
+            ):
+                packets, _, output, _ = self.run_main(
+                    "--pcma-input",
+                    str(pcma_path),
+                    "--preroll-ms",
+                    "20",
+                    "--packet-ms",
+                    "20",
+                )
+
+        payload = b"".join(
+            packet[meta.header_size : len(packet) - meta.padding_size]
+            for packet in packets
+            for meta in [parse_rtp_packet(packet)]
+        )
+        self.assertEqual(payload[:160], b"\xd5" * 160)
+        self.assertEqual(payload[160:], captured)
+        self.assertIn(str(pcma_path), output)
+        self.assertIn("200 bytes", output)
+        self.assertIn(hashlib.sha256(captured).hexdigest(), output)
+        self.assertNotIn(str(list(captured[:10])), output)
+
+    def test_pcma_input_restrictions_fail_before_network(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = pathlib.Path(directory)
+            valid = directory / "valid.pcma"
+            empty = directory / "empty.pcma"
+            valid.write_bytes(b"\xd5")
+            empty.write_bytes(b"")
+            cases = (
+                (["--pcma-input", str(valid), "--file", "source.wav"], "not allowed"),
+                (["--pcma-input", str(valid), "--codec", "pcmu"], "only supports --codec pcma"),
+                (["--pcma-input", str(valid), "--sample-rate", "16000"], "sample-rate 8000"),
+                (["--pcma-input", str(empty)], "must not be empty"),
+            )
+            for arguments, message in cases:
+                with self.subTest(arguments=arguments), patch.object(
+                    sys, "argv", ["onvif_play.py", *arguments]
+                ), patch.object(onvif_play, "onvif_stream_uri") as resolver, \
+                        redirect_stderr(StringIO()) as stderr, \
+                        self.assertRaises((SystemExit, ValueError)) as raised:
+                    onvif_play.main()
+
+                resolver.assert_not_called()
+                combined = stderr.getvalue() + str(raised.exception)
+                self.assertIn(message, combined)
+
+    def test_pcma_input_size_limit_is_checked_before_read_and_network(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "captured.pcma"
+            path.write_bytes(b"1234")
+            with patch.object(onvif_play, "MAX_PCMA_INPUT_BYTES", 3), patch.object(
+                sys, "argv", ["onvif_play.py", "--pcma-input", str(path)]
+            ), patch.object(onvif_play, "onvif_stream_uri") as resolver, patch.object(
+                pathlib.Path, "read_bytes", side_effect=AssertionError("unbounded read")
+            ), self.assertRaisesRegex(ValueError, "exceeds 3 byte limit"):
+                onvif_play.main()
+
+            resolver.assert_not_called()
 
 
 class BackchannelRequestTest(unittest.TestCase):

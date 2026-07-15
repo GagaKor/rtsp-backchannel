@@ -6,8 +6,9 @@ Python equivalent of the TS PoC (m3/cli) for cross-verification.
   python3 python/onvif_play.py --host 172.168.46.56 --user admin --pass CHANGEME
   python3 python/onvif_play.py --file test.mp3 --host 172.168.46.56
 """
-import argparse, base64, datetime, hashlib, math, os, queue, re, socket, ssl, struct, subprocess, threading, time, urllib.parse, urllib.request
+import argparse, base64, datetime, hashlib, math, os, pathlib, queue, re, socket, ssl, stat, struct, subprocess, threading, time, urllib.parse, urllib.request
 
+import backchannel_audio
 from backchannel_rtp import RtpPacketizer
 
 DEV = "http://www.onvif.org/ver10/device/wsdl"
@@ -23,6 +24,7 @@ RTSP_MAX_HEADER_BYTES = 64 * 1024
 RTSP_MAX_BODY_BYTES = 4 * 1024 * 1024
 RTSP_MAX_BUFFER_BYTES = 8 * 1024 * 1024
 RTSP_MAX_QUEUED_RESPONSES = 64
+MAX_PCMA_INPUT_BYTES = 128 * 1024 * 1024
 
 
 # ---------- ONVIF ----------
@@ -681,7 +683,16 @@ def tone_audio(freq, ms, codec, amp=0.7, rate=8000):
     return bytes(enc(int(amp * 32767 * math.sin(2 * math.pi * freq * i / rate))) for i in range(n))
 
 
-def file_audio(path, codec, volume, sample_rate):
+def file_audio(path, codec, volume, sample_rate, encoder="ffmpeg"):
+    if codec == "pcma":
+        decoded = backchannel_audio.decode_source(path, sample_rate)
+        if encoder == "ffmpeg":
+            return backchannel_audio.encode_pcma_ffmpeg(
+                decoded, volume, sample_rate
+            )
+        if encoder == "gst-compatible":
+            return backchannel_audio.encode_pcma_gst_compatible(decoded, volume)
+        raise ValueError(f"unsupported PCMA encoder: {encoder}")
     fmt = CODECS[codec][1]
     p = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", path,
                         "-af", f"volume={volume}", "-ar", str(sample_rate), "-ac", "1",
@@ -729,12 +740,96 @@ def aac_rfc3640_payload(frame):
     return b"\x00\x10" + struct.pack(">H", len(frame) << 3) + frame
 
 
-def main():
+def read_pcma_input(path):
+    path = pathlib.Path(path)
+    try:
+        metadata = path.stat()
+    except FileNotFoundError as error:
+        raise ValueError(f"PCMA input does not exist: {path}") from error
+    except OSError as error:
+        raise ValueError(f"cannot inspect PCMA input {path}: {error}") from error
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ValueError(f"PCMA input is not a regular file: {path}")
+    if metadata.st_size > MAX_PCMA_INPUT_BYTES:
+        raise ValueError(
+            f"PCMA input {path} exceeds {MAX_PCMA_INPUT_BYTES} byte limit"
+        )
+    try:
+        with path.open("rb") as source:
+            payload = source.read(MAX_PCMA_INPUT_BYTES + 1)
+    except OSError as error:
+        raise ValueError(f"cannot read PCMA input {path}: {error}") from error
+    if len(payload) > MAX_PCMA_INPUT_BYTES:
+        raise ValueError(
+            f"PCMA input {path} exceeds {MAX_PCMA_INPUT_BYTES} byte limit"
+        )
+    if not payload:
+        raise ValueError(f"PCMA input {path} must not be empty")
+    return payload
+
+
+def prepare_audio(arguments):
+    if arguments.codec == "aac":
+        if not arguments.file:
+            raise ValueError("AAC output requires --file")
+        frames = file_aac(
+            arguments.file,
+            arguments.volume,
+            arguments.sample_rate,
+            arguments.preroll_ms,
+        )
+        payload_bytes = sum(len(frame) for frame in frames)
+        duration = len(frames) * 1024 / arguments.sample_rate
+        message = (
+            f"  AAC-LC file {arguments.file} -> {len(frames)} frames, "
+            f"{payload_bytes} bytes (~{duration:.1f}s, including preroll)"
+        )
+        return None, frames, message
+    if arguments.pcma_input:
+        payload = read_pcma_input(arguments.pcma_input)
+        digest = hashlib.sha256(payload).hexdigest()
+        message = (
+            f"  PCMA input {arguments.pcma_input} -> {len(payload)} bytes "
+            f"sha256={digest}"
+        )
+        return payload, None, message
+    if arguments.file:
+        payload = file_audio(
+            arguments.file,
+            arguments.codec,
+            arguments.volume,
+            arguments.sample_rate,
+            encoder=arguments.encoder,
+        )
+        bytes_per_sample = 2 if arguments.codec == "l16" else 1
+        duration = len(payload) / (arguments.sample_rate * bytes_per_sample)
+        message = (
+            f"  file {arguments.file} -> {len(payload)} bytes "
+            f"(~{duration:.1f}s {arguments.codec.upper()})"
+        )
+        return payload, None, message
+    payload = tone_audio(
+        arguments.freq,
+        arguments.ms,
+        arguments.codec,
+        amp=arguments.volume,
+        rate=arguments.sample_rate,
+    )
+    message = (
+        f"  tone {arguments.freq}Hz {arguments.ms}ms -> "
+        f"{len(payload)} bytes ({arguments.codec.upper()})"
+    )
+    return payload, None, message
+
+
+def build_argument_parser():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="172.168.46.56")
     ap.add_argument("--user", default="admin")
     ap.add_argument("--pass", dest="pw", default="CHANGEME")
-    ap.add_argument("--file")
+    input_group = ap.add_mutually_exclusive_group()
+    input_group.add_argument("--file")
+    input_group.add_argument("--pcma-input", type=pathlib.Path)
     ap.add_argument("--freq", type=int, default=1000)
     ap.add_argument("--ms", type=int, default=3000)
     ap.add_argument("--volume", type=float, default=0.25,
@@ -757,13 +852,24 @@ def main():
                     help="backchannel RTP transport: tcp(interleaved) or udp")
     ap.add_argument("--codec", choices=["pcmu", "pcma", "l16", "aac"], default="pcma",
                     help="RTP audio codec: pcma, pcmu, l16, or AAC-LC MPEG4-GENERIC")
-    a = ap.parse_args()
-    if not 0.0 < a.volume <= 1.0:
-        ap.error("--volume must be greater than 0.0 and at most 1.0")
+    ap.add_argument("--encoder", choices=["ffmpeg", "gst-compatible"], default="ffmpeg",
+                    help="PCMA terminal encoder for decoded file input")
+    return ap
+
+
+def main(argv=None):
+    ap = build_argument_parser()
+    a = ap.parse_args(argv)
+    if not math.isfinite(a.volume) or not 0.0 <= a.volume <= 1.0:
+        ap.error("--volume must be finite and between 0.0 and 1.0")
     if a.rtcp_interval < 0:
         ap.error("--rtcp-interval must be 0 or greater")
     if a.preroll_ms < 0:
         ap.error("--preroll-ms must be 0 or greater")
+    if a.pcma_input and a.codec != "pcma":
+        ap.error("--pcma-input only supports --codec pcma")
+    if a.pcma_input and a.sample_rate != 8000:
+        ap.error("--pcma-input requires --sample-rate 8000")
     samples_per_frame = None
     if a.codec != "aac":
         if not math.isfinite(a.packet_ms) or a.packet_ms <= 0:
@@ -783,6 +889,7 @@ def main():
                 f"{a.transport.upper()} limit {packet_limit}"
             )
 
+    payload, aac_frames, audio_message = prepare_audio(a)
     print(f"# Python ONVIF 백채널 송출 @ {a.host}")
     uri, model = onvif_stream_uri(a.host, a.user, a.pw)
     print(f"  ✓ ONVIF OK ({model})  stream={redact_rtsp_uri(uri)}")
@@ -841,23 +948,7 @@ def main():
             f"ssrc={advertised_ssrc_text}"
         )
 
-        aac_frames = None
-        if a.codec == "aac":
-            if not a.file:
-                raise RuntimeError("AAC 송출에는 --file이 필요합니다")
-            aac_frames = file_aac(a.file, a.volume, a.sample_rate, a.preroll_ms)
-            payload_bytes = sum(len(frame) for frame in aac_frames)
-            duration = len(aac_frames) * 1024 / a.sample_rate
-            print(f"  AAC-LC 파일 {a.file} → {len(aac_frames)} frames, {payload_bytes} bytes "
-                  f"(~{duration:.1f}s, preroll 포함)")
-        elif a.file:
-            payload = file_audio(a.file, a.codec, a.volume, a.sample_rate)
-            bytes_per_sample = 2 if a.codec == "l16" else 1
-            print(f"  파일 {a.file} → {len(payload)} bytes "
-                  f"(~{len(payload)/(a.sample_rate * bytes_per_sample):.1f}s {a.codec.upper()})")
-        else:
-            payload = tone_audio(a.freq, a.ms, a.codec, amp=a.volume, rate=a.sample_rate)
-            print(f"  톤 {a.freq}Hz {a.ms}ms → {len(payload)} bytes ({a.codec.upper()})")
+        print(audio_message)
 
         if a.codec != "aac":
             bytes_per_sample = 2 if a.codec == "l16" else 1
