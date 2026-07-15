@@ -1,5 +1,6 @@
 import hashlib
 import json
+import math
 import os
 import pathlib
 import socket
@@ -121,16 +122,28 @@ class FakeRtsp:
 
 
 class FakeClock:
-    def __init__(self, now_ns=1_000_000_000):
+    def __init__(self, now_ns=1_000_000_000, sleep_overshoot_ns=0):
+        self.start_ns = now_ns
         self.now_ns = now_ns
+        self.sleep_overshoot_ns = sleep_overshoot_ns
         self.sleeps = []
+        self.sleep_deadlines_ns = []
 
     def monotonic_ns(self):
         return self.now_ns
 
+    def monotonic(self):
+        return self.now_ns / 1_000_000_000
+
+    def time(self):
+        return 1_700_000_000 + self.monotonic()
+
     def sleep(self, seconds):
         self.sleeps.append(seconds)
-        self.now_ns += round(seconds * 1_000_000_000)
+        self.now_ns += (
+            round(seconds * 1_000_000_000) + self.sleep_overshoot_ns
+        )
+        self.sleep_deadlines_ns.append(self.now_ns)
 
 
 class FakeUdpRtsp(FakeRtsp):
@@ -143,6 +156,42 @@ class FakeUdpRtsp(FakeRtsp):
                 "session": "udp-session;timeout=60",
                 "transport": "RTP/AVP;unicast;server_port=61000-61001",
             }, ""
+        return super().request(method, uri, headers)
+
+
+class FakeRtspWithoutIdentity(FakeRtsp):
+    def request(self, method, uri, headers=None):
+        status, response_headers, body = super().request(method, uri, headers)
+        if method == "SETUP":
+            response_headers["transport"] = response_headers[
+                "transport"
+            ].replace(";ssrc=01020304", "")
+        elif method == "PLAY":
+            response_headers = {}
+        return status, response_headers, body
+
+
+class FakeAacRtsp(FakeRtsp):
+    def request(self, method, uri, headers=None):
+        if method == "DESCRIBE":
+            headers = headers or {}
+            self.requests.append((method, uri, headers))
+            self.events.append(("request", method, uri, headers))
+            sdp = (
+                "v=0\r\n"
+                "m=video 0 RTP/AVP 96\r\n"
+                "a=control:trackID=0\r\n"
+                "a=recvonly\r\n"
+                "m=audio 0 RTP/AVP 8\r\n"
+                "a=control:trackID=1\r\n"
+                "a=rtpmap:8 PCMA/8000\r\n"
+                "a=recvonly\r\n"
+                "m=audio 0 RTP/AVP 97\r\n"
+                "a=control:trackID=5\r\n"
+                "a=rtpmap:97 MPEG4-GENERIC/8000\r\n"
+                "a=sendonly\r\n"
+            )
+            return 200, {"content-base": uri + "/"}, sdp
         return super().request(method, uri, headers)
 
 
@@ -976,6 +1025,371 @@ class ReplayReferenceTest(unittest.TestCase):
             self.assertEqual(result, 1)
             self.assertFalse(send_log.exists())
             self.assertTrue(rtsp.closed)
+
+
+class RtpSenderMainTest(unittest.TestCase):
+    RANDOM_VALUES = (
+        b"\x11\x22\x33\x44",
+        b"\x55\x66",
+        b"\x77\x88\x99\xaa",
+    )
+
+    def run_main(
+        self, *extra_args, random_values=None, rtsp_type=FakeRtsp, clock=None
+    ):
+        FakeRtsp.instances.clear()
+        argv = [
+            "onvif_play.py",
+            "--host", "example.invalid",
+            "--user", "fake-user",
+            "--pass", "fake-password",
+            "--ms", "25",
+            "--preroll-ms", "0",
+            "--rtcp-interval", "0",
+            *extra_args,
+        ]
+        output = StringIO()
+        clock = clock or FakeClock()
+        self.clock = clock
+        values = self.RANDOM_VALUES if random_values is None else random_values
+        with patch.object(sys, "argv", argv), \
+                patch.object(onvif_play, "onvif_stream_uri", return_value=(
+                    "rtsp://fake-user:fake-password@example.invalid/live",
+                    "test-camera",
+                )), patch.object(onvif_play, "Rtsp", rtsp_type), \
+                patch.object(onvif_play, "time", clock), \
+                patch.object(os, "urandom", side_effect=values) as urandom, \
+                redirect_stdout(output):
+            onvif_play.main()
+
+        events = FakeRtsp.instances[0].events
+        rtp_packets = [event[2] for event in events
+                       if event[0] == "media" and event[1] == 6]
+        rtcp_packets = [event[2] for event in events
+                        if event[0] == "media" and event[1] == 7]
+        return rtp_packets, rtcp_packets, output.getvalue(), urandom
+
+    def test_default_sender_identity_ignores_server_advertised_tuple(self):
+        packets, _, output, urandom = self.run_main()
+
+        first = parse_rtp_packet(packets[0])
+        self.assertEqual(first.ssrc, 0x11223344)
+        self.assertEqual(first.sequence, 0x5566)
+        self.assertEqual(first.timestamp, 0x778899AA)
+        self.assertEqual([call.args for call in urandom.call_args_list],
+                         [(4,), (2,), (4,)])
+        self.assertIn(
+            "Server-advertised RTP: seq=0 rtptime=0 ssrc=01020304", output
+        )
+        self.assertIn(
+            "Selected sender RTP: seq=21862 rtptime=2005440938 ssrc=11223344",
+            output,
+        )
+        self.assertNotIn("fake-user", output)
+        self.assertNotIn("fake-password", output)
+
+    def test_legacy_identity_uses_server_advertised_tuple(self):
+        packets, _, output, urandom = self.run_main(
+            "--rtp-identity", "legacy", random_values=()
+        )
+
+        first = parse_rtp_packet(packets[0])
+        self.assertEqual((first.ssrc, first.sequence, first.timestamp),
+                         (0x01020304, 0, 0))
+        urandom.assert_not_called()
+        self.assertIn(
+            "Selected sender RTP: seq=0 rtptime=0 ssrc=01020304 (legacy)",
+            output,
+        )
+
+    def test_legacy_identity_randomizes_missing_values_in_prior_order(self):
+        random_values = (
+            b"\x01\x02",
+            b"\x03\x04\x05\x06",
+            b"\x07\x08\x09\x0a",
+        )
+
+        packets, _, _, urandom = self.run_main(
+            "--rtp-identity", "legacy",
+            random_values=random_values,
+            rtsp_type=FakeRtspWithoutIdentity,
+        )
+
+        first = parse_rtp_packet(packets[0])
+        self.assertEqual((first.sequence, first.timestamp, first.ssrc),
+                         (0x0102, 0x03040506, 0x0708090A))
+        self.assertEqual([call.args for call in urandom.call_args_list],
+                         [(2,), (4,), (4,)])
+
+    def test_default_marker_is_only_on_first_packet_across_preroll(self):
+        packets, _, _, _ = self.run_main(
+            "--ms", "20", "--preroll-ms", "20"
+        )
+
+        self.assertEqual([parse_rtp_packet(packet).marker for packet in packets],
+                         [True, False])
+
+    def test_audio_start_marker_preserves_preroll_transition(self):
+        packets, _, _, _ = self.run_main(
+            "--ms", "20",
+            "--preroll-ms", "20",
+            "--marker-mode", "audio-start",
+        )
+
+        self.assertEqual([parse_rtp_packet(packet).marker for packet in packets],
+                         [True, True])
+
+    def test_audio_start_without_preroll_marks_only_the_first_packet(self):
+        packets, _, _, _ = self.run_main(
+            "--ms", "20", "--marker-mode", "audio-start"
+        )
+
+        self.assertEqual([parse_rtp_packet(packet).marker for packet in packets],
+                         [True])
+
+    def test_packet_ms_drives_packet_samples_and_pacing(self):
+        packets, _, _, _ = self.run_main(
+            "--ms", "30", "--packet-ms", "12.5"
+        )
+        metadata = [parse_rtp_packet(packet) for packet in packets]
+
+        self.assertEqual([meta.payload_size for meta in metadata], [100, 100, 40])
+        self.assertEqual(
+            [meta.timestamp for meta in metadata],
+            [0x778899AA, 0x778899AA + 100, 0x778899AA + 200],
+        )
+        for actual, expected in zip(
+            self.clock.sleeps, (0.0125, 0.0125, 0.005), strict=True
+        ):
+            self.assertAlmostEqual(actual, expected)
+        self.assertEqual(
+            [deadline - self.clock.start_ns
+             for deadline in self.clock.sleep_deadlines_ns],
+            [12_500_000, 25_000_000, 30_000_000],
+        )
+        self.assertEqual(self.clock.now_ns - self.clock.start_ns, 30_000_000)
+
+    def test_aac_packetization_is_isolated_from_g711_packet_controls(self):
+        frames = [b"\x11\x22", b"\x33"]
+
+        for packet_ms in ("0.1", "nan", "1e100"):
+            with self.subTest(packet_ms=packet_ms):
+                with patch.object(
+                    onvif_play, "file_aac", return_value=frames
+                ) as encoder:
+                    packets, reports, _, _ = self.run_main(
+                        "--codec", "aac",
+                        "--file", "fake.aac",
+                        "--packet-ms", packet_ms,
+                        "--preroll-ms", "37",
+                        "--marker-mode", "first",
+                        "--rtcp-interval", "10",
+                        rtsp_type=FakeAacRtsp,
+                    )
+
+                metadata = [parse_rtp_packet(packet) for packet in packets]
+                encoder.assert_called_once_with("fake.aac", 0.25, 8000, 37)
+                self.assertEqual([packet[12:] for packet in packets], [
+                    b"\x00\x10\x00\x10\x11\x22",
+                    b"\x00\x10\x00\x08\x33",
+                ])
+                self.assertEqual(
+                    [meta.timestamp for meta in metadata],
+                    [0x778899AA, 0x778899AA + 1024],
+                )
+                # Each packet carries one complete AAC access unit, so every packet is marked.
+                self.assertEqual([meta.marker for meta in metadata], [True, True])
+                for actual in self.clock.sleeps:
+                    self.assertAlmostEqual(actual, 1024 / 8000)
+                report_timestamps = [
+                    struct.unpack_from("!BBHIIIIII", report)[6]
+                    for report in reports
+                ]
+                self.assertEqual(
+                    report_timestamps,
+                    [0x778899AA, (0x778899AA + 2048) & 0xFFFFFFFF],
+                )
+
+    def test_rtcp_maps_first_periodic_and_final_reports_to_send_timeline(self):
+        packets, reports, _, _ = self.run_main(
+            "--ms", "30",
+            "--packet-ms", "12.5",
+            "--rtcp-interval", "0.01",
+        )
+
+        self.assertEqual(len(packets), 3)
+        fields = [struct.unpack_from("!BBHIIIIII", report) for report in reports]
+        self.assertEqual([report[3] for report in fields], [0x11223344] * 4)
+        mono_start = self.clock.start_ns / 1_000_000_000
+        elapsed_ns = [0, 12_500_000, 25_000_000, 30_000_000]
+        sent_samples = [100, 200, 240, 240]
+        mapped_samples = [
+            min(
+                math.floor(
+                    ((self.clock.start_ns + elapsed) / 1_000_000_000
+                     - mono_start) * 8000
+                ),
+                sent,
+            )
+            for elapsed, sent in zip(elapsed_ns, sent_samples, strict=True)
+        ]
+        self.assertEqual(
+            [report[6] for report in fields],
+            [(0x778899AA + samples) & 0xFFFFFFFF
+             for samples in mapped_samples],
+        )
+        self.assertEqual([report[7] for report in fields], [1, 2, 3, 3])
+        self.assertEqual([report[8] for report in fields], [100, 200, 240, 240])
+
+    def test_rtcp_uses_session_clock_under_sleep_overshoot_and_timestamp_wrap(self):
+        initial_timestamp = 0xFFFFFF80
+        clock = FakeClock(sleep_overshoot_ns=3_906_250)
+        random_values = (
+            b"\x11\x22\x33\x44",
+            b"\x55\x66",
+            initial_timestamp.to_bytes(4, "big"),
+        )
+
+        packets, reports, _, _ = self.run_main(
+            "--ms", "45",
+            "--packet-ms", "15.625",
+            "--rtcp-interval", "0.01",
+            random_values=random_values,
+            clock=clock,
+        )
+
+        self.assertEqual(
+            [parse_rtp_packet(packet).payload_size for packet in packets],
+            [125, 125, 110],
+        )
+        fields = [struct.unpack_from("!BBHIIIIII", report) for report in reports]
+        elapsed_ns = [0, 19_531_250, 35_156_250, 48_906_250]
+        sent_samples = [125, 250, 360, 360]
+        mapped_samples = [
+            min((elapsed * 8000) // 1_000_000_000, sent)
+            for elapsed, sent in zip(elapsed_ns, sent_samples, strict=True)
+        ]
+        self.assertEqual(mapped_samples, [0, 156, 281, 360])
+        self.assertEqual(
+            [report[6] for report in fields],
+            [(initial_timestamp + samples) & 0xFFFFFFFF
+             for samples in mapped_samples],
+        )
+        self.assertEqual([report[7] for report in fields], [1, 2, 3, 3])
+        self.assertEqual([report[8] for report in fields], [125, 250, 360, 360])
+
+        wall_start = 1_700_000_001.0
+        for report, elapsed in zip(fields, elapsed_ns, strict=True):
+            actual_unix_time = (
+                report[4] - 2_208_988_800 + report[5] / (1 << 32)
+            )
+            self.assertAlmostEqual(
+                actual_unix_time,
+                wall_start + elapsed / 1_000_000_000,
+                places=6,
+            )
+
+        final_packet = parse_rtp_packet(packets[-1])
+        self.assertEqual(
+            fields[-1][6],
+            (final_packet.timestamp + final_packet.payload_size) & 0xFFFFFFFF,
+        )
+
+    def test_rtcp_before_any_rtp_uses_initial_timestamp_and_zero_counters(self):
+        packets, reports, _, _ = self.run_main(
+            "--ms", "0", "--rtcp-interval", "10"
+        )
+
+        self.assertEqual(packets, [])
+        self.assertEqual(len(reports), 1)
+        fields = struct.unpack_from("!BBHIIIIII", reports[0])
+        self.assertEqual(fields[3], 0x11223344)
+        self.assertEqual(fields[6], 0x778899AA)
+        self.assertEqual(fields[7], 0)
+        self.assertEqual(fields[8], 0)
+
+    def test_rejects_oversized_non_aac_packets_before_network(self):
+        cases = (
+            ("pcma", "tcp", "8190.5", "65535"),
+            ("l16", "tcp", "4095.25", "65535"),
+            ("pcma", "udp", "8187", "65507"),
+            ("l16", "udp", "4093.5", "65507"),
+        )
+
+        for codec, transport, packet_ms, limit in cases:
+            argv = [
+                "onvif_play.py",
+                "--codec", codec,
+                "--transport", transport,
+                "--packet-ms", packet_ms,
+            ]
+            with self.subTest(codec=codec, transport=transport):
+                with patch.object(sys, "argv", argv), patch.object(
+                    onvif_play,
+                    "onvif_stream_uri",
+                    side_effect=AssertionError("network resolver called"),
+                ) as resolver, redirect_stderr(StringIO()) as stderr, \
+                        self.assertRaises(SystemExit):
+                    onvif_play.main()
+
+                resolver.assert_not_called()
+                self.assertIn("RTP packet size", stderr.getvalue())
+                self.assertIn(limit, stderr.getvalue())
+
+    def test_accepts_transport_packet_boundaries_and_common_durations(self):
+        cases = (
+            ("pcma", "tcp", "8190.375"),
+            ("l16", "tcp", "4095.125"),
+            ("pcma", "udp", "8186.875"),
+            ("l16", "udp", "4093.375"),
+            ("pcma", "tcp", "20"),
+            ("l16", "tcp", "40"),
+            ("pcma", "udp", "40"),
+            ("l16", "udp", "20"),
+        )
+
+        class ResolverReached(RuntimeError):
+            pass
+
+        for codec, transport, packet_ms in cases:
+            argv = [
+                "onvif_play.py",
+                "--codec", codec,
+                "--transport", transport,
+                "--packet-ms", packet_ms,
+            ]
+            with self.subTest(
+                codec=codec, transport=transport, packet_ms=packet_ms
+            ), patch.object(sys, "argv", argv), patch.object(
+                onvif_play, "onvif_stream_uri", side_effect=ResolverReached
+            ) as resolver, redirect_stdout(StringIO()), self.assertRaises(
+                ResolverReached
+            ):
+                onvif_play.main()
+
+            resolver.assert_called_once()
+
+    def test_rejects_nonpositive_or_nonintegral_packet_duration_before_network(self):
+        for value, message in (("0", "positive"), ("0.1", "integral sample count")):
+            with self.subTest(value=value), patch.object(
+                sys, "argv", ["onvif_play.py", "--packet-ms", value]
+            ), patch.object(onvif_play, "onvif_stream_uri") as resolver, \
+                    redirect_stderr(StringIO()) as stderr, \
+                    self.assertRaises(SystemExit):
+                onvif_play.main()
+            resolver.assert_not_called()
+            self.assertIn(message, stderr.getvalue())
+
+    def test_pacer_only_accepts_legacy(self):
+        with patch.object(
+            sys, "argv", ["onvif_play.py", "--pacer", "adaptive"]
+        ), patch.object(onvif_play, "onvif_stream_uri") as resolver, \
+                redirect_stderr(StringIO()) as stderr, \
+                self.assertRaises(SystemExit):
+            onvif_play.main()
+
+        resolver.assert_not_called()
+        self.assertIn("invalid choice", stderr.getvalue())
 
 
 class BackchannelRequestTest(unittest.TestCase):

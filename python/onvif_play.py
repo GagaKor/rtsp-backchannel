@@ -8,6 +8,8 @@ Python equivalent of the TS PoC (m3/cli) for cross-verification.
 """
 import argparse, base64, datetime, hashlib, math, os, queue, re, socket, ssl, struct, subprocess, threading, time, urllib.parse, urllib.request
 
+from backchannel_rtp import RtpPacketizer
+
 DEV = "http://www.onvif.org/ver10/device/wsdl"
 MED = "http://www.onvif.org/ver10/media/wsdl"
 SCHEMA = "http://www.onvif.org/ver10/schema"
@@ -743,6 +745,14 @@ def main():
                     help="seconds between RTCP sender reports; 0 disables RTCP")
     ap.add_argument("--preroll-ms", type=int, default=3000,
                     help="silent RTP warm-up before audio, for camera clock convergence")
+    ap.add_argument("--rtp-identity", choices=["legacy", "sender"], default="sender",
+                    help="RTP identity source: sender-owned random state or legacy server values")
+    ap.add_argument("--marker-mode", choices=["audio-start", "first"], default="first",
+                    help="marker policy for G.711/L16 packets")
+    ap.add_argument("--packet-ms", type=float, default=20,
+                    help="packet duration in milliseconds for G.711/L16")
+    ap.add_argument("--pacer", choices=["legacy"], default="legacy",
+                    help="RTP pacing implementation")
     ap.add_argument("--transport", choices=["tcp", "udp"], default="tcp",
                     help="backchannel RTP transport: tcp(interleaved) or udp")
     ap.add_argument("--codec", choices=["pcmu", "pcma", "l16", "aac"], default="pcma",
@@ -754,6 +764,24 @@ def main():
         ap.error("--rtcp-interval must be 0 or greater")
     if a.preroll_ms < 0:
         ap.error("--preroll-ms must be 0 or greater")
+    samples_per_frame = None
+    if a.codec != "aac":
+        if not math.isfinite(a.packet_ms) or a.packet_ms <= 0:
+            ap.error("--packet-ms must be positive")
+        packet_samples = a.sample_rate * a.packet_ms / 1000
+        if not packet_samples.is_integer():
+            ap.error("--packet-ms must produce an integral sample count")
+        samples_per_frame = int(packet_samples)
+        if samples_per_frame > 0xFFFFFFFF:
+            ap.error("--packet-ms sample count exceeds uint32")
+        packet_payload_bytes = samples_per_frame * (2 if a.codec == "l16" else 1)
+        rtp_packet_bytes = 12 + packet_payload_bytes
+        packet_limit = 65535 if a.transport == "tcp" else 65507
+        if rtp_packet_bytes > packet_limit:
+            ap.error(
+                f"RTP packet size {rtp_packet_bytes} exceeds "
+                f"{a.transport.upper()} limit {packet_limit}"
+            )
 
     print(f"# Python ONVIF 백채널 송출 @ {a.host}")
     uri, model = onvif_stream_uri(a.host, a.user, a.pw)
@@ -797,9 +825,20 @@ def main():
             print(f"  SETUP(tcp) -> 200  session={r.session}  channel={ch}")
             print(f"    Transport: {setup_transport or '-'}")
         print(f"  PLAY -> 200  (transport={a.transport})")
-        print(f"    RTP-Info: {backchannel.play_headers.get('rtp-info', '-')}")
         backchannel_info = rtp_info_for_track(
             backchannel.play_headers.get("rtp-info", ""), ctrl
+        )
+        advertised_seq = backchannel_info.get("seq")
+        advertised_timestamp = backchannel_info.get("rtptime")
+        advertised_ssrc = negotiated_ssrc
+        advertised_ssrc_text = (
+            f"{advertised_ssrc:08X}" if advertised_ssrc is not None else "-"
+        )
+        print(
+            "    Server-advertised RTP: "
+            f"seq={advertised_seq if advertised_seq is not None else '-'} "
+            f"rtptime={advertised_timestamp if advertised_timestamp is not None else '-'} "
+            f"ssrc={advertised_ssrc_text}"
         )
 
         aac_frames = None
@@ -830,17 +869,29 @@ def main():
             if preroll:
                 print(f"  무음 preroll: {a.preroll_ms}ms ({len(preroll)} bytes)")
 
-        seq = backchannel_info.get("seq")
-        if seq is None:
-            seq = int.from_bytes(os.urandom(2), "big")
-        ts = backchannel_info.get("rtptime")
-        if ts is None:
-            ts = int.from_bytes(os.urandom(4), "big")
-        ts_start = ts
-        ssrc = negotiated_ssrc if negotiated_ssrc is not None else int.from_bytes(os.urandom(4), "big")
-        print(f"  RTP 시작값: seq={seq} rtptime={ts} ssrc={ssrc:08X}")
+        if a.rtp_identity == "legacy":
+            sequence = advertised_seq
+            if sequence is None:
+                sequence = int.from_bytes(os.urandom(2), "big")
+            timestamp = advertised_timestamp
+            if timestamp is None:
+                timestamp = int.from_bytes(os.urandom(4), "big")
+            ssrc = advertised_ssrc
+            if ssrc is None:
+                ssrc = int.from_bytes(os.urandom(4), "big")
+            packetizer = RtpPacketizer(pt, ssrc, sequence, timestamp)
+        else:
+            packetizer = RtpPacketizer(pt)
+        initial_ssrc, initial_sequence, initial_timestamp = packetizer.initial_state
+        identity_suffix = " (legacy)" if a.rtp_identity == "legacy" else ""
+        print(
+            "    Selected sender RTP: "
+            f"seq={initial_sequence} rtptime={initial_timestamp} "
+            f"ssrc={initial_ssrc:08X}{identity_suffix}"
+        )
         sent = 0
         octets_sent = 0
+        total_samples_sent = 0
         nxt = time.monotonic()
         mono_start = nxt
         wall_start = time.time()
@@ -848,9 +899,15 @@ def main():
         cname = f"py-poc@{socket.gethostname()}"
 
         def send_rtcp(now):
-            elapsed = now - mono_start
-            current_rtp_ts = (ts_start + int(elapsed * a.sample_rate)) & 0xFFFFFFFF
-            report = rtcp_sender_report(ssrc, current_rtp_ts, sent, octets_sent,
+            elapsed = max(0.0, now - mono_start)
+            mapped_samples = min(
+                math.floor(elapsed * a.sample_rate), total_samples_sent
+            )
+            report_timestamp = (
+                initial_timestamp + mapped_samples
+            ) & 0xFFFFFFFF
+            report = rtcp_sender_report(packetizer.ssrc, report_timestamp,
+                                        sent, octets_sent,
                                         wall_start + elapsed, cname)
             backchannel.send_rtcp(report)
 
@@ -859,33 +916,34 @@ def main():
                              for frame in aac_frames)
             frame_seconds = 1024 / a.sample_rate
         else:
-            samples_per_frame = a.sample_rate // 50  # 20 ms
             bytes_per_frame = samples_per_frame * bytes_per_sample
             packet_source = ((stream_payload[off:off + bytes_per_frame],
                               len(stream_payload[off:off + bytes_per_frame]) // bytes_per_sample,
-                              off == audio_start_offset)
+                              off <= audio_start_offset < off + bytes_per_frame)
                              for off in range(0, len(stream_payload), bytes_per_frame))
-            frame_seconds = 0.02
+            frame_seconds = a.packet_ms / 1000
 
         for chunk, samples_in_packet, audio_marker in packet_source:
-            hdr = bytearray(12)
-            hdr[0] = 0x80
-            marker = sent == 0 or audio_marker
-            hdr[1] = (0x80 if marker else 0) | pt
-            hdr[2:4] = struct.pack(">H", seq & 0xFFFF)
-            hdr[4:8] = struct.pack(">I", ts & 0xFFFFFFFF)
-            hdr[8:12] = struct.pack(">I", ssrc & 0xFFFFFFFF)
-            rtp = bytes(hdr) + chunk
+            if a.codec == "aac":
+                # RFC 3640 packetization is experimental and keeps its prior AU marker policy.
+                marker = audio_marker
+            elif a.marker_mode == "audio-start":
+                marker = sent == 0 or audio_marker
+            else:
+                marker = sent == 0
+            rtp = packetizer.build(chunk, samples_in_packet, marker)
             backchannel.send_rtp(rtp)
-            seq += 1
-            ts += samples_in_packet
             sent += 1
             octets_sent += len(chunk)
+            total_samples_sent += samples_in_packet
             now = time.monotonic()
             if a.rtcp_interval > 0 and (sent == 1 or now - last_rtcp >= a.rtcp_interval):
                 send_rtcp(now)
                 last_rtcp = now
-            nxt += frame_seconds
+            packet_seconds = frame_seconds
+            if a.codec != "aac" and samples_in_packet < samples_per_frame:
+                packet_seconds = samples_in_packet / a.sample_rate
+            nxt += packet_seconds
             d = nxt - time.monotonic()
             if d > 0:
                 time.sleep(d)

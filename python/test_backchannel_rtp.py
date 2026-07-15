@@ -1,4 +1,5 @@
 import hashlib
+import importlib
 import json
 import os
 import pathlib
@@ -68,6 +69,121 @@ def make_rtp_packet(
         packet.extend(bytes(padding - 1))
         packet.append(padding)
     return bytes(packet)
+
+
+class RtpPacketizerTests(unittest.TestCase):
+    def setUp(self):
+        try:
+            self.module = importlib.import_module("backchannel_rtp")
+        except ModuleNotFoundError as error:
+            self.fail(f"backchannel_rtp module is missing: {error}")
+        self.packetizer_type = self.module.RtpPacketizer
+
+    def test_defaults_consume_independent_secure_random_values(self):
+        random_values = [
+            b"\x01\x02\x03\x04",
+            b"\x05\x06",
+            b"\x07\x08\x09\x0a",
+        ]
+
+        with mock.patch.object(
+            self.module.os, "urandom", side_effect=random_values
+        ) as urandom:
+            packetizer = self.packetizer_type(payload_type=8)
+
+        self.assertEqual(packetizer.initial_state, (0x01020304, 0x0506, 0x0708090A))
+        self.assertEqual(packetizer.ssrc, 0x01020304)
+        self.assertEqual(packetizer.sequence, 0x0506)
+        self.assertEqual(packetizer.timestamp, 0x0708090A)
+        self.assertEqual([call.args for call in urandom.call_args_list], [(4,), (2,), (4,)])
+
+    def test_build_emits_rtp_v2_header_payload_marker_and_payload_type(self):
+        packetizer = self.packetizer_type(
+            payload_type=97,
+            ssrc=0x50607080,
+            sequence=0x1234,
+            timestamp=0x10203040,
+        )
+
+        packet = packetizer.build(memoryview(b"audio"), samples=160, marker=True)
+        meta = parse_rtp_packet(packet)
+
+        self.assertEqual(packet[0], 0x80)
+        self.assertEqual(meta.payload_type, 97)
+        self.assertTrue(meta.marker)
+        self.assertEqual(meta.sequence, 0x1234)
+        self.assertEqual(meta.timestamp, 0x10203040)
+        self.assertEqual(meta.ssrc, 0x50607080)
+        self.assertEqual(packet[12:], b"audio")
+        self.assertEqual(packetizer.sequence, 0x1235)
+        self.assertEqual(packetizer.timestamp, 0x102030E0)
+        self.assertEqual(packetizer.initial_state, (0x50607080, 0x1234, 0x10203040))
+
+    def test_build_wraps_sequence_and_timestamp_while_ssrc_stays_constant(self):
+        packetizer = self.packetizer_type(
+            payload_type=8,
+            ssrc=0xAABBCCDD,
+            sequence=0xFFFF,
+            timestamp=0xFFFFFFFE,
+        )
+
+        first = parse_rtp_packet(packetizer.build(bytearray(b"a"), samples=2))
+        second = parse_rtp_packet(packetizer.build(b"b", samples=1))
+
+        self.assertEqual((first.sequence, first.timestamp, first.ssrc),
+                         (0xFFFF, 0xFFFFFFFE, 0xAABBCCDD))
+        self.assertEqual((second.sequence, second.timestamp, second.ssrc),
+                         (0, 0, 0xAABBCCDD))
+        self.assertEqual(packetizer.sequence, 1)
+        self.assertEqual(packetizer.timestamp, 1)
+        self.assertEqual(packetizer.ssrc, 0xAABBCCDD)
+
+    def test_initial_state_is_read_only(self):
+        packetizer = self.packetizer_type(8, ssrc=1, sequence=2, timestamp=3)
+
+        with self.assertRaises(AttributeError):
+            packetizer.initial_state = (4, 5, 6)
+
+    def test_rejects_invalid_constructor_values(self):
+        cases = {
+            "negative payload type": {"payload_type": -1},
+            "large payload type": {"payload_type": 128},
+            "noninteger payload type": {"payload_type": 8.5},
+            "negative ssrc": {"payload_type": 8, "ssrc": -1},
+            "large ssrc": {"payload_type": 8, "ssrc": 1 << 32},
+            "negative sequence": {"payload_type": 8, "sequence": -1},
+            "large sequence": {"payload_type": 8, "sequence": 1 << 16},
+            "negative timestamp": {"payload_type": 8, "timestamp": -1},
+            "large timestamp": {"payload_type": 8, "timestamp": 1 << 32},
+        }
+
+        for name, kwargs in cases.items():
+            with self.subTest(name=name), self.assertRaises((TypeError, ValueError)):
+                self.packetizer_type(**kwargs)
+
+    def test_rejects_invalid_payload_and_sample_counts_without_advancing(self):
+        packetizer = self.packetizer_type(8, ssrc=1, sequence=2, timestamp=3)
+
+        for payload in (None, "audio", 7):
+            with self.subTest(payload=payload), self.assertRaises(TypeError):
+                packetizer.build(payload, samples=1)
+        for samples in (0, -1, 1 << 32, 1.5, True):
+            with self.subTest(samples=samples), self.assertRaises(
+                (TypeError, ValueError)
+            ):
+                packetizer.build(b"audio", samples=samples)
+
+        self.assertEqual((packetizer.sequence, packetizer.timestamp), (2, 3))
+
+    def test_rejects_nonboolean_markers_without_advancing(self):
+        packetizer = self.packetizer_type(8, ssrc=1, sequence=2, timestamp=3)
+
+        for marker in (1, None, "true"):
+            with self.subTest(marker=marker), self.assertRaises(TypeError):
+                packetizer.build(b"audio", samples=160, marker=marker)
+
+        self.assertEqual((packetizer.sequence, packetizer.timestamp), (2, 3))
+        self.assertEqual(packetizer.ssrc, 1)
 
 
 class ParseRtpPacketTests(unittest.TestCase):
