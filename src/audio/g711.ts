@@ -36,11 +36,29 @@ export function linearToALaw(sample: number): number {
 
 export type G711Variant = 'PCMU' | 'PCMA';
 
-/** Encode an Int16 PCM buffer to a G.711 byte buffer (1 byte/sample). */
-export function pcm16ToG711(pcm: Int16Array, variant: G711Variant): Buffer {
+const Q11_UNITY = 1 << 11;
+
+function volumeToQ11(volume: number): number {
+  if (!Number.isFinite(volume) || volume < 0 || volume > 1) {
+    throw new RangeError('volume must be finite and between 0 and 1');
+  }
+  return Math.trunc(volume * Q11_UNITY);
+}
+
+function applyQ11Gain(sample: number, gain: number): number {
+  return Math.max(-32768, Math.min(32767, Math.floor((sample * gain) / Q11_UNITY)));
+}
+
+/** Encode Int16 PCM to G.711 after applying GStreamer-compatible Q11 gain. */
+export function pcm16ToG711(
+  pcm: Int16Array,
+  variant: G711Variant,
+  volume = 1,
+): Buffer {
   const enc = variant === 'PCMA' ? linearToALaw : linearToMuLaw;
+  const gain = volumeToQ11(volume);
   const out = Buffer.allocUnsafe(pcm.length);
-  for (let i = 0; i < pcm.length; i++) out[i] = enc(pcm[i]);
+  for (let i = 0; i < pcm.length; i++) out[i] = enc(applyQ11Gain(pcm[i], gain));
   return out;
 }
 
