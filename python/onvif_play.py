@@ -36,13 +36,21 @@ RTSP_MAX_BODY_BYTES = 4 * 1024 * 1024
 RTSP_MAX_BUFFER_BYTES = 8 * 1024 * 1024
 RTSP_MAX_QUEUED_RESPONSES = 64
 DEFAULT_RTSP_SESSION_TIMEOUT_SECONDS = 60
+MAX_RTSP_SESSION_TIMEOUT_SECONDS = int(threading.TIMEOUT_MAX) * 2
 RTSP_KEEPALIVE_METHODS = ("SET_PARAMETER", "GET_PARAMETER", "OPTIONS")
-RTSP_KEEPALIVE_JOIN_TIMEOUT_SECONDS = RTSP_IO_TIMEOUT_SECONDS + 1
+RTSP_KEEPALIVE_MAX_EXCHANGES = len(RTSP_KEEPALIVE_METHODS) * 2
+# An exchange may consume one socket-send timeout plus one response timeout.
+RTSP_REQUEST_EXCHANGE_BUDGET_SECONDS = RTSP_IO_TIMEOUT_SECONDS * 2
+RTSP_KEEPALIVE_JOIN_TIMEOUT_SECONDS = (
+    RTSP_KEEPALIVE_MAX_EXCHANGES * RTSP_REQUEST_EXCHANGE_BUDGET_SECONDS + 1
+)
+RTSP_KEEPALIVE_CANCEL_JOIN_TIMEOUT_SECONDS = RTSP_IO_TIMEOUT_SECONDS + 1
 MAX_PCMA_INPUT_BYTES = 128 * 1024 * 1024
 MAX_AUDIO_SOURCE_BYTES = 128 * 1024 * 1024
 MAX_AUDIO_SOURCE_FRAMES = 100_000
 MAX_REPEATED_MEDIA_BYTES = 128 * 1024 * 1024
 MAX_REPEATED_AUDIO_FRAMES = 1_000_000
+MAX_PREROLL_MILLISECONDS = MAX_REPEATED_MEDIA_BYTES * 1000 // 8000
 MAX_TIMING_ROWS = TIMING_LOG_MAX_ROWS
 MAX_TIMING_LINE_BYTES = TIMING_LOG_MAX_LINE_BYTES
 MAX_TIMING_BYTES = TIMING_LOG_MAX_BYTES
@@ -202,6 +210,8 @@ class Rtsp:
         self.write_lock = threading.Lock()
         self.request_lock = threading.Lock()
         self.responses = queue.Queue(maxsize=RTSP_MAX_QUEUED_RESPONSES)
+        self.response_timeout_seconds = RTSP_IO_TIMEOUT_SECONDS
+        self.monotonic = time.monotonic
         self.reader_failure = None
         self.closed = False
         self.reader = threading.Thread(target=self._reader_loop, daemon=True)
@@ -220,8 +230,14 @@ class Rtsp:
     def _send(self, method, uri, extra):
         self._raise_reader_failure()
         self.cseq += 1
-        hdr = {"CSeq": str(self.cseq), "User-Agent": "py-poc"}
-        hdr.update(extra)
+        expected_cseq = self.cseq
+        hdr = {"User-Agent": "py-poc"}
+        hdr.update(
+            (key, value)
+            for key, value in extra.items()
+            if key.lower() != "cseq"
+        )
+        hdr["CSeq"] = str(expected_cseq)
         a = self._auth(method, uri)
         if a:
             hdr["Authorization"] = a
@@ -229,7 +245,7 @@ class Rtsp:
         with self.write_lock:
             self._raise_reader_failure()
             self.s.sendall(msg.encode())
-        return self._read()
+        return self._read(expected_cseq)
 
     def _raise_reader_failure(self):
         if self.reader_failure is not None:
@@ -301,15 +317,47 @@ class Rtsp:
         except Exception as exc:
             self._fail_reader(exc)
 
-    def _read(self):
-        self._raise_reader_failure()
-        try:
-            result = self.responses.get(timeout=RTSP_IO_TIMEOUT_SECONDS)
-        except queue.Empty as exc:
-            raise TimeoutError("RTSP response timeout") from exc
-        if isinstance(result, Exception):
-            raise result
-        return result
+    def _read(self, expected_cseq):
+        deadline = self.monotonic() + self.response_timeout_seconds
+        expected_text = str(expected_cseq)
+        while True:
+            self._raise_reader_failure()
+            remaining = deadline - self.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("RTSP response timeout")
+            try:
+                result = self.responses.get(timeout=remaining)
+            except queue.Empty as exc:
+                self._raise_reader_failure()
+                raise TimeoutError("RTSP response timeout") from exc
+            if isinstance(result, Exception):
+                raise result
+            _, headers, _ = result
+            raw_cseq = headers.get("cseq")
+            if raw_cseq is None:
+                raise RuntimeError("missing RTSP response CSeq")
+            if not re.fullmatch(r"[0-9]+", raw_cseq):
+                raise RuntimeError(
+                    f"invalid RTSP response CSeq: {raw_cseq!r}"
+                )
+            normalized_cseq = raw_cseq.lstrip("0") or "0"
+            if (
+                len(normalized_cseq) < len(expected_text)
+                or (
+                    len(normalized_cseq) == len(expected_text)
+                    and normalized_cseq < expected_text
+                )
+            ):
+                continue
+            if normalized_cseq != expected_text:
+                display_cseq = normalized_cseq[:32]
+                if len(normalized_cseq) > len(display_cseq):
+                    display_cseq += "..."
+                raise RuntimeError(
+                    "future RTSP response CSeq "
+                    f"{display_cseq} while waiting for {expected_cseq}"
+                )
+            return result
 
     def request(self, method, uri, extra=None):
         with self.request_lock:
@@ -415,9 +463,24 @@ def parse_session_header(
         if not separator or key.strip().lower() != "timeout":
             continue
         value = value.strip().strip('"')
-        if not re.fullmatch(r"[0-9]+", value) or int(value) <= 0:
-            raise RuntimeError(f"invalid RTSP Session timeout: {value!r}")
-        timeout = int(value)
+        normalized = value.lstrip("0") or "0"
+        maximum = str(MAX_RTSP_SESSION_TIMEOUT_SECONDS)
+        if (
+            not re.fullmatch(r"[0-9]+", value)
+            or normalized == "0"
+            or len(normalized) > len(maximum)
+            or (
+                len(normalized) == len(maximum)
+                and normalized > maximum
+            )
+        ):
+            display_value = value[:64]
+            if len(value) > len(display_value):
+                display_value += "..."
+            raise RuntimeError(
+                f"invalid RTSP Session timeout: {display_value!r}"
+            )
+        timeout = int(normalized)
     return session_id, timeout
 
 
@@ -449,6 +512,10 @@ class BackchannelTransport:
         transport,
         *,
         keepalive_event_factory=threading.Event,
+        keepalive_join_timeout_seconds=RTSP_KEEPALIVE_JOIN_TIMEOUT_SECONDS,
+        keepalive_cancel_join_timeout_seconds=(
+            RTSP_KEEPALIVE_CANCEL_JOIN_TIMEOUT_SECONDS
+        ),
     ):
         self.stream_uri = stream_uri
         self.rtsp = rtsp
@@ -465,6 +532,10 @@ class BackchannelTransport:
         self.session_timeout_seconds = DEFAULT_RTSP_SESSION_TIMEOUT_SECONDS
         self.keepalive_method = "OPTIONS"
         self.keepalive_event_factory = keepalive_event_factory
+        self.keepalive_join_timeout_seconds = keepalive_join_timeout_seconds
+        self.keepalive_cancel_join_timeout_seconds = (
+            keepalive_cancel_join_timeout_seconds
+        )
         self.keepalive_stop = None
         self.keepalive_thread = None
         self.keepalive_failure = None
@@ -523,9 +594,14 @@ class BackchannelTransport:
         )
         self.keepalive_thread.start()
 
+    def check_keepalive(self):
+        if self.keepalive_failure is not None:
+            raise self.keepalive_failure
+
     def send_rtp(self, packet):
         if self.closed:
             raise RuntimeError("backchannel transport is closed")
+        self.check_keepalive()
         if self.transport == "tcp":
             self.rtsp.send_interleaved(self.rtp_channel, packet)
         else:
@@ -534,6 +610,7 @@ class BackchannelTransport:
     def send_rtcp(self, packet):
         if self.closed:
             raise RuntimeError("backchannel transport is closed")
+        self.check_keepalive()
         if self.transport == "tcp":
             self.rtsp.send_interleaved(self.rtcp_channel, packet)
         else:
@@ -545,24 +622,50 @@ class BackchannelTransport:
         if self.closed:
             return
         errors = []
+        rtsp_closed = False
+        forced_rtsp_cancellation = False
+
+        def record_error(error):
+            if not any(error is existing for existing in errors):
+                errors.append(error)
+
         try:
-            keepalive_stopped = True
             if self.keepalive_thread is not None:
                 self.keepalive_stop.set()
                 try:
                     self.keepalive_thread.join(
-                        timeout=RTSP_KEEPALIVE_JOIN_TIMEOUT_SECONDS
+                        timeout=self.keepalive_join_timeout_seconds
                     )
                 except BaseException as error:
-                    errors.append(error)
+                    record_error(error)
                 if self.keepalive_thread.is_alive():
-                    keepalive_stopped = False
-                    errors.append(RuntimeError(
-                        "RTSP keepalive thread did not stop"
+                    forced_rtsp_cancellation = True
+                    record_error(RuntimeError(
+                        "RTSP keepalive exceeded its shutdown budget; "
+                        "TEARDOWN could not be sent because the RTSP "
+                        "connection had to be closed"
                     ))
+                    try:
+                        self.rtsp.close()
+                    except BaseException as error:
+                        record_error(error)
+                    finally:
+                        rtsp_closed = True
+                    try:
+                        self.keepalive_thread.join(
+                            timeout=self.keepalive_cancel_join_timeout_seconds
+                        )
+                    except BaseException as error:
+                        record_error(error)
+                    if self.keepalive_thread.is_alive():
+                        record_error(RuntimeError(
+                            "RTSP keepalive thread exceeded the forced "
+                            "cancellation join budget"
+                        ))
+                        self.keepalive_thread.join()
                 if self.keepalive_failure is not None:
-                    errors.append(self.keepalive_failure)
-            if self.rtsp.session and keepalive_stopped:
+                    record_error(self.keepalive_failure)
+            if self.rtsp.session and not forced_rtsp_cancellation:
                 try:
                     status, _, _ = self.rtsp.request("TEARDOWN", self.stream_uri, {
                         "Session": self.rtsp.session,
@@ -570,17 +673,18 @@ class BackchannelTransport:
                     })
                     _require_rtsp_success("TEARDOWN", status)
                 except BaseException as error:
-                    errors.append(error)
+                    record_error(error)
             for udp_socket in (self.udp_socket, self.udp_rtcp_socket):
                 if udp_socket is not None:
                     try:
                         udp_socket.close()
                     except BaseException as error:
-                        errors.append(error)
-            try:
-                self.rtsp.close()
-            except BaseException as error:
-                errors.append(error)
+                        record_error(error)
+            if not rtsp_closed:
+                try:
+                    self.rtsp.close()
+                except BaseException as error:
+                    record_error(error)
         finally:
             self.closed = True
         if errors:
@@ -638,6 +742,10 @@ def open_backchannel_transport(
     onvif_uri_resolver=None,
     client_rtp_port=50000,
     keepalive_event_factory=threading.Event,
+    keepalive_join_timeout_seconds=RTSP_KEEPALIVE_JOIN_TIMEOUT_SECONDS,
+    keepalive_cancel_join_timeout_seconds=(
+        RTSP_KEEPALIVE_CANCEL_JOIN_TIMEOUT_SECONDS
+    ),
 ):
     """Open and PLAY an ONVIF backchannel, returning a closable RTP transport."""
     if transport not in {"tcp", "udp"}:
@@ -660,6 +768,10 @@ def open_backchannel_transport(
         camera_host,
         transport,
         keepalive_event_factory=keepalive_event_factory,
+        keepalive_join_timeout_seconds=keepalive_join_timeout_seconds,
+        keepalive_cancel_join_timeout_seconds=(
+            keepalive_cancel_join_timeout_seconds
+        ),
     )
     result.model = model
 
@@ -858,7 +970,7 @@ CODECS = {
 
 def tone_audio(freq, ms, codec, amp=0.7, rate=8000):
     enc = CODECS[codec][2]
-    n = int(rate * ms / 1000)
+    n = rate * ms // 1000
     if codec == "l16":
         return b"".join(struct.pack(">h", int(amp * 32767 * math.sin(2 * math.pi * freq * i / rate)))
                         for i in range(n))
@@ -885,7 +997,15 @@ def file_audio(path, codec, volume, sample_rate, encoder="ffmpeg"):
     return p.stdout
 
 
-def parse_adts_frames(data):
+def parse_adts_frames(data, max_frames=None):
+    if max_frames is None:
+        max_frames = MAX_AUDIO_SOURCE_FRAMES
+    if (
+        isinstance(max_frames, bool)
+        or not isinstance(max_frames, int)
+        or max_frames < 0
+    ):
+        raise ValueError("AAC max_frames must be a nonnegative integer")
     frames = []
     offset = 0
     while offset < len(data):
@@ -896,12 +1016,23 @@ def parse_adts_frames(data):
         header_length = 7 if protection_absent else 9
         if frame_length < header_length or offset + frame_length > len(data):
             raise RuntimeError(f"truncated ADTS frame at byte {offset}")
+        if len(frames) >= max_frames:
+            raise ValueError(
+                f"AAC source frame count exceeds {max_frames} frame limit"
+            )
         frames.append(data[offset + header_length:offset + frame_length])
         offset += frame_length
     return frames
 
 
-def file_aac(path, volume, sample_rate, preroll_ms, bitrate_kbps=64):
+def file_aac(
+    path,
+    volume,
+    sample_rate,
+    preroll_ms,
+    bitrate_kbps=64,
+    max_frames=None,
+):
     filters = [f"volume={volume}"]
     if preroll_ms:
         filters.append(f"adelay={preroll_ms}:all=1")
@@ -914,7 +1045,12 @@ def file_aac(path, volume, sample_rate, preroll_ms, bitrate_kbps=64):
     ], capture_output=True)
     if p.returncode != 0:
         raise RuntimeError("ffmpeg AAC: " + p.stderr.decode().strip())
-    return parse_adts_frames(p.stdout)
+    if len(p.stdout) > MAX_AUDIO_SOURCE_BYTES:
+        raise ValueError(
+            "AAC encoded output exceeds "
+            f"{MAX_AUDIO_SOURCE_BYTES} byte limit"
+        )
+    return parse_adts_frames(p.stdout, max_frames=max_frames)
 
 
 def aac_rfc3640_payload(frame):
@@ -1010,7 +1146,9 @@ def _timing_packet_count(arguments, payload, aac_frames, samples_per_frame):
     if arguments.codec == "aac":
         return len(aac_frames)
     bytes_per_sample = 2 if arguments.codec == "l16" else 1
-    preroll_samples = arguments.sample_rate * arguments.preroll_ms // 1000
+    preroll_samples = preroll_sample_count(
+        arguments.sample_rate, arguments.preroll_ms
+    )
     total_bytes = len(payload) + preroll_samples * bytes_per_sample
     bytes_per_frame = samples_per_frame * bytes_per_sample
     return (total_bytes + bytes_per_frame - 1) // bytes_per_frame
@@ -1129,19 +1267,43 @@ def repeat_aac_frames_for_session_cycles(
     return frames * repetitions + frames[:tail_frames]
 
 
-def session_timeout_cycles(value):
-    try:
-        cycles = int(value)
-    except ValueError as error:
+def _bounded_nonnegative_decimal(value, *, maximum, label):
+    text = value.strip()
+    maximum_text = str(maximum)
+    if (
+        not re.fullmatch(r"[0-9]+", text)
+        or len(text) > len(maximum_text)
+        or (len(text) == len(maximum_text) and text > maximum_text)
+    ):
         raise argparse.ArgumentTypeError(
-            "session timeout cycles must be an integer"
-        ) from error
-    if str(cycles) != value.strip() or not 0 <= cycles <= MAX_SESSION_TIMEOUT_CYCLES:
-        raise argparse.ArgumentTypeError(
-            "session timeout cycles must be between 0 and "
-            f"{MAX_SESSION_TIMEOUT_CYCLES}"
+            f"{label} must be between 0 and {maximum}"
         )
-    return cycles
+    result = int(text)
+    if str(result) != text:
+        raise argparse.ArgumentTypeError(
+            f"{label} must be between 0 and {maximum}"
+        )
+    return result
+
+
+def session_timeout_cycles(value):
+    return _bounded_nonnegative_decimal(
+        value,
+        maximum=MAX_SESSION_TIMEOUT_CYCLES,
+        label="session timeout cycles",
+    )
+
+
+def preroll_milliseconds(value):
+    return _bounded_nonnegative_decimal(
+        value,
+        maximum=MAX_PREROLL_MILLISECONDS,
+        label="preroll milliseconds",
+    )
+
+
+def preroll_sample_count(sample_rate, preroll_ms):
+    return sample_rate * preroll_ms // 1000
 
 
 def build_argument_parser():
@@ -1160,7 +1322,7 @@ def build_argument_parser():
                     default=8000, help="PCMA/PCMU RTP clock rate offered by the camera")
     ap.add_argument("--rtcp-interval", type=float, default=0.5,
                     help="seconds between RTCP sender reports; 0 disables RTCP")
-    ap.add_argument("--preroll-ms", type=int, default=3000,
+    ap.add_argument("--preroll-ms", type=preroll_milliseconds, default=3000,
                     help="silent RTP warm-up before audio, for camera clock convergence")
     ap.add_argument("--rtp-identity", choices=["legacy", "sender"], default="sender",
                     help="RTP identity source: sender-owned random state or legacy server values")
@@ -1213,8 +1375,8 @@ def main(argv=None):
     remove_output(a.timing_log)
     if not math.isfinite(a.volume) or not 0.0 <= a.volume <= 1.0:
         ap.error("--volume must be finite and between 0.0 and 1.0")
-    if a.rtcp_interval < 0:
-        ap.error("--rtcp-interval must be 0 or greater")
+    if not math.isfinite(a.rtcp_interval) or a.rtcp_interval < 0:
+        ap.error("--rtcp-interval must be finite and 0 or greater")
     if a.preroll_ms < 0:
         ap.error("--preroll-ms must be 0 or greater")
     if a.pcma_input and a.codec != "pcma":
@@ -1229,6 +1391,11 @@ def main(argv=None):
         ap.error(
             "--session-timeout-cycles cannot repeat the one-shot "
             "--packet-pattern manifest"
+        )
+    if a.codec == "aac" and a.session_timeout_cycles and a.preroll_ms:
+        ap.error(
+            "AAC --session-timeout-cycles cannot use --preroll-ms because "
+            "encoder priming and silence must not be repeated"
         )
 
     packet_limit = 65535 if a.transport == "tcp" else 65507
@@ -1275,6 +1442,20 @@ def main(argv=None):
                 f"{MAX_AUDIO_SOURCE_BYTES} byte source limit"
             )
 
+    bytes_per_sample = None
+    preroll_samples = None
+    if a.codec != "aac":
+        bytes_per_sample = 2 if a.codec == "l16" else 1
+        preroll_samples = preroll_sample_count(
+            a.sample_rate, a.preroll_ms
+        )
+        preroll_bytes = preroll_samples * bytes_per_sample
+        if preroll_bytes > MAX_REPEATED_MEDIA_BYTES:
+            ap.error(
+                f"audio preroll requires {preroll_bytes} bytes, exceeding "
+                f"the {MAX_REPEATED_MEDIA_BYTES} byte media limit"
+            )
+
     payload, aac_frames, audio_message = prepare_audio(a)
     if a.codec == "aac" and len(aac_frames) > MAX_AUDIO_SOURCE_FRAMES:
         ap.error(
@@ -1293,19 +1474,11 @@ def main(argv=None):
         )
     boundary_plan = None
     if a.codec != "aac":
-        bytes_per_sample = 2 if a.codec == "l16" else 1
         silence_sample = {
             "pcma": b"\xD5",
             "pcmu": b"\xFF",
             "l16": b"\x00\x00",
         }[a.codec]
-        preroll_samples = int(a.sample_rate * a.preroll_ms / 1000)
-        preroll_bytes = preroll_samples * bytes_per_sample
-        if preroll_bytes > MAX_REPEATED_MEDIA_BYTES:
-            ap.error(
-                f"audio preroll requires {preroll_bytes} bytes, exceeding "
-                f"the {MAX_REPEATED_MEDIA_BYTES} byte media limit"
-            )
         preroll = silence_sample * preroll_samples
         audio_start_offset = len(preroll)
         stream_payload = None if a.session_timeout_cycles else preroll + payload
@@ -1557,6 +1730,7 @@ def main(argv=None):
             )
 
         for chunk, samples_in_packet, audio_marker in packet_source:
+            backchannel.check_keepalive()
             timing = pacer.wait(samples_in_packet)
             if a.codec == "aac":
                 # RFC 3640 packetization is experimental and keeps its prior AU marker policy.
@@ -1601,7 +1775,9 @@ def main(argv=None):
             ):
                 send_rtcp(now_ns)
                 last_rtcp_ns = now_ns
+        backchannel.check_keepalive()
         pacer.finish()
+        backchannel.check_keepalive()
         if a.rtcp_interval > 0:
             send_rtcp(time.monotonic_ns())
         print(f"  ✓ {sent} RTP 프레임 송신 완료 ({a.transport}) — 카메라 스피커에서 재생됐다면 성공")

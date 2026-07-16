@@ -3,12 +3,14 @@ import json
 import math
 import os
 import pathlib
+import queue
 import socket
 import struct
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
@@ -210,6 +212,43 @@ class KeepaliveFallbackRtsp(FakeRtsp):
         return super().request(method, uri, headers)
 
 
+class PausingKeepaliveFallbackRtsp(KeepaliveFallbackRtsp):
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.get_parameter_started = threading.Event()
+        self.allow_get_parameter = threading.Event()
+
+    def request(self, method, uri, headers=None):
+        if method == "GET_PARAMETER":
+            headers = headers or {}
+            self.requests.append((method, uri, headers))
+            self.events.append(("request", method, uri, headers))
+            self.get_parameter_started.set()
+            if not self.allow_get_parameter.wait(timeout=1):
+                raise AssertionError("GET_PARAMETER fallback was not released")
+            return 501, {}, ""
+        return super().request(method, uri, headers)
+
+
+class UnsupportedKeepaliveRtsp(FakeRtsp):
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.keepalive_exhausted = threading.Event()
+
+    def request(self, method, uri, headers=None):
+        headers = headers or {}
+        if method in {"SET_PARAMETER", "GET_PARAMETER"}:
+            self.requests.append((method, uri, headers))
+            self.events.append(("request", method, uri, headers))
+            return (405 if method == "SET_PARAMETER" else 501), {}, ""
+        if method == "OPTIONS" and "Session" in headers:
+            self.requests.append((method, uri, headers))
+            self.events.append(("request", method, uri, headers))
+            self.keepalive_exhausted.set()
+            return 405, {}, ""
+        return super().request(method, uri, headers)
+
+
 class GetParameterKeepaliveRtsp(FakeRtsp):
     public_header = "OPTIONS, DESCRIBE, SETUP, PLAY, GET_PARAMETER, TEARDOWN"
 
@@ -277,6 +316,32 @@ class KeepaliveFailureRtsp(ParameterizedSessionRtsp):
                 self.transport.keepalive_thread.is_alive()
             )
         return super().request(method, uri, headers)
+
+
+class BlockingKeepaliveRtsp(ParameterizedSessionRtsp):
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.keepalive_started = threading.Event()
+        self.release_keepalive = threading.Event()
+
+    def request(self, method, uri, headers=None):
+        if method == "SET_PARAMETER":
+            headers = headers or {}
+            self.requests.append((method, uri, headers))
+            self.events.append(("request", method, uri, headers))
+            self.keepalive_started.set()
+            if not self.release_keepalive.wait(timeout=1):
+                raise AssertionError("RTSP close did not interrupt keepalive")
+            raise RuntimeError("keepalive interrupted by RTSP close")
+        return super().request(method, uri, headers)
+
+    def close(self):
+        self.closed = True
+        self.events.append(("close",))
+        self.release_keepalive.set()
+        error = RuntimeError("forced RTSP socket close failure")
+        error.add_note("forced RTSP reader close detail")
+        raise error
 
 
 class CombinedCleanupFailureRtsp(KeepaliveFailureRtsp):
@@ -424,6 +489,43 @@ class ScriptedRtspSocket:
         self.closed = True
 
 
+class LateKeepaliveResponseSocket:
+    def __init__(self):
+        self.sent = []
+        self.timeouts = []
+        self.second_request_sent = threading.Event()
+        self.closed_event = threading.Event()
+        self.response_delivered = False
+        self.closed = False
+
+    def settimeout(self, timeout):
+        self.timeouts.append(timeout)
+
+    def recv(self, size):
+        if not self.response_delivered:
+            if not self.second_request_sent.wait(timeout=1):
+                raise socket.timeout("waiting for second request")
+            self.response_delivered = True
+            return (
+                b"RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Length: 5\r\n\r\nstale"
+                b"RTSP/1.0 200 OK\r\nCSeq: 2\r\nContent-Length: 8\r\n\r\nteardown"
+            )
+        self.closed_event.wait(timeout=1)
+        return b""
+
+    def sendall(self, payload):
+        self.sent.append(payload)
+        if len(self.sent) == 2:
+            self.second_request_sent.set()
+
+    def shutdown(self, how):
+        self.closed_event.set()
+
+    def close(self):
+        self.closed = True
+        self.closed_event.set()
+
+
 class ConcurrentSendSocket:
     def __init__(self):
         self.guard = threading.Lock()
@@ -461,7 +563,9 @@ class RtspSafetyTest(unittest.TestCase):
         rtsp.challenge = None
         rtsp.reader_failure = None
         rtsp.responses = onvif_play.queue.Queue()
-        rtsp.responses.put((200, {}, ""))
+        rtsp.responses.put((200, {"cseq": "1"}, ""))
+        rtsp.response_timeout_seconds = onvif_play.RTSP_IO_TIMEOUT_SECONDS
+        rtsp.monotonic = time.monotonic
         rtsp.write_lock = threading.Lock()
         rtsp.request_lock = threading.Lock()
         errors = []
@@ -566,6 +670,31 @@ class RtspSafetyTest(unittest.TestCase):
             },
         )
 
+    def test_request_headers_cannot_override_owned_cseq(self):
+        fake_socket = ScriptedRtspSocket()
+        rtsp = onvif_play.Rtsp.__new__(onvif_play.Rtsp)
+        rtsp.s = fake_socket
+        rtsp.user = "fake-user"
+        rtsp.pw = "fake-password"
+        rtsp.cseq = 0
+        rtsp.challenge = None
+        rtsp.reader_failure = None
+        rtsp.responses = queue.Queue()
+        rtsp.responses.put((200, {"cseq": "1"}, ""))
+        rtsp.response_timeout_seconds = 1
+        rtsp.monotonic = time.monotonic
+        rtsp.write_lock = threading.Lock()
+        rtsp.request_lock = threading.Lock()
+
+        rtsp.request(
+            "OPTIONS",
+            "rtsp://example.invalid/live",
+            {"CSeq": "999"},
+        )
+
+        self.assertIn(b"CSeq: 1\r\n", fake_socket.sent[0])
+        self.assertNotIn(b"CSeq: 999\r\n", fake_socket.sent[0])
+
     def test_response_queue_overflow_fails_closed_without_blocking_reader(self):
         response = b"RTSP/1.0 200 OK\r\n\r\n"
         fake_socket = ScriptedRtspSocket(
@@ -589,7 +718,7 @@ class RtspSafetyTest(unittest.TestCase):
                 with self.assertRaisesRegex(
                     RuntimeError, "RTSP response queue exceeded 64"
                 ):
-                    rtsp._read()
+                    rtsp._read(1)
                 self.assertTrue(fake_socket.shutdown_called)
                 self.assertTrue(fake_socket.closed)
             finally:
@@ -625,7 +754,10 @@ class RtspSafetyTest(unittest.TestCase):
 
     def test_normal_request_flow_uses_bounded_response_queue(self):
         fake_socket = ScriptedRtspSocket(
-            recv_results=[b"RTSP/1.0 200 OK\r\nX-Test: yes\r\n\r\n", b""]
+            recv_results=[
+                b"RTSP/1.0 200 OK\r\nCSeq: 1\r\nX-Test: yes\r\n\r\n",
+                b"",
+            ]
         )
 
         with patch.object(
@@ -637,7 +769,7 @@ class RtspSafetyTest(unittest.TestCase):
             try:
                 self.assertEqual(
                     rtsp.request("OPTIONS", "rtsp://example.invalid/live"),
-                    (200, {"x-test": "yes"}, ""),
+                    (200, {"cseq": "1", "x-test": "yes"}, ""),
                 )
                 self.assertEqual(rtsp.responses.maxsize, 64)
                 self.assertEqual(len(fake_socket.sent), 1)
@@ -647,8 +779,9 @@ class RtspSafetyTest(unittest.TestCase):
     def test_digest_401_retry_flow_uses_bounded_response_queue(self):
         responses = (
             b"RTSP/1.0 401 Unauthorized\r\n"
+            b"CSeq: 1\r\n"
             b'WWW-Authenticate: Digest realm="camera", nonce="nonce"\r\n\r\n'
-            b"RTSP/1.0 200 OK\r\n\r\n"
+            b"RTSP/1.0 200 OK\r\nCSeq: 2\r\n\r\n"
         )
         fake_socket = ScriptedRtspSocket(recv_results=[responses, b""])
 
@@ -661,10 +794,12 @@ class RtspSafetyTest(unittest.TestCase):
             try:
                 self.assertEqual(
                     rtsp.request("OPTIONS", "rtsp://example.invalid/live"),
-                    (200, {}, ""),
+                    (200, {"cseq": "2"}, ""),
                 )
                 self.assertEqual(rtsp.responses.maxsize, 64)
                 self.assertEqual(len(fake_socket.sent), 2)
+                self.assertIn(b"CSeq: 1\r\n", fake_socket.sent[0])
+                self.assertIn(b"CSeq: 2\r\n", fake_socket.sent[1])
                 self.assertIn(b"Authorization: Digest", fake_socket.sent[1])
             finally:
                 rtsp.close()
@@ -690,7 +825,10 @@ class RtspSafetyTest(unittest.TestCase):
                 rtsp.close()
 
     def test_idle_recv_timeout_does_not_stop_reader(self):
-        response = b"RTSP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok"
+        response = (
+            b"RTSP/1.0 200 OK\r\nCSeq: 1\r\n"
+            b"Content-Length: 2\r\n\r\nok"
+        )
         fake_socket = ScriptedRtspSocket(
             recv_results=[socket.timeout("idle"), response, b""]
         )
@@ -702,7 +840,84 @@ class RtspSafetyTest(unittest.TestCase):
                 "example.invalid", 554, "fake-user", "fake-password"
             )
             try:
-                self.assertEqual(rtsp._read(), (200, {"content-length": "2"}, "ok"))
+                self.assertEqual(
+                    rtsp._read(1),
+                    (
+                        200,
+                        {"cseq": "1", "content-length": "2"},
+                        "ok",
+                    ),
+                )
+            finally:
+                rtsp.close()
+
+    def test_read_rejects_missing_malformed_and_future_cseq(self):
+        cases = (
+            ({}, "missing RTSP response CSeq"),
+            ({"cseq": "not-a-number"}, "invalid RTSP response CSeq"),
+            ({"cseq": "8"}, "future RTSP response CSeq 8"),
+        )
+        for headers, message in cases:
+            with self.subTest(headers=headers):
+                rtsp = onvif_play.Rtsp.__new__(onvif_play.Rtsp)
+                rtsp.reader_failure = None
+                rtsp.responses = queue.Queue()
+                rtsp.responses.put((200, headers, ""))
+                rtsp.response_timeout_seconds = 0.01
+                rtsp.monotonic = time.monotonic
+
+                with self.assertRaisesRegex(RuntimeError, message):
+                    rtsp._read(7)
+
+    def test_stale_responses_do_not_reset_current_request_deadline(self):
+        class AdvancingQueue:
+            def __init__(self, clock):
+                self.clock = clock
+                self.results = [
+                    (200, {"cseq": "4"}, "stale"),
+                    (200, {"cseq": "5"}, "current"),
+                ]
+                self.timeouts = []
+
+            def get(self, timeout):
+                self.timeouts.append(timeout)
+                self.clock[0] += 3
+                return self.results.pop(0)
+
+        now = [10.0]
+        rtsp = onvif_play.Rtsp.__new__(onvif_play.Rtsp)
+        rtsp.reader_failure = None
+        rtsp.response_timeout_seconds = 8.0
+        rtsp.monotonic = lambda: now[0]
+        rtsp.responses = AdvancingQueue(now)
+
+        self.assertEqual(
+            rtsp._read(5),
+            (200, {"cseq": "5"}, "current"),
+        )
+        self.assertEqual(rtsp.responses.timeouts, [8.0, 5.0])
+
+    def test_late_keepalive_response_cannot_satisfy_teardown(self):
+        fake_socket = LateKeepaliveResponseSocket()
+        with patch.object(
+            onvif_play.socket, "create_connection", return_value=fake_socket
+        ), patch.object(onvif_play, "RTSP_IO_TIMEOUT_SECONDS", 0.02):
+            rtsp = onvif_play.Rtsp(
+                "example.invalid", 554, "fake-user", "fake-password"
+            )
+            try:
+                with self.assertRaisesRegex(TimeoutError, "response timeout"):
+                    rtsp.request(
+                        "SET_PARAMETER", "rtsp://example.invalid/live"
+                    )
+                self.assertEqual(
+                    rtsp.request("TEARDOWN", "rtsp://example.invalid/live"),
+                    (
+                        200,
+                        {"cseq": "2", "content-length": "8"},
+                        "teardown",
+                    ),
+                )
             finally:
                 rtsp.close()
 
@@ -900,6 +1115,33 @@ class BackchannelTransportTest(unittest.TestCase):
             self.assertEqual(transport.session_timeout_seconds, 60)
             self.assertEqual(transport.keepalive_interval_seconds, 30)
 
+    def test_session_timeout_is_bounded_before_thread_wait_conversion(self):
+        maximum = onvif_play.MAX_RTSP_SESSION_TIMEOUT_SECONDS
+        session_id, timeout = onvif_play.parse_session_header(
+            f"bounded-session;timeout={maximum}"
+        )
+        transport = onvif_play.BackchannelTransport(
+            "rtsp://example.invalid/live",
+            FakeRtsp("example.invalid", 554, "fake-user", "fake-password"),
+            "example.invalid",
+            "tcp",
+        )
+        transport.update_session(f"{session_id};timeout={timeout}")
+
+        self.assertEqual(timeout, maximum)
+        self.assertLessEqual(
+            transport.keepalive_interval_seconds,
+            threading.TIMEOUT_MAX,
+        )
+        for invalid in (str(maximum + 1), "9" * 10_000):
+            with self.subTest(length=len(invalid)), self.assertRaisesRegex(
+                RuntimeError, "invalid RTSP Session timeout"
+            ) as raised:
+                onvif_play.parse_session_header(
+                    f"oversized-session;timeout={invalid}"
+                )
+            self.assertLess(len(str(raised.exception)), 256)
+
     def test_keepalive_prefers_advertised_set_parameter_with_session(self):
         with onvif_play.open_backchannel_transport(
             "example.invalid",
@@ -951,6 +1193,66 @@ class BackchannelTransportTest(unittest.TestCase):
                 self.assertEqual(event[3]["Session"], "test-session")
         self.assertEqual(post_play[3], ("media", 6, packet))
         self.assertEqual(transport.keepalive_method, "OPTIONS")
+
+    def test_media_remains_active_while_keepalive_fallback_is_progressing(self):
+        keepalive_event = ControlledKeepaliveEvent()
+        packet = make_rtp_packet(b"during-fallback", sequence=9, timestamp=1000)
+        transport = onvif_play.open_backchannel_transport(
+            "example.invalid",
+            "fake-user",
+            "fake-password",
+            stream_uri="rtsp://example.invalid/live",
+            rtsp_factory=PausingKeepaliveFallbackRtsp,
+            keepalive_event_factory=lambda: keepalive_event,
+        )
+        client = FakeRtsp.instances[0]
+        try:
+            self.assertTrue(keepalive_event.wait_started.wait(timeout=1))
+            keepalive_event.trigger()
+            self.assertTrue(client.get_parameter_started.wait(timeout=1))
+
+            transport.send_rtp(packet)
+
+            self.assertIsNone(transport.keepalive_failure)
+            self.assertIn(("media", 6, packet), client.events)
+            client.allow_get_parameter.set()
+            transport.keepalive_thread.join(timeout=1)
+            self.assertTrue(transport.keepalive_thread.is_alive())
+            self.assertEqual(transport.keepalive_method, "OPTIONS")
+        finally:
+            client.allow_get_parameter.set()
+            transport.close()
+
+    def test_exhausted_keepalive_fallback_stops_the_next_media_send(self):
+        keepalive_event = ControlledKeepaliveEvent()
+        transport = onvif_play.open_backchannel_transport(
+            "example.invalid",
+            "fake-user",
+            "fake-password",
+            stream_uri="rtsp://example.invalid/live",
+            rtsp_factory=UnsupportedKeepaliveRtsp,
+            keepalive_event_factory=lambda: keepalive_event,
+        )
+        client = FakeRtsp.instances[0]
+        self.assertTrue(keepalive_event.wait_started.wait(timeout=1))
+        keepalive_event.trigger()
+        self.assertTrue(client.keepalive_exhausted.wait(timeout=1))
+        transport.keepalive_thread.join(timeout=1)
+
+        with self.assertRaisesRegex(
+            RuntimeError, "does not support an RTSP keepalive method"
+        ) as raised:
+            transport.send_rtp(b"must-not-send")
+
+        with self.assertRaises(RuntimeError) as cleanup:
+            transport.close()
+        self.assertIs(cleanup.exception, raised.exception)
+        self.assertEqual(getattr(raised.exception, "__notes__", []), [])
+        self.assertFalse(any(event[0] == "media" for event in client.events))
+        self.assertEqual(
+            [request[0] for request in client.requests[-4:-1]],
+            ["SET_PARAMETER", "GET_PARAMETER", "OPTIONS"],
+        )
 
     def test_public_methods_select_get_parameter_then_session_options(self):
         for rtsp_type, expected_method in (
@@ -1005,6 +1307,57 @@ class BackchannelTransportTest(unittest.TestCase):
                  if event[:2] == ("request", "TEARDOWN")),
         )
 
+    def test_keepalive_join_budget_covers_fallback_and_digest_exchanges(self):
+        worst_case_exchanges = len(onvif_play.RTSP_KEEPALIVE_METHODS) * 2
+        exchange_budget = onvif_play.RTSP_IO_TIMEOUT_SECONDS * 2
+
+        self.assertGreaterEqual(
+            onvif_play.RTSP_KEEPALIVE_JOIN_TIMEOUT_SECONDS,
+            worst_case_exchanges * exchange_budget,
+        )
+
+    def test_close_forces_rtsp_cancellation_and_never_leaves_worker_alive(self):
+        keepalive_event = ControlledKeepaliveEvent()
+        transport = onvif_play.open_backchannel_transport(
+            "example.invalid",
+            "fake-user",
+            "fake-password",
+            stream_uri="rtsp://example.invalid/live",
+            rtsp_factory=BlockingKeepaliveRtsp,
+            keepalive_event_factory=lambda: keepalive_event,
+            keepalive_join_timeout_seconds=0.01,
+            keepalive_cancel_join_timeout_seconds=0.1,
+        )
+        client = FakeRtsp.instances[0]
+        self.assertTrue(keepalive_event.wait_started.wait(timeout=1))
+        keepalive_event.trigger()
+        self.assertTrue(client.keepalive_started.wait(timeout=1))
+
+        with self.assertRaisesRegex(
+            RuntimeError, "TEARDOWN could not be sent"
+        ) as raised:
+            transport.close()
+
+        self.assertFalse(transport.keepalive_thread.is_alive())
+        self.assertTrue(client.closed)
+        self.assertFalse(
+            any(request[0] == "TEARDOWN" for request in client.requests)
+        )
+        self.assertEqual(
+            raised.exception.__notes__,
+            [
+                (
+                    "additional backchannel cleanup failure: forced RTSP "
+                    "socket close failure"
+                ),
+                "forced RTSP reader close detail",
+                (
+                    "additional backchannel cleanup failure: keepalive "
+                    "interrupted by RTSP close"
+                ),
+            ],
+        )
+
     def test_keepalive_failure_propagates_after_worker_and_transport_cleanup(self):
         keepalive_event = ControlledKeepaliveEvent()
         transport = onvif_play.open_backchannel_transport(
@@ -1030,6 +1383,55 @@ class BackchannelTransportTest(unittest.TestCase):
         self.assertFalse(client.worker_alive_at_teardown)
         self.assertEqual(client.requests[-1][0], "TEARDOWN")
         self.assertTrue(client.closed)
+
+    def test_nonfallback_keepalive_failure_stops_rtp_and_rtcp_without_duplication(self):
+        keepalive_event = ControlledKeepaliveEvent()
+        transport = onvif_play.open_backchannel_transport(
+            "example.invalid",
+            "fake-user",
+            "fake-password",
+            stream_uri="rtsp://example.invalid/live",
+            rtsp_factory=CombinedCleanupFailureRtsp,
+            keepalive_event_factory=lambda: keepalive_event,
+        )
+        client = FakeRtsp.instances[0]
+        client.transport = transport
+        self.assertTrue(keepalive_event.wait_started.wait(timeout=1))
+        keepalive_event.trigger()
+        self.assertTrue(client.keepalive_received.wait(timeout=1))
+        transport.keepalive_thread.join(timeout=1)
+
+        failures = []
+        for send in (
+            lambda: transport.send_rtp(b"rtp-must-not-send"),
+            lambda: transport.send_rtcp(b"rtcp-must-not-send"),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "SET_PARAMETER failed with RTSP status 500"
+            ) as raised:
+                send()
+            failures.append(raised.exception)
+
+        with self.assertRaises(RuntimeError) as cleanup:
+            transport.close()
+        self.assertIs(failures[0], failures[1])
+        self.assertIs(cleanup.exception, failures[0])
+        self.assertEqual(
+            failures[0].__notes__,
+            [
+                (
+                    "additional backchannel cleanup failure: TEARDOWN "
+                    "failed with RTSP status 500"
+                ),
+                (
+                    "additional backchannel cleanup failure: RTSP socket "
+                    "close failure"
+                ),
+                "additional RTSP close failure: RTSP reader join failure",
+                "RTSP reader remained active after shutdown",
+            ],
+        )
+        self.assertFalse(any(event[0] == "media" for event in client.events))
 
     def test_keepalive_failure_does_not_mask_primary_playback_error(self):
         keepalive_event = ControlledKeepaliveEvent()
@@ -1864,6 +2266,72 @@ class RtpSenderMainTest(unittest.TestCase):
                     "--session-timeout-cycles", invalid
                 ])
 
+    def test_preroll_sample_count_uses_exact_integer_arithmetic(self):
+        milliseconds = 2**53 + 1
+        self.assertEqual(
+            onvif_play.preroll_sample_count(64_000, milliseconds),
+            64_000 * milliseconds // 1000,
+        )
+
+    def test_huge_preroll_decimal_is_rejected_before_audio_or_network(self):
+        with patch.object(
+            onvif_play,
+            "prepare_audio",
+            side_effect=AssertionError("audio was prepared"),
+        ) as prepare_audio, patch.object(
+            onvif_play,
+            "onvif_stream_uri",
+            side_effect=AssertionError("network resolver called"),
+        ) as resolver, redirect_stderr(
+            StringIO()
+        ) as stderr, self.assertRaises(SystemExit):
+            onvif_play.main(["--preroll-ms", "9" * 10_000])
+
+        prepare_audio.assert_not_called()
+        resolver.assert_not_called()
+        self.assertIn("preroll milliseconds must be between", stderr.getvalue())
+
+    def test_preroll_media_cap_is_checked_before_audio_preparation(self):
+        with patch.object(
+            onvif_play,
+            "prepare_audio",
+            side_effect=AssertionError("audio was prepared"),
+        ) as prepare_audio, patch.object(
+            onvif_play,
+            "onvif_stream_uri",
+            side_effect=AssertionError("network resolver called"),
+        ) as resolver, redirect_stderr(
+            StringIO()
+        ) as stderr, self.assertRaises(SystemExit):
+            onvif_play.main([
+                "--codec", "l16",
+                "--sample-rate", "64000",
+                "--preroll-ms", str(onvif_play.MAX_PREROLL_MILLISECONDS),
+            ])
+
+        prepare_audio.assert_not_called()
+        resolver.assert_not_called()
+        self.assertIn("audio preroll requires", stderr.getvalue())
+
+    def test_nonfinite_rtcp_interval_is_rejected_before_audio_or_network(self):
+        for interval in ("nan", "inf", "-inf"):
+            with self.subTest(interval=interval), patch.object(
+                onvif_play,
+                "prepare_audio",
+                side_effect=AssertionError("audio was prepared"),
+            ) as prepare_audio, patch.object(
+                onvif_play,
+                "onvif_stream_uri",
+                side_effect=AssertionError("network resolver called"),
+            ) as resolver, redirect_stderr(
+                StringIO()
+            ) as stderr, self.assertRaises(SystemExit):
+                onvif_play.main([f"--rtcp-interval={interval}"])
+
+            prepare_audio.assert_not_called()
+            resolver.assert_not_called()
+            self.assertIn("must be finite", stderr.getvalue())
+
     def test_timeout_cycles_repeat_and_trim_fixed_pcma_sample_exactly(self):
         packets, _, _, _ = self.run_main(
             "--ms", "30",
@@ -2589,6 +3057,39 @@ class RtpSenderMainTest(unittest.TestCase):
         self.assertEqual(client.requests[-1][0], "TEARDOWN")
         self.assertTrue(client.closed)
 
+    def test_main_promotes_keepalive_failure_before_cleanup_without_duplicate_note(self):
+        failure = RuntimeError("terminal keepalive failure")
+        opened = []
+        original_open = onvif_play.open_backchannel_transport
+
+        def open_with_failed_keepalive(*args, **kwargs):
+            transport = original_open(*args, **kwargs)
+            transport.keepalive_stop.set()
+            transport.keepalive_thread.join(timeout=1)
+            transport.keepalive_failure = failure
+            original_close = transport.close
+
+            def record_active_error_at_close():
+                transport.active_error_at_close = sys.exception()
+                return original_close()
+
+            transport.close = record_active_error_at_close
+            opened.append(transport)
+            return transport
+
+        with patch.object(
+            onvif_play,
+            "open_backchannel_transport",
+            side_effect=open_with_failed_keepalive,
+        ), self.assertRaisesRegex(
+            RuntimeError, "terminal keepalive failure"
+        ) as raised:
+            self.run_main("--ms", "0")
+
+        self.assertIs(raised.exception, failure)
+        self.assertIs(opened[0].active_error_at_close, failure)
+        self.assertEqual(getattr(failure, "__notes__", []), [])
+
     def test_timing_log_is_not_published_when_teardown_fails(self):
         with tempfile.TemporaryDirectory() as directory:
             timing_log = pathlib.Path(directory) / "send-timing.jsonl"
@@ -2706,6 +3207,32 @@ class RtpSenderMainTest(unittest.TestCase):
                     [0x778899AA, (0x778899AA + 2048) & 0xFFFFFFFF],
                 )
 
+    def test_aac_timeout_cycles_reject_preroll_before_decode_or_network(self):
+        with patch.object(
+            onvif_play,
+            "prepare_audio",
+            side_effect=AssertionError("AAC source was decoded"),
+        ) as prepare_audio, patch.object(
+            onvif_play,
+            "onvif_stream_uri",
+            side_effect=AssertionError("network resolver called"),
+        ) as resolver, redirect_stderr(
+            StringIO()
+        ) as stderr, self.assertRaises(SystemExit):
+            onvif_play.main([
+                "--codec", "aac",
+                "--file", "source.wav",
+                "--preroll-ms", "1",
+                "--session-timeout-cycles", "1",
+            ])
+
+        prepare_audio.assert_not_called()
+        resolver.assert_not_called()
+        self.assertIn(
+            "AAC --session-timeout-cycles cannot use --preroll-ms",
+            stderr.getvalue(),
+        )
+
     def test_aac_uses_the_same_rebase_pacer_and_timing_schema(self):
         clock = FakeClock(
             inject_on_sleep=1, injected_overshoot_ns=150_000_000
@@ -2818,6 +3345,64 @@ class RtpSenderMainTest(unittest.TestCase):
 
         resolver.assert_not_called()
         self.assertIn("source frame", stderr.getvalue())
+
+    def test_adts_frame_limit_is_enforced_before_materializing_frame_max_plus_one(self):
+        def adts_frame(payload):
+            frame_length = 7 + len(payload)
+            return bytes([
+                0xFF,
+                0xF1,
+                0x50,
+                (frame_length >> 11) & 0x03,
+                (frame_length >> 3) & 0xFF,
+                (frame_length & 0x07) << 5,
+                0,
+            ]) + payload
+
+        class TrackingData:
+            def __init__(self, data):
+                self.data = data
+                self.payload_slices = []
+
+            def __len__(self):
+                return len(self.data)
+
+            def __getitem__(self, key):
+                if isinstance(key, slice):
+                    self.payload_slices.append((key.start, key.stop))
+                return self.data[key]
+
+        data = TrackingData(
+            adts_frame(b"one") + adts_frame(b"two") + adts_frame(b"three")
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, "AAC source frame count exceeds 2"
+        ):
+            onvif_play.parse_adts_frames(data, max_frames=2)
+
+        self.assertEqual(len(data.payload_slices), 2)
+
+    def test_aac_encoded_output_limit_precedes_adts_parsing(self):
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=b"123456789", stderr=b""
+        )
+        with patch.object(
+            onvif_play, "MAX_AUDIO_SOURCE_BYTES", 8
+        ), patch.object(
+            onvif_play.subprocess, "run", return_value=completed
+        ), patch.object(
+            onvif_play,
+            "parse_adts_frames",
+            side_effect=AssertionError("ADTS parser called"),
+        ) as parser, self.assertRaisesRegex(
+            ValueError, "AAC encoded output exceeds 8 byte limit"
+        ):
+            onvif_play.file_aac(
+                "source.wav", 0.25, 8000, 0, max_frames=2
+            )
+
+        parser.assert_not_called()
 
     def test_aac_repetition_frame_cap_fails_before_rtp(self):
         with patch.object(
