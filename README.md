@@ -1,6 +1,6 @@
 # ONVIF RTSP Audio Backchannel
 
-카메라의 ONVIF RTSP 백채널로 음원 파일을 한 번 전송하고 종료하는 Python/TypeScript 도구입니다.
+카메라의 ONVIF RTSP 백채널로 음원 파일을 한 번 전송하고 종료하는 Python/TypeScript/Rust 도구입니다.
 GStreamer는 사용하지 않습니다. FFmpeg는 입력 파일을 mono 8kHz PCM으로 디코딩할 때만 사용하고,
 PCMA(A-law) 인코딩과 RTP/RTSP 전송은 각 언어의 코드가 처리합니다.
 
@@ -8,6 +8,7 @@ PCMA(A-law) 인코딩과 RTP/RTSP 전송은 각 언어의 코드가 처리합니
 
 - Python 3
 - Node.js 22 이상과 npm (TypeScript 사용 시)
+- Rust 1.85 이상과 Cargo (Rust 사용 시)
 - FFmpeg (`ffmpeg` 명령이 `PATH`에 있어야 함)
 
 macOS에서는 다음 명령으로 FFmpeg를 설치할 수 있습니다.
@@ -83,10 +84,32 @@ npm run play -- \
 긴 음원은 협상된 RTSP 세션 timeout의 절반 간격으로 keepalive를 전송합니다.
 음원 전송이 끝나거나 변환 오류가 발생하면 RTSP 세션을 종료합니다.
 
+## Rust로 한 번 재생
+
+다음 명령은 다른 구현과 동일한 순수 Rust Q11/A-law 인코더, PCMA 8kHz,
+TCP, 40ms 패킷, rebase 페이싱 프로필을 사용합니다. GStreamer는 필요하지 않습니다.
+
+```bash
+# 실행 전 서비스 secret/env에 ONVIF_PASSWORD를 설정합니다.
+cargo run --release --manifest-path rust/Cargo.toml -- \
+  --host 10.128.10.141 \
+  --user admin \
+  --file '/absolute/path/to/audio.mp3' \
+  --volume 0.05
+```
+
+Rust 구현도 긴 음원 재생 중 RTSP keepalive를 전송하며, 재생 성공 또는 오류 후
+TEARDOWN으로 세션을 정리합니다.
+수동 호환을 위한 `--pass` 옵션도 지원하지만, 자동 실행에서는 비밀번호가 프로세스
+인자에 남지 않도록 `ONVIF_PASSWORD` 환경변수를 사용합니다.
+
 ## 테스트
 
 ```bash
 PYTHONPATH=python:. python3 -m unittest discover -s python -p 'test_*.py'
 npm test
 npm run typecheck
+cargo test --manifest-path rust/Cargo.toml
+cargo fmt --manifest-path rust/Cargo.toml --check
+cargo clippy --manifest-path rust/Cargo.toml --all-targets -- -D warnings
 ```
