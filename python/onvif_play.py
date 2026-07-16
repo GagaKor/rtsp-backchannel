@@ -35,10 +35,18 @@ RTSP_MAX_HEADER_BYTES = 64 * 1024
 RTSP_MAX_BODY_BYTES = 4 * 1024 * 1024
 RTSP_MAX_BUFFER_BYTES = 8 * 1024 * 1024
 RTSP_MAX_QUEUED_RESPONSES = 64
+DEFAULT_RTSP_SESSION_TIMEOUT_SECONDS = 60
+RTSP_KEEPALIVE_METHODS = ("SET_PARAMETER", "GET_PARAMETER", "OPTIONS")
+RTSP_KEEPALIVE_JOIN_TIMEOUT_SECONDS = RTSP_IO_TIMEOUT_SECONDS + 1
 MAX_PCMA_INPUT_BYTES = 128 * 1024 * 1024
+MAX_AUDIO_SOURCE_BYTES = 128 * 1024 * 1024
+MAX_AUDIO_SOURCE_FRAMES = 100_000
+MAX_REPEATED_MEDIA_BYTES = 128 * 1024 * 1024
+MAX_REPEATED_AUDIO_FRAMES = 1_000_000
 MAX_TIMING_ROWS = TIMING_LOG_MAX_ROWS
 MAX_TIMING_LINE_BYTES = TIMING_LOG_MAX_LINE_BYTES
 MAX_TIMING_BYTES = TIMING_LOG_MAX_BYTES
+MAX_SESSION_TIMEOUT_CYCLES = 100
 
 
 # ---------- ONVIF ----------
@@ -191,6 +199,8 @@ class Rtsp:
         self.cseq = 0
         self.challenge = None
         self.session = None
+        self.write_lock = threading.Lock()
+        self.request_lock = threading.Lock()
         self.responses = queue.Queue(maxsize=RTSP_MAX_QUEUED_RESPONSES)
         self.reader_failure = None
         self.closed = False
@@ -216,7 +226,9 @@ class Rtsp:
         if a:
             hdr["Authorization"] = a
         msg = f"{method} {uri} RTSP/1.0\r\n" + "".join(f"{k}: {v}\r\n" for k, v in hdr.items()) + "\r\n"
-        self.s.sendall(msg.encode())
+        with self.write_lock:
+            self._raise_reader_failure()
+            self.s.sendall(msg.encode())
         return self._read()
 
     def _raise_reader_failure(self):
@@ -294,19 +306,25 @@ class Rtsp:
         return result
 
     def request(self, method, uri, extra=None):
-        st, h, b = self._send(method, uri, extra or {})
-        if st == 401 and "www-authenticate" in h:
-            wa = h["www-authenticate"]
-            realm = re.search(r'realm="([^"]*)"', wa)
-            nonce = re.search(r'nonce="([^"]*)"', wa)
-            if realm and nonce:
-                self.challenge = {"realm": realm.group(1), "nonce": nonce.group(1)}
-                st, h, b = self._send(method, uri, extra or {})
-        return st, h, b
+        with self.request_lock:
+            st, h, b = self._send(method, uri, extra or {})
+            if st == 401 and "www-authenticate" in h:
+                wa = h["www-authenticate"]
+                realm = re.search(r'realm="([^"]*)"', wa)
+                nonce = re.search(r'nonce="([^"]*)"', wa)
+                if realm and nonce:
+                    self.challenge = {
+                        "realm": realm.group(1),
+                        "nonce": nonce.group(1),
+                    }
+                    st, h, b = self._send(method, uri, extra or {})
+            return st, h, b
 
     def send_interleaved(self, channel, rtp):
-        self._raise_reader_failure()
-        self.s.sendall(b"\x24" + bytes([channel]) + struct.pack(">H", len(rtp)) + rtp)
+        frame = b"\x24" + bytes([channel]) + struct.pack(">H", len(rtp)) + rtp
+        with self.write_lock:
+            self._raise_reader_failure()
+            self.s.sendall(frame)
 
     def close(self):
         if self.closed:
@@ -367,10 +385,53 @@ def rtp_info_for_track(header, control):
     return {}
 
 
+def parse_public_methods(header):
+    return frozenset(
+        method.strip().upper()
+        for method in header.split(",")
+        if method.strip()
+    )
+
+
+def parse_session_header(
+    header, *, default_timeout=DEFAULT_RTSP_SESSION_TIMEOUT_SECONDS
+):
+    parts = [part.strip() for part in header.split(";")]
+    session_id = parts[0] if parts else ""
+    if not session_id:
+        raise RuntimeError("RTSP SETUP returned an empty Session ID")
+    timeout = default_timeout
+    for parameter in parts[1:]:
+        key, separator, value = parameter.partition("=")
+        if not separator or key.strip().lower() != "timeout":
+            continue
+        value = value.strip().strip('"')
+        if not re.fullmatch(r"[0-9]+", value) or int(value) <= 0:
+            raise RuntimeError(f"invalid RTSP Session timeout: {value!r}")
+        timeout = int(value)
+    return session_id, timeout
+
+
+def select_keepalive_method(public_methods):
+    if "SET_PARAMETER" in public_methods:
+        return "SET_PARAMETER"
+    if "GET_PARAMETER" in public_methods:
+        return "GET_PARAMETER"
+    return "OPTIONS"
+
+
 class BackchannelTransport:
     """An established ONVIF RTSP backchannel and its RTP destination."""
 
-    def __init__(self, stream_uri, rtsp, camera_host, transport):
+    def __init__(
+        self,
+        stream_uri,
+        rtsp,
+        camera_host,
+        transport,
+        *,
+        keepalive_event_factory=threading.Event,
+    ):
         self.stream_uri = stream_uri
         self.rtsp = rtsp
         self.camera_host = camera_host
@@ -378,10 +439,17 @@ class BackchannelTransport:
         self.model = None
         self.sdp = None
         self.describe_headers = {}
+        self.public_methods = frozenset()
         self.send_track = None
         self.send_control = None
         self.setup_headers = {}
         self.play_headers = {}
+        self.session_timeout_seconds = DEFAULT_RTSP_SESSION_TIMEOUT_SECONDS
+        self.keepalive_method = "OPTIONS"
+        self.keepalive_event_factory = keepalive_event_factory
+        self.keepalive_stop = None
+        self.keepalive_thread = None
+        self.keepalive_failure = None
         self.rtp_channel = None
         self.rtcp_channel = None
         self.udp_target = None
@@ -393,6 +461,49 @@ class BackchannelTransport:
     @property
     def session(self):
         return self.rtsp.session
+
+    @property
+    def keepalive_interval_seconds(self):
+        return self.session_timeout_seconds / 2
+
+    def update_session(self, session_header):
+        session_id, timeout = parse_session_header(session_header)
+        self.rtsp.session = session_id
+        self.session_timeout_seconds = timeout
+
+    def _send_keepalive(self):
+        start_index = RTSP_KEEPALIVE_METHODS.index(self.keepalive_method)
+        for method in RTSP_KEEPALIVE_METHODS[start_index:]:
+            headers = {"Session": self.session}
+            if method in {"SET_PARAMETER", "GET_PARAMETER"}:
+                headers["Content-Length"] = "0"
+            status, _, _ = self.rtsp.request(method, self.stream_uri, headers)
+            if status == 200:
+                self.keepalive_method = method
+                return
+            if status not in {405, 501}:
+                _require_rtsp_success(method, status)
+        raise RuntimeError("camera does not support an RTSP keepalive method")
+
+    def _keepalive_loop(self):
+        try:
+            while not self.keepalive_stop.wait(
+                self.keepalive_interval_seconds
+            ):
+                self._send_keepalive()
+        except BaseException as error:
+            self.keepalive_failure = error
+
+    def start_keepalive(self):
+        if self.keepalive_thread is not None:
+            return
+        self.keepalive_stop = self.keepalive_event_factory()
+        self.keepalive_thread = threading.Thread(
+            target=self._keepalive_loop,
+            name="rtsp-backchannel-keepalive",
+            daemon=True,
+        )
+        self.keepalive_thread.start()
 
     def send_rtp(self, packet):
         if self.closed:
@@ -417,7 +528,23 @@ class BackchannelTransport:
             return
         errors = []
         try:
-            if self.rtsp.session:
+            keepalive_stopped = True
+            if self.keepalive_thread is not None:
+                self.keepalive_stop.set()
+                try:
+                    self.keepalive_thread.join(
+                        timeout=RTSP_KEEPALIVE_JOIN_TIMEOUT_SECONDS
+                    )
+                except BaseException as error:
+                    errors.append(error)
+                if self.keepalive_thread.is_alive():
+                    keepalive_stopped = False
+                    errors.append(RuntimeError(
+                        "RTSP keepalive thread did not stop"
+                    ))
+                if self.keepalive_failure is not None:
+                    errors.append(self.keepalive_failure)
+            if self.rtsp.session and keepalive_stopped:
                 try:
                     status, _, _ = self.rtsp.request("TEARDOWN", self.stream_uri, {
                         "Session": self.rtsp.session,
@@ -486,6 +613,7 @@ def open_backchannel_transport(
     rtsp_factory=None,
     onvif_uri_resolver=None,
     client_rtp_port=50000,
+    keepalive_event_factory=threading.Event,
 ):
     """Open and PLAY an ONVIF backchannel, returning a closable RTP transport."""
     if transport not in {"tcp", "udp"}:
@@ -502,12 +630,24 @@ def open_backchannel_transport(
     camera_host = parsed_uri.hostname
     camera_port = parsed_uri.port or 554
     rtsp = (rtsp_factory or Rtsp)(camera_host, camera_port, user, password)
-    result = BackchannelTransport(stream_uri, rtsp, camera_host, transport)
+    result = BackchannelTransport(
+        stream_uri,
+        rtsp,
+        camera_host,
+        transport,
+        keepalive_event_factory=keepalive_event_factory,
+    )
     result.model = model
 
     try:
-        status, _, _ = rtsp.request("OPTIONS", stream_uri)
+        status, options_headers, _ = rtsp.request("OPTIONS", stream_uri)
         _require_rtsp_success("OPTIONS", status)
+        result.public_methods = parse_public_methods(
+            options_headers.get("public", "")
+        )
+        result.keepalive_method = select_keepalive_method(
+            result.public_methods
+        )
         status, describe_headers, sdp = rtsp.request("DESCRIBE", stream_uri, {
             "Accept": "application/sdp",
             "Require": BACKCHANNEL,
@@ -553,7 +693,7 @@ def open_backchannel_transport(
                     "SETUP", receive_uri, headers
                 )
                 _require_rtsp_success(f"SETUP({receive_control})", status)
-                rtsp.session = setup_headers.get("session", "").split(";")[0].strip()
+                result.update_session(setup_headers.get("session", ""))
                 requested_channel += 2
 
             send_uri = resolve_track_uri(stream_uri, content_base, send_control)
@@ -568,7 +708,7 @@ def open_backchannel_transport(
                 headers["Session"] = rtsp.session
             status, setup_headers, _ = rtsp.request("SETUP", send_uri, headers)
             _require_rtsp_success("SETUP(backchannel)", status)
-            rtsp.session = setup_headers.get("session", "").split(";")[0].strip()
+            result.update_session(setup_headers.get("session", ""))
             interleaved = re.search(
                 r"(?:^|;)interleaved=(\d+)-(\d+)(?:;|$)",
                 setup_headers.get("transport", ""),
@@ -592,7 +732,7 @@ def open_backchannel_transport(
             }
             status, setup_headers, _ = rtsp.request("SETUP", send_uri, headers)
             _require_rtsp_success("SETUP(backchannel)", status)
-            rtsp.session = setup_headers.get("session", "").split(";")[0].strip()
+            result.update_session(setup_headers.get("session", ""))
             server_ports = re.search(
                 r"(?:^|;)server_port=(\d+)-(\d+)(?:;|$)",
                 setup_headers.get("transport", ""),
@@ -615,6 +755,7 @@ def open_backchannel_transport(
         })
         _require_rtsp_success("PLAY", status)
         result.play_headers = play_headers
+        result.start_keepalive()
         return result
     except BaseException as error:
         try:
@@ -710,6 +851,7 @@ def file_audio(path, codec, volume, sample_rate, encoder="ffmpeg"):
     fmt = CODECS[codec][1]
     p = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", path,
                         "-af", f"volume={volume}", "-ar", str(sample_rate), "-ac", "1",
+                        "-fs", str(MAX_AUDIO_SOURCE_BYTES + 1),
                         "-f", fmt, "-"], capture_output=True)
     if p.returncode != 0:
         raise RuntimeError("ffmpeg: " + p.stderr.decode().strip())
@@ -740,6 +882,7 @@ def file_aac(path, volume, sample_rate, preroll_ms, bitrate_kbps=64):
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", path,
         "-af", ",".join(filters), "-ar", str(sample_rate), "-ac", "1",
         "-c:a", "aac", "-profile:a", "aac_low", "-b:a", f"{bitrate_kbps}k",
+        "-fs", str(MAX_AUDIO_SOURCE_BYTES + 1),
         "-f", "adts", "-",
     ], capture_output=True)
     if p.returncode != 0:
@@ -846,6 +989,134 @@ def _timing_packet_count(arguments, payload, aac_frames, samples_per_frame):
     return (total_bytes + bytes_per_frame - 1) // bytes_per_frame
 
 
+def session_cycle_pcm_layout(
+    payload,
+    preroll,
+    *,
+    bytes_per_sample,
+    sample_rate,
+    session_timeout_seconds,
+    cycles,
+):
+    if len(payload) % bytes_per_sample:
+        raise ValueError("audio payload is not sample-aligned")
+    if len(preroll) % bytes_per_sample:
+        raise ValueError("audio preroll is not sample-aligned")
+    target_stream_samples = (
+        cycles * session_timeout_seconds + 5
+    ) * sample_rate
+    preroll_samples = len(preroll) // bytes_per_sample
+    required_audio_samples = max(0, target_stream_samples - preroll_samples)
+    source_samples = len(payload) // bytes_per_sample
+    output_audio_samples = max(source_samples, required_audio_samples)
+    output_audio_bytes = output_audio_samples * bytes_per_sample
+    output_bytes = len(preroll) + output_audio_bytes
+    if output_bytes > MAX_REPEATED_MEDIA_BYTES:
+        raise ValueError(
+            "session timeout diagnostic media requires "
+            f"{output_bytes} bytes, exceeding the "
+            f"{MAX_REPEATED_MEDIA_BYTES} byte repetition limit"
+        )
+    if output_audio_bytes and not payload:
+        raise ValueError(
+            "session timeout diagnostic requires a non-empty audio payload"
+        )
+    return output_audio_bytes, output_bytes
+
+
+def repeat_payload_for_session_cycles(
+    payload,
+    preroll,
+    *,
+    bytes_per_sample,
+    sample_rate,
+    session_timeout_seconds,
+    cycles,
+):
+    output_audio_bytes, _ = session_cycle_pcm_layout(
+        payload,
+        preroll,
+        bytes_per_sample=bytes_per_sample,
+        sample_rate=sample_rate,
+        session_timeout_seconds=session_timeout_seconds,
+        cycles=cycles,
+    )
+    repetitions, tail_bytes = divmod(output_audio_bytes, len(payload) or 1)
+    return preroll + payload * repetitions + payload[:tail_bytes]
+
+
+def session_cycle_aac_layout(
+    frames,
+    *,
+    sample_rate,
+    session_timeout_seconds,
+    cycles,
+):
+    frames = tuple(frames)
+    if not frames:
+        raise ValueError(
+            "session timeout diagnostic requires at least one AAC frame"
+        )
+    target_samples = (
+        cycles * session_timeout_seconds + 5
+    ) * sample_rate
+    target_frame_count = (
+        target_samples + 1024 - 1
+    ) // 1024
+    output_frame_count = max(len(frames), target_frame_count)
+    if output_frame_count > MAX_REPEATED_AUDIO_FRAMES:
+        raise ValueError(
+            "session timeout diagnostic requires "
+            f"{output_frame_count} AAC frames, exceeding the "
+            f"{MAX_REPEATED_AUDIO_FRAMES} frame limit"
+        )
+    repetitions, tail_frames = divmod(output_frame_count, len(frames))
+    source_bytes = sum(len(frame) for frame in frames)
+    represented_bytes = (
+        repetitions * source_bytes
+        + sum(len(frame) for frame in frames[:tail_frames])
+        + output_frame_count * 4
+    )
+    if represented_bytes > MAX_REPEATED_MEDIA_BYTES:
+        raise ValueError(
+            "session timeout diagnostic AAC media requires "
+            f"{represented_bytes} bytes, exceeding the "
+            f"{MAX_REPEATED_MEDIA_BYTES} byte repetition limit"
+        )
+    return frames, output_frame_count, repetitions, tail_frames
+
+
+def repeat_aac_frames_for_session_cycles(
+    frames,
+    *,
+    sample_rate,
+    session_timeout_seconds,
+    cycles,
+):
+    frames, _, repetitions, tail_frames = session_cycle_aac_layout(
+        frames,
+        sample_rate=sample_rate,
+        session_timeout_seconds=session_timeout_seconds,
+        cycles=cycles,
+    )
+    return frames * repetitions + frames[:tail_frames]
+
+
+def session_timeout_cycles(value):
+    try:
+        cycles = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "session timeout cycles must be an integer"
+        ) from error
+    if str(cycles) != value.strip() or not 0 <= cycles <= MAX_SESSION_TIMEOUT_CYCLES:
+        raise argparse.ArgumentTypeError(
+            "session timeout cycles must be between 0 and "
+            f"{MAX_SESSION_TIMEOUT_CYCLES}"
+        )
+    return cycles
+
+
 def build_argument_parser():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="172.168.46.56")
@@ -883,6 +1154,16 @@ def build_argument_parser():
                     help="RTP audio codec: pcma, pcmu, l16, or AAC-LC MPEG4-GENERIC")
     ap.add_argument("--encoder", choices=["ffmpeg", "gst-compatible"], default="ffmpeg",
                     help="PCMA terminal encoder for decoded file input")
+    ap.add_argument(
+        "--session-timeout-cycles",
+        type=session_timeout_cycles,
+        default=0,
+        metavar="N",
+        help=(
+            "extend media through N negotiated RTSP session timeouts plus "
+            "5 seconds; 0 disables"
+        ),
+    )
     return ap
 
 
@@ -917,6 +1198,11 @@ def main(argv=None):
         ap.error("--packet-pattern only supports --codec pcma")
     if a.packet_pattern and a.sample_rate != 8000:
         ap.error("--packet-pattern requires --sample-rate 8000")
+    if a.session_timeout_cycles and a.packet_pattern:
+        ap.error(
+            "--session-timeout-cycles cannot repeat the one-shot "
+            "--packet-pattern manifest"
+        )
 
     packet_limit = 65535 if a.transport == "tcp" else 65507
     pattern_payload_sizes = None
@@ -951,7 +1237,33 @@ def main(argv=None):
                 f"{a.transport.upper()} limit {packet_limit}"
             )
 
+    if not a.file and not a.pcma_input and a.codec != "aac":
+        if a.ms < 0:
+            ap.error("--ms must be 0 or greater")
+        tone_samples = a.sample_rate * a.ms // 1000
+        tone_bytes = tone_samples * (2 if a.codec == "l16" else 1)
+        if tone_bytes > MAX_AUDIO_SOURCE_BYTES:
+            ap.error(
+                f"tone source requires {tone_bytes} bytes, exceeding the "
+                f"{MAX_AUDIO_SOURCE_BYTES} byte source limit"
+            )
+
     payload, aac_frames, audio_message = prepare_audio(a)
+    if a.codec == "aac" and len(aac_frames) > MAX_AUDIO_SOURCE_FRAMES:
+        ap.error(
+            f"AAC source frame count {len(aac_frames)} exceeds the "
+            f"{MAX_AUDIO_SOURCE_FRAMES} source frame limit"
+        )
+    source_audio_bytes = (
+        sum(len(frame) for frame in aac_frames)
+        if a.codec == "aac"
+        else len(payload)
+    )
+    if source_audio_bytes > MAX_AUDIO_SOURCE_BYTES:
+        ap.error(
+            f"audio source requires {source_audio_bytes} bytes, exceeding "
+            f"the {MAX_AUDIO_SOURCE_BYTES} byte source limit"
+        )
     boundary_plan = None
     if a.codec != "aac":
         bytes_per_sample = 2 if a.codec == "l16" else 1
@@ -961,9 +1273,15 @@ def main(argv=None):
             "l16": b"\x00\x00",
         }[a.codec]
         preroll_samples = int(a.sample_rate * a.preroll_ms / 1000)
+        preroll_bytes = preroll_samples * bytes_per_sample
+        if preroll_bytes > MAX_REPEATED_MEDIA_BYTES:
+            ap.error(
+                f"audio preroll requires {preroll_bytes} bytes, exceeding "
+                f"the {MAX_REPEATED_MEDIA_BYTES} byte media limit"
+            )
         preroll = silence_sample * preroll_samples
         audio_start_offset = len(preroll)
-        stream_payload = preroll + payload
+        stream_payload = None if a.session_timeout_cycles else preroll + payload
         if pattern_payload_sizes is not None:
             pattern_samples = sum(pattern_payload_sizes)
             stream_samples = len(stream_payload)
@@ -983,14 +1301,14 @@ def main(argv=None):
                 sample_rate=a.sample_rate,
                 bytes_per_sample=1,
             )
-        else:
+        elif not a.session_timeout_cycles:
             boundary_plan = RtpBoundaryPlan.fixed(
                 stream_payload,
                 samples_per_frame,
                 sample_rate=a.sample_rate,
                 bytes_per_sample=bytes_per_sample,
             )
-    if a.timing_log is not None:
+    if a.timing_log is not None and not a.session_timeout_cycles:
         timing_packet_count = (
             len(aac_frames)
             if a.codec == "aac"
@@ -1013,7 +1331,83 @@ def main(argv=None):
         stream_uri=uri,
     )
     r = backchannel.rtsp
+    playback_error = None
     try:
+        if a.session_timeout_cycles:
+            if a.codec == "aac":
+                _, diagnostic_packet_count, _, _ = session_cycle_aac_layout(
+                    aac_frames,
+                    sample_rate=a.sample_rate,
+                    session_timeout_seconds=(
+                        backchannel.session_timeout_seconds
+                    ),
+                    cycles=a.session_timeout_cycles,
+                )
+                if (
+                    a.timing_log is not None
+                    and diagnostic_packet_count > MAX_TIMING_ROWS
+                ):
+                    ap.error(
+                        f"--timing-log packet count "
+                        f"{diagnostic_packet_count} exceeds "
+                        f"{MAX_TIMING_ROWS:,} row limit"
+                    )
+                aac_frames = repeat_aac_frames_for_session_cycles(
+                    aac_frames,
+                    sample_rate=a.sample_rate,
+                    session_timeout_seconds=(
+                        backchannel.session_timeout_seconds
+                    ),
+                    cycles=a.session_timeout_cycles,
+                )
+                diagnostic_packet_count = len(aac_frames)
+            else:
+                _, diagnostic_stream_bytes = session_cycle_pcm_layout(
+                    payload,
+                    preroll,
+                    bytes_per_sample=bytes_per_sample,
+                    sample_rate=a.sample_rate,
+                    session_timeout_seconds=(
+                        backchannel.session_timeout_seconds
+                    ),
+                    cycles=a.session_timeout_cycles,
+                )
+                packet_payload_bytes = samples_per_frame * bytes_per_sample
+                diagnostic_packet_count = (
+                    diagnostic_stream_bytes + packet_payload_bytes - 1
+                ) // packet_payload_bytes
+                if (
+                    a.timing_log is not None
+                    and diagnostic_packet_count > MAX_TIMING_ROWS
+                ):
+                    ap.error(
+                        f"--timing-log packet count "
+                        f"{diagnostic_packet_count} exceeds "
+                        f"{MAX_TIMING_ROWS:,} row limit"
+                    )
+                stream_payload = repeat_payload_for_session_cycles(
+                    payload,
+                    preroll,
+                    bytes_per_sample=bytes_per_sample,
+                    sample_rate=a.sample_rate,
+                    session_timeout_seconds=(
+                        backchannel.session_timeout_seconds
+                    ),
+                    cycles=a.session_timeout_cycles,
+                )
+                boundary_plan = RtpBoundaryPlan.fixed(
+                    stream_payload,
+                    samples_per_frame,
+                    sample_rate=a.sample_rate,
+                    bytes_per_sample=bytes_per_sample,
+                )
+                diagnostic_packet_count = boundary_plan.packet_count
+            if a.timing_log is not None and diagnostic_packet_count > MAX_TIMING_ROWS:
+                ap.error(
+                    f"--timing-log packet count "
+                    f"{diagnostic_packet_count} exceeds "
+                    f"{MAX_TIMING_ROWS:,} row limit"
+                )
         print("  OPTIONS -> 200")
         print("  DESCRIBE(backchannel) -> 200")
         track = backchannel.send_track
@@ -1184,8 +1578,19 @@ def main(argv=None):
         if a.rtcp_interval > 0:
             send_rtcp(time.monotonic_ns())
         print(f"  ✓ {sent} RTP 프레임 송신 완료 ({a.transport}) — 카메라 스피커에서 재생됐다면 성공")
+    except BaseException as error:
+        playback_error = error
+        raise
     finally:
-        backchannel.close()
+        try:
+            backchannel.close()
+        except BaseException as cleanup_error:
+            if playback_error is None:
+                raise
+            if hasattr(playback_error, "add_note"):
+                playback_error.add_note(
+                    f"backchannel cleanup failure: {cleanup_error}"
+                )
     if a.timing_log is not None:
         atomic_write_jsonl(
             a.timing_log,

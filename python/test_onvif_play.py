@@ -8,6 +8,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
@@ -79,6 +80,11 @@ def write_packet_pattern(path, payload_sizes):
 
 class FakeRtsp:
     instances = []
+    public_header = (
+        "OPTIONS, describe, SETUP, PLAY, SET_PARAMETER, GET_PARAMETER, "
+        "TEARDOWN"
+    )
+    session_header = "test-session;timeout=60"
 
     def __init__(self, host, port, user, password):
         self.host = host
@@ -93,6 +99,8 @@ class FakeRtsp:
         headers = headers or {}
         self.requests.append((method, uri, headers))
         self.events.append(("request", method, uri, headers))
+        if method == "OPTIONS":
+            return 200, {"public": self.public_header}, ""
         if method == "DESCRIBE":
             sdp = (
                 "v=0\r\n"
@@ -117,7 +125,7 @@ class FakeRtsp:
             else:
                 channel = "6-7"
             return 200, {
-                "session": "test-session;timeout=60",
+                "session": self.session_header,
                 "transport": (
                     "RTP/AVP/TCP;unicast;"
                     f"interleaved={channel};ssrc=01020304"
@@ -176,6 +184,101 @@ class FakeClock:
         self.sleep_deadlines_ns.append(self.now_ns)
 
 
+class ParameterizedSessionRtsp(FakeRtsp):
+    session_header = "  durable-session ; mode=play ; TiMeOuT = 42  "
+
+
+class MissingTimeoutRtsp(FakeRtsp):
+    session_header = "default-timeout-session;mode=play"
+
+
+class ShortTimeoutRtsp(FakeRtsp):
+    session_header = "short-session;timeout=1"
+
+
+class KeepaliveFallbackRtsp(FakeRtsp):
+    def request(self, method, uri, headers=None):
+        headers = headers or {}
+        if method == "SET_PARAMETER":
+            self.requests.append((method, uri, headers))
+            self.events.append(("request", method, uri, headers))
+            return 405, {}, ""
+        if method == "GET_PARAMETER":
+            self.requests.append((method, uri, headers))
+            self.events.append(("request", method, uri, headers))
+            return 501, {}, ""
+        return super().request(method, uri, headers)
+
+
+class GetParameterKeepaliveRtsp(FakeRtsp):
+    public_header = "OPTIONS, DESCRIBE, SETUP, PLAY, GET_PARAMETER, TEARDOWN"
+
+
+class OptionsKeepaliveRtsp(FakeRtsp):
+    public_header = "OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN"
+
+
+class ControlledKeepaliveEvent:
+    def __init__(self):
+        self.wake = threading.Event()
+        self.wait_started = threading.Event()
+        self.wait_timeouts = []
+        self.stopped = False
+
+    def wait(self, timeout):
+        self.wait_timeouts.append(timeout)
+        self.wait_started.set()
+        self.wake.wait(timeout=1)
+        self.wake.clear()
+        return self.stopped
+
+    def trigger(self):
+        self.wake.set()
+
+    def set(self):
+        self.stopped = True
+        self.wake.set()
+
+
+class KeepaliveWorkerRtsp(ParameterizedSessionRtsp):
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.keepalive_received = threading.Event()
+        self.transport = None
+        self.worker_alive_at_teardown = None
+
+    def request(self, method, uri, headers=None):
+        result = super().request(method, uri, headers)
+        if method == "SET_PARAMETER":
+            self.keepalive_received.set()
+        elif method == "TEARDOWN":
+            self.worker_alive_at_teardown = (
+                self.transport.keepalive_thread.is_alive()
+            )
+        return result
+
+
+class KeepaliveFailureRtsp(ParameterizedSessionRtsp):
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.keepalive_received = threading.Event()
+        self.transport = None
+        self.worker_alive_at_teardown = None
+
+    def request(self, method, uri, headers=None):
+        headers = headers or {}
+        if method == "SET_PARAMETER":
+            self.requests.append((method, uri, headers))
+            self.events.append(("request", method, uri, headers))
+            self.keepalive_received.set()
+            return 500, {}, ""
+        if method == "TEARDOWN":
+            self.worker_alive_at_teardown = (
+                self.transport.keepalive_thread.is_alive()
+            )
+        return super().request(method, uri, headers)
+
+
 class FakeUdpRtsp(FakeRtsp):
     def request(self, method, uri, headers=None):
         if method == "SETUP":
@@ -223,6 +326,10 @@ class FakeAacRtsp(FakeRtsp):
             )
             return 200, {"content-base": uri + "/"}, sdp
         return super().request(method, uri, headers)
+
+
+class ShortTimeoutAacRtsp(FakeAacRtsp):
+    session_header = "short-aac-session;timeout=1"
 
 
 class TeardownFailureRtsp(FakeRtsp):
@@ -283,7 +390,148 @@ class ScriptedRtspSocket:
         self.closed = True
 
 
+class ConcurrentSendSocket:
+    def __init__(self):
+        self.guard = threading.Lock()
+        self.first_entered = threading.Event()
+        self.second_entered = threading.Event()
+        self.active_sends = 0
+        self.overlapped = False
+        self.sent = []
+
+    def sendall(self, payload):
+        with self.guard:
+            call_index = len(self.sent)
+            self.sent.append(payload)
+            self.active_sends += 1
+            self.overlapped = self.overlapped or self.active_sends > 1
+        try:
+            if call_index == 0:
+                self.first_entered.set()
+                self.second_entered.wait(timeout=0.25)
+            else:
+                self.second_entered.set()
+        finally:
+            with self.guard:
+                self.active_sends -= 1
+
+
 class RtspSafetyTest(unittest.TestCase):
+    def test_request_bytes_and_interleaved_media_share_one_write_lock(self):
+        fake_socket = ConcurrentSendSocket()
+        rtsp = onvif_play.Rtsp.__new__(onvif_play.Rtsp)
+        rtsp.s = fake_socket
+        rtsp.user = "fake-user"
+        rtsp.pw = "fake-password"
+        rtsp.cseq = 0
+        rtsp.challenge = None
+        rtsp.reader_failure = None
+        rtsp.responses = onvif_play.queue.Queue()
+        rtsp.responses.put((200, {}, ""))
+        rtsp.write_lock = threading.Lock()
+        rtsp.request_lock = threading.Lock()
+        errors = []
+
+        request_thread = threading.Thread(
+            target=lambda: self._capture_thread_error(
+                errors,
+                lambda: rtsp.request("OPTIONS", "rtsp://example.invalid/live"),
+            )
+        )
+        media_thread = threading.Thread(
+            target=lambda: self._capture_thread_error(
+                errors,
+                lambda: rtsp.send_interleaved(6, b"rtp"),
+            )
+        )
+        request_thread.start()
+        self.assertTrue(fake_socket.first_entered.wait(timeout=1))
+        media_thread.start()
+        request_thread.join(timeout=1)
+        media_thread.join(timeout=1)
+
+        self.assertFalse(request_thread.is_alive())
+        self.assertFalse(media_thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertFalse(fake_socket.overlapped)
+        self.assertEqual(len(fake_socket.sent), 2)
+
+    @staticmethod
+    def _capture_thread_error(errors, operation):
+        try:
+            operation()
+        except BaseException as error:
+            errors.append(error)
+
+    def test_concurrent_requests_keep_response_ownership_ordered(self):
+        rtsp = onvif_play.Rtsp.__new__(onvif_play.Rtsp)
+        rtsp.challenge = None
+        rtsp.request_lock = threading.Lock()
+        guard = threading.Lock()
+        second_exchange_entered = threading.Event()
+        first_exchange_entered = threading.Event()
+        active_exchanges = 0
+        exchanges_overlapped = False
+        results = {}
+        errors = []
+
+        def exchange(method, uri, headers):
+            nonlocal active_exchanges, exchanges_overlapped
+            with guard:
+                call_index = len(results)
+                active_exchanges += 1
+                exchanges_overlapped = (
+                    exchanges_overlapped or active_exchanges > 1
+                )
+            try:
+                if call_index == 0:
+                    first_exchange_entered.set()
+                    second_exchange_entered.wait(timeout=0.25)
+                else:
+                    second_exchange_entered.set()
+                return 200, {"request-method": method}, method
+            finally:
+                with guard:
+                    active_exchanges -= 1
+
+        rtsp._send = exchange
+
+        def request(method):
+            try:
+                results[method] = rtsp.request(
+                    method, "rtsp://example.invalid/live"
+                )
+            except BaseException as error:
+                errors.append(error)
+
+        first = threading.Thread(target=request, args=("SET_PARAMETER",))
+        second = threading.Thread(target=request, args=("GET_PARAMETER",))
+        first.start()
+        self.assertTrue(first_exchange_entered.wait(timeout=1))
+        second.start()
+        first.join(timeout=1)
+        second.join(timeout=1)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(errors, [])
+        self.assertFalse(exchanges_overlapped)
+        self.assertEqual(
+            results,
+            {
+                "SET_PARAMETER": (
+                    200,
+                    {"request-method": "SET_PARAMETER"},
+                    "SET_PARAMETER",
+                ),
+                "GET_PARAMETER": (
+                    200,
+                    {"request-method": "GET_PARAMETER"},
+                    "GET_PARAMETER",
+                ),
+            },
+        )
+
     def test_response_queue_overflow_fails_closed_without_blocking_reader(self):
         response = b"RTSP/1.0 200 OK\r\n\r\n"
         fake_socket = ScriptedRtspSocket(
@@ -500,6 +748,18 @@ class BackchannelTransportTest(unittest.TestCase):
             ["OPTIONS", "DESCRIBE", "SETUP", "SETUP", "SETUP", "PLAY", "TEARDOWN"],
         )
         self.assertEqual(
+            transport.public_methods,
+            frozenset({
+                "OPTIONS",
+                "DESCRIBE",
+                "SETUP",
+                "PLAY",
+                "SET_PARAMETER",
+                "GET_PARAMETER",
+                "TEARDOWN",
+            }),
+        )
+        self.assertEqual(
             [request[1].rsplit("/", 1)[-1] for request in client.requests[2:5]],
             ["trackID=0", "trackID=1", "trackID=5"],
         )
@@ -518,6 +778,192 @@ class BackchannelTransportTest(unittest.TestCase):
         teardown = client.requests[6]
         for request in (describe, backchannel_setup, play, teardown):
             self.assertEqual(request[2].get("Require"), onvif_play.BACKCHANNEL)
+
+    def test_parses_session_timeout_parameters_and_uses_half_deadline(self):
+        with onvif_play.open_backchannel_transport(
+            "example.invalid",
+            "fake-user",
+            "fake-password",
+            stream_uri="rtsp://example.invalid/live",
+            rtsp_factory=ParameterizedSessionRtsp,
+        ) as transport:
+            self.assertEqual(transport.session, "durable-session")
+            self.assertEqual(transport.session_timeout_seconds, 42)
+            self.assertEqual(transport.keepalive_interval_seconds, 21)
+
+    def test_missing_session_timeout_defaults_to_sixty_seconds(self):
+        with onvif_play.open_backchannel_transport(
+            "example.invalid",
+            "fake-user",
+            "fake-password",
+            stream_uri="rtsp://example.invalid/live",
+            rtsp_factory=MissingTimeoutRtsp,
+        ) as transport:
+            self.assertEqual(transport.session, "default-timeout-session")
+            self.assertEqual(transport.session_timeout_seconds, 60)
+            self.assertEqual(transport.keepalive_interval_seconds, 30)
+
+    def test_keepalive_prefers_advertised_set_parameter_with_session(self):
+        with onvif_play.open_backchannel_transport(
+            "example.invalid",
+            "fake-user",
+            "fake-password",
+            stream_uri="rtsp://example.invalid/live",
+            rtsp_factory=FakeRtsp,
+        ) as transport:
+            transport._send_keepalive()
+
+        client = FakeRtsp.instances[0]
+        keepalive = next(
+            request for request in client.requests
+            if request[0] == "SET_PARAMETER"
+        )
+        self.assertEqual(keepalive[2]["Session"], "test-session")
+        self.assertEqual(keepalive[2]["Content-Length"], "0")
+        self.assertEqual(transport.keepalive_method, "SET_PARAMETER")
+
+    def test_keepalive_falls_back_and_remembers_working_method(self):
+        packet = make_rtp_packet(b"still-active", sequence=9, timestamp=1000)
+        with onvif_play.open_backchannel_transport(
+            "example.invalid",
+            "fake-user",
+            "fake-password",
+            stream_uri="rtsp://example.invalid/live",
+            rtsp_factory=KeepaliveFallbackRtsp,
+        ) as transport:
+            transport._send_keepalive()
+            transport.send_rtp(packet)
+            transport._send_keepalive()
+
+        client = FakeRtsp.instances[0]
+        play_index = next(
+            index for index, event in enumerate(client.events)
+            if event[:2] == ("request", "PLAY")
+        )
+        teardown_index = next(
+            index for index, event in enumerate(client.events)
+            if event[:2] == ("request", "TEARDOWN")
+        )
+        post_play = client.events[play_index + 1 : teardown_index]
+        self.assertEqual(
+            [event[1] for event in post_play],
+            ["SET_PARAMETER", "GET_PARAMETER", "OPTIONS", 6, "OPTIONS"],
+        )
+        for event in post_play:
+            if event[0] == "request":
+                self.assertEqual(event[3]["Session"], "test-session")
+        self.assertEqual(post_play[3], ("media", 6, packet))
+        self.assertEqual(transport.keepalive_method, "OPTIONS")
+
+    def test_public_methods_select_get_parameter_then_session_options(self):
+        for rtsp_type, expected_method in (
+            (GetParameterKeepaliveRtsp, "GET_PARAMETER"),
+            (OptionsKeepaliveRtsp, "OPTIONS"),
+        ):
+            with self.subTest(expected_method=expected_method):
+                FakeRtsp.instances.clear()
+                with onvif_play.open_backchannel_transport(
+                    "example.invalid",
+                    "fake-user",
+                    "fake-password",
+                    stream_uri="rtsp://example.invalid/live",
+                    rtsp_factory=rtsp_type,
+                ) as transport:
+                    transport._send_keepalive()
+
+                client = FakeRtsp.instances[0]
+                keepalive = next(
+                    request for request in client.requests[1:]
+                    if request[0] == expected_method
+                )
+                self.assertEqual(keepalive[2]["Session"], "test-session")
+                self.assertEqual(transport.keepalive_method, expected_method)
+
+    def test_keepalive_worker_uses_half_timeout_and_joins_before_teardown(self):
+        keepalive_event = ControlledKeepaliveEvent()
+        transport = onvif_play.open_backchannel_transport(
+            "example.invalid",
+            "fake-user",
+            "fake-password",
+            stream_uri="rtsp://example.invalid/live",
+            rtsp_factory=KeepaliveWorkerRtsp,
+            keepalive_event_factory=lambda: keepalive_event,
+        )
+        client = FakeRtsp.instances[0]
+        client.transport = transport
+        try:
+            self.assertTrue(keepalive_event.wait_started.wait(timeout=1))
+            self.assertEqual(keepalive_event.wait_timeouts[0], 21)
+            keepalive_event.trigger()
+            self.assertTrue(client.keepalive_received.wait(timeout=1))
+        finally:
+            transport.close()
+
+        self.assertFalse(transport.keepalive_thread.is_alive())
+        self.assertFalse(client.worker_alive_at_teardown)
+        self.assertLess(
+            next(i for i, event in enumerate(client.events)
+                 if event[:2] == ("request", "SET_PARAMETER")),
+            next(i for i, event in enumerate(client.events)
+                 if event[:2] == ("request", "TEARDOWN")),
+        )
+
+    def test_keepalive_failure_propagates_after_worker_and_transport_cleanup(self):
+        keepalive_event = ControlledKeepaliveEvent()
+        transport = onvif_play.open_backchannel_transport(
+            "example.invalid",
+            "fake-user",
+            "fake-password",
+            stream_uri="rtsp://example.invalid/live",
+            rtsp_factory=KeepaliveFailureRtsp,
+            keepalive_event_factory=lambda: keepalive_event,
+        )
+        client = FakeRtsp.instances[0]
+        client.transport = transport
+        self.assertTrue(keepalive_event.wait_started.wait(timeout=1))
+        keepalive_event.trigger()
+        self.assertTrue(client.keepalive_received.wait(timeout=1))
+
+        with self.assertRaisesRegex(
+            RuntimeError, "SET_PARAMETER failed with RTSP status 500"
+        ):
+            transport.close()
+
+        self.assertFalse(transport.keepalive_thread.is_alive())
+        self.assertFalse(client.worker_alive_at_teardown)
+        self.assertEqual(client.requests[-1][0], "TEARDOWN")
+        self.assertTrue(client.closed)
+
+    def test_keepalive_failure_does_not_mask_primary_playback_error(self):
+        keepalive_event = ControlledKeepaliveEvent()
+        transport = onvif_play.open_backchannel_transport(
+            "example.invalid",
+            "fake-user",
+            "fake-password",
+            stream_uri="rtsp://example.invalid/live",
+            rtsp_factory=KeepaliveFailureRtsp,
+            keepalive_event_factory=lambda: keepalive_event,
+        )
+        client = FakeRtsp.instances[0]
+        client.transport = transport
+        self.assertTrue(keepalive_event.wait_started.wait(timeout=1))
+        keepalive_event.trigger()
+        self.assertTrue(client.keepalive_received.wait(timeout=1))
+
+        with self.assertRaisesRegex(
+            RuntimeError, "primary playback failure"
+        ) as raised:
+            with transport:
+                raise RuntimeError("primary playback failure")
+
+        self.assertTrue(
+            any(
+                "SET_PARAMETER failed with RTSP status 500" in note
+                for note in raised.exception.__notes__
+            )
+        )
+        self.assertFalse(transport.keepalive_thread.is_alive())
+        self.assertFalse(client.worker_alive_at_teardown)
 
     def test_teardown_occurs_when_replay_raises(self):
         with self.assertRaisesRegex(RuntimeError, "send failed"):
@@ -1221,6 +1667,198 @@ class RtpSenderMainTest(unittest.TestCase):
         )
         self.assertEqual(self.clock.now_ns - self.clock.start_ns, 1_000_000)
 
+    def test_session_timeout_cycles_is_a_bounded_nonnegative_integer(self):
+        parser = onvif_play.build_argument_parser()
+
+        self.assertEqual(parser.parse_args([]).session_timeout_cycles, 0)
+        self.assertEqual(
+            parser.parse_args([
+                "--session-timeout-cycles", "1"
+            ]).session_timeout_cycles,
+            1,
+        )
+        self.assertEqual(
+            parser.parse_args([
+                "--session-timeout-cycles", "100"
+            ]).session_timeout_cycles,
+            100,
+        )
+        for invalid in ("-1", "101", "1.5"):
+            with self.subTest(invalid=invalid), redirect_stderr(
+                StringIO()
+            ), self.assertRaises(SystemExit):
+                parser.parse_args([
+                    "--session-timeout-cycles", invalid
+                ])
+
+    def test_timeout_cycles_repeat_and_trim_fixed_pcma_sample_exactly(self):
+        packets, _, _, _ = self.run_main(
+            "--ms", "30",
+            "--session-timeout-cycles", "2",
+            rtsp_type=ShortTimeoutRtsp,
+        )
+        source = onvif_play.tone_audio(
+            1000, 30, "pcma", amp=0.25, rate=8000
+        )
+        target_samples = (2 * 1 + 5) * 8000
+        expected_payload = (
+            source * ((target_samples + len(source) - 1) // len(source))
+        )[:target_samples]
+        metadata = [parse_rtp_packet(packet) for packet in packets]
+        actual_payload = b"".join(
+            packet[meta.header_size : len(packet) - meta.padding_size]
+            for packet, meta in zip(packets, metadata, strict=True)
+        )
+
+        self.assertEqual(actual_payload, expected_payload)
+        self.assertEqual(actual_payload[-80:], source[:80])
+        self.assertEqual(len(packets), 350)
+        self.assertEqual(
+            [meta.timestamp for meta in metadata],
+            [
+                (0x778899AA + index * 160) & 0xFFFFFFFF
+                for index in range(350)
+            ],
+        )
+        self.assertEqual({meta.ssrc for meta in metadata}, {0x11223344})
+        self.assertEqual(
+            [index for index, meta in enumerate(metadata) if meta.marker],
+            [0],
+        )
+        self.assertEqual(
+            self.clock.now_ns - self.clock.start_ns,
+            7_000_000_000,
+        )
+
+    def test_timeout_cycles_use_default_sixty_second_session_timeout(self):
+        packets, _, _, _ = self.run_main(
+            "--ms", "30",
+            "--session-timeout-cycles", "1",
+            rtsp_type=MissingTimeoutRtsp,
+        )
+
+        self.assertEqual(len(packets), 3250)
+        self.assertEqual(
+            self.clock.now_ns - self.clock.start_ns,
+            65_000_000_000,
+        )
+        self.assertEqual(FakeRtsp.instances[0].session, "default-timeout-session")
+
+    def test_timeout_cycles_decode_pcma_file_once_before_repetition(self):
+        decoded = b"\x00\x00" * 239
+        source_payload = bytes(range(239))
+        with patch.object(
+            backchannel_audio, "decode_source", return_value=decoded
+        ) as decode, patch.object(
+            backchannel_audio,
+            "encode_pcma_gst_compatible",
+            return_value=source_payload,
+        ) as encode:
+            packets, _, _, _ = self.run_main(
+                "--file", "source.wav",
+                "--encoder", "gst-compatible",
+                "--session-timeout-cycles", "1",
+                rtsp_type=ShortTimeoutRtsp,
+            )
+
+        decode.assert_called_once_with("source.wav", 8000)
+        encode.assert_called_once_with(decoded, 0.25)
+        actual_payload = b"".join(packet[12:] for packet in packets)
+        expected_payload = (
+            source_payload
+            * ((48_000 + len(source_payload) - 1) // len(source_payload))
+        )[:48_000]
+        self.assertEqual(actual_payload, expected_payload)
+
+    def test_timeout_cycles_support_raw_pcma_with_rebase_pacer(self):
+        source_payload = bytes(range(1, 240))
+        with tempfile.TemporaryDirectory() as directory:
+            source = pathlib.Path(directory) / "hardware.pcma"
+            source.write_bytes(source_payload)
+            with patch.object(
+                onvif_play,
+                "read_pcma_input",
+                wraps=onvif_play.read_pcma_input,
+            ) as reader, patch.object(
+                backchannel_audio,
+                "decode_source",
+                side_effect=AssertionError("decode called"),
+            ):
+                packets, _, _, _ = self.run_main(
+                    "--pcma-input", str(source),
+                    "--pacer", "rebase",
+                    "--session-timeout-cycles", "1",
+                    rtsp_type=ShortTimeoutRtsp,
+                )
+
+        reader.assert_called_once_with(source)
+        expected_payload = (
+            source_payload
+            * ((48_000 + len(source_payload) - 1) // len(source_payload))
+        )[:48_000]
+        self.assertEqual(b"".join(packet[12:] for packet in packets), expected_payload)
+        self.assertEqual(len(packets), 300)
+        self.assertEqual(self.clock.now_ns - self.clock.start_ns, 6_000_000_000)
+        client = FakeRtsp.instances[0]
+        self.assertEqual(client.requests[-1][0], "TEARDOWN")
+        self.assertTrue(client.closed)
+
+    def test_timeout_cycle_source_byte_cap_fails_before_network(self):
+        with patch.object(
+            onvif_play, "MAX_AUDIO_SOURCE_BYTES", 3
+        ), patch.object(
+            onvif_play,
+            "prepare_audio",
+            return_value=(b"1234", None, "audio"),
+        ), patch.object(
+            onvif_play,
+            "onvif_stream_uri",
+            side_effect=AssertionError("network resolver called"),
+        ) as resolver, redirect_stderr(
+            StringIO()
+        ) as stderr, self.assertRaises(SystemExit):
+            onvif_play.main(["--session-timeout-cycles", "1"])
+
+        resolver.assert_not_called()
+        self.assertIn("source limit", stderr.getvalue())
+
+    def test_timeout_cycle_tone_source_cap_precedes_materialization(self):
+        with patch.object(
+            onvif_play, "MAX_AUDIO_SOURCE_BYTES", 3
+        ), patch.object(
+            onvif_play,
+            "tone_audio",
+            side_effect=AssertionError("tone materialized"),
+        ) as tone, patch.object(
+            onvif_play,
+            "onvif_stream_uri",
+            side_effect=AssertionError("network resolver called"),
+        ) as resolver, redirect_stderr(
+            StringIO()
+        ) as stderr, self.assertRaises(SystemExit):
+            onvif_play.main([
+                "--ms", "1",
+                "--session-timeout-cycles", "1",
+            ])
+
+        tone.assert_not_called()
+        resolver.assert_not_called()
+        self.assertIn("source limit", stderr.getvalue())
+
+    def test_timeout_cycle_repetition_byte_cap_fails_before_rtp(self):
+        with patch.object(
+            onvif_play, "MAX_REPEATED_MEDIA_BYTES", 1000
+        ), self.assertRaisesRegex(ValueError, "repetition limit"):
+            self.run_main(
+                "--session-timeout-cycles", "1",
+                rtsp_type=ShortTimeoutRtsp,
+            )
+
+        client = FakeRtsp.instances[0]
+        self.assertFalse(any(event[0] == "media" for event in client.events))
+        self.assertEqual(client.requests[-1][0], "TEARDOWN")
+        self.assertTrue(client.closed)
+
     def test_explicit_packet_ms_and_packet_pattern_are_mutually_exclusive(self):
         parser = onvif_play.build_argument_parser()
         with redirect_stderr(StringIO()) as stderr, self.assertRaises(SystemExit):
@@ -1417,6 +2055,29 @@ class RtpSenderMainTest(unittest.TestCase):
             resolver.assert_not_called()
             self.assertIn(message, stderr.getvalue())
 
+    def test_timeout_cycles_reject_packet_pattern_before_file_or_network(self):
+        with patch.object(
+            onvif_play,
+            "load_packet_pattern",
+            side_effect=AssertionError("manifest loaded"),
+        ) as loader, patch.object(
+            onvif_play,
+            "prepare_audio",
+            side_effect=AssertionError("audio prepared"),
+        ) as prepare_audio, patch.object(
+            onvif_play, "onvif_stream_uri"
+        ) as resolver, redirect_stderr(StringIO()) as stderr, \
+                self.assertRaises(SystemExit):
+            onvif_play.main([
+                "--session-timeout-cycles", "1",
+                "--packet-pattern", "manifest.jsonl",
+            ])
+
+        self.assertIn("one-shot", stderr.getvalue())
+        loader.assert_not_called()
+        prepare_audio.assert_not_called()
+        resolver.assert_not_called()
+
     def test_packet_pattern_transport_size_is_validated_before_audio_or_network(self):
         class ResolverReached(RuntimeError):
             pass
@@ -1552,6 +2213,33 @@ class RtpSenderMainTest(unittest.TestCase):
             resolver.assert_not_called()
             self.assertFalse(timing_log.exists())
 
+    def test_timeout_cycle_timing_cap_precedes_repetition_materialization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            timing_log = pathlib.Path(directory) / "diagnostic-timing.jsonl"
+            timing_log.write_text("stale\n")
+            with patch.object(
+                onvif_play,
+                "repeat_payload_for_session_cycles",
+                side_effect=AssertionError("repetition materialized"),
+            ) as repeat_payload, redirect_stderr(
+                StringIO()
+            ) as stderr, self.assertRaises(SystemExit):
+                self.run_main(
+                    "--ms", "1",
+                    "--packet-ms", "0.125",
+                    "--session-timeout-cycles", "2",
+                    "--timing-log", str(timing_log),
+                    rtsp_type=ShortTimeoutRtsp,
+                )
+
+        repeat_payload.assert_not_called()
+        self.assertIn("10,000", stderr.getvalue())
+        self.assertFalse(timing_log.exists())
+        client = FakeRtsp.instances[0]
+        self.assertFalse(any(event[0] == "media" for event in client.events))
+        self.assertEqual(client.requests[-1][0], "TEARDOWN")
+        self.assertTrue(client.closed)
+
     def test_timing_log_enforces_serialized_bound_atomically(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(
             onvif_play, "MAX_TIMING_LINE_BYTES", 64
@@ -1650,6 +2338,28 @@ class RtpSenderMainTest(unittest.TestCase):
 
             self.assertFalse(timing_log.exists())
             self.assertFalse(list(timing_log.parent.glob(f".{timing_log.name}.*.tmp")))
+
+    def test_playback_error_survives_concurrent_cleanup_failure(self):
+        class FailingSendAndTeardownRtsp(TeardownFailureRtsp):
+            def send_interleaved(self, channel, payload):
+                if channel == 6:
+                    raise RuntimeError("primary playback failure")
+                super().send_interleaved(channel, payload)
+
+        with self.assertRaisesRegex(
+            RuntimeError, "primary playback failure"
+        ) as raised:
+            self.run_main(
+                "--ms", "20",
+                rtsp_type=FailingSendAndTeardownRtsp,
+            )
+
+        self.assertTrue(
+            any(
+                "TEARDOWN failed" in note
+                for note in raised.exception.__notes__
+            )
+        )
 
     def test_timing_log_is_not_published_when_teardown_fails(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1793,6 +2503,111 @@ class RtpSenderMainTest(unittest.TestCase):
             [parse_rtp_packet(packet).timestamp for packet in packets],
             [0x778899AA, 0x77889DAA, 0x7788A1AA],
         )
+
+    def test_timeout_cycles_repeat_aac_frames_after_one_source_decode(self):
+        source_frames = [b"a", b"bc", b"def"]
+        with patch.object(
+            onvif_play, "file_aac", return_value=source_frames
+        ) as encoder:
+            packets, _, _, _ = self.run_main(
+                "--codec", "aac",
+                "--file", "source.wav",
+                "--session-timeout-cycles", "1",
+                rtsp_type=ShortTimeoutAacRtsp,
+            )
+
+        expected_count = math.ceil((1 * 1 + 5) * 8000 / 1024)
+        metadata = [parse_rtp_packet(packet) for packet in packets]
+        encoded_frames = [packet[16:] for packet in packets]
+        expected_frames = [
+            source_frames[index % len(source_frames)]
+            for index in range(expected_count)
+        ]
+
+        encoder.assert_called_once_with("source.wav", 0.25, 8000, 0)
+        self.assertEqual(encoded_frames, expected_frames)
+        self.assertEqual(len(packets), expected_count)
+        self.assertEqual(
+            [meta.timestamp for meta in metadata],
+            [
+                (0x778899AA + index * 1024) & 0xFFFFFFFF
+                for index in range(expected_count)
+            ],
+        )
+        self.assertEqual({meta.ssrc for meta in metadata}, {0x11223344})
+        self.assertTrue(all(meta.marker for meta in metadata))
+        self.assertGreaterEqual(
+            self.clock.now_ns - self.clock.start_ns,
+            6_000_000_000,
+        )
+
+    def test_aac_timeout_cycle_timing_cap_precedes_frame_repetition(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            onvif_play, "file_aac", return_value=[b"a"]
+        ), patch.object(
+            onvif_play,
+            "repeat_aac_frames_for_session_cycles",
+            side_effect=AssertionError("AAC frames repeated"),
+        ) as repeat_frames, redirect_stderr(
+            StringIO()
+        ) as stderr, self.assertRaises(SystemExit):
+            timing_log = pathlib.Path(directory) / "aac-diagnostic.jsonl"
+            self.run_main(
+                "--codec", "aac",
+                "--file", "source.wav",
+                "--sample-rate", "64000",
+                "--session-timeout-cycles", "100",
+                "--timing-log", str(timing_log),
+                rtsp_type=FakeAacRtsp,
+            )
+
+        repeat_frames.assert_not_called()
+        self.assertIn("10,000", stderr.getvalue())
+        self.assertFalse(timing_log.exists())
+        client = FakeRtsp.instances[0]
+        self.assertFalse(any(event[0] == "media" for event in client.events))
+        self.assertEqual(client.requests[-1][0], "TEARDOWN")
+        self.assertTrue(client.closed)
+
+    def test_aac_source_frame_cap_fails_before_network(self):
+        with patch.object(
+            onvif_play, "MAX_AUDIO_SOURCE_FRAMES", 2
+        ), patch.object(
+            onvif_play,
+            "prepare_audio",
+            return_value=(None, [b"a", b"b", b"c"], "audio"),
+        ), patch.object(
+            onvif_play,
+            "onvif_stream_uri",
+            side_effect=AssertionError("network resolver called"),
+        ) as resolver, redirect_stderr(
+            StringIO()
+        ) as stderr, self.assertRaises(SystemExit):
+            onvif_play.main([
+                "--codec", "aac",
+                "--file", "source.wav",
+            ])
+
+        resolver.assert_not_called()
+        self.assertIn("source frame", stderr.getvalue())
+
+    def test_aac_repetition_frame_cap_fails_before_rtp(self):
+        with patch.object(
+            onvif_play, "file_aac", return_value=[b"frame"]
+        ), patch.object(
+            onvif_play, "MAX_REPEATED_AUDIO_FRAMES", 2
+        ), self.assertRaisesRegex(ValueError, "frame limit"):
+            self.run_main(
+                "--codec", "aac",
+                "--file", "source.wav",
+                "--session-timeout-cycles", "1",
+                rtsp_type=ShortTimeoutAacRtsp,
+            )
+
+        client = FakeRtsp.instances[0]
+        self.assertFalse(any(event[0] == "media" for event in client.events))
+        self.assertEqual(client.requests[-1][0], "TEARDOWN")
+        self.assertTrue(client.closed)
 
     def test_rtcp_maps_first_periodic_and_final_reports_to_send_timeline(self):
         packets, reports, _, _ = self.run_main(
@@ -2039,6 +2854,29 @@ class RtpSenderMainTest(unittest.TestCase):
             else:
                 gst_encoder.assert_called_once_with(decoded, 0.05)
                 ffmpeg_encoder.assert_not_called()
+
+    def test_legacy_file_encoders_bound_ffmpeg_source_output(self):
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=b"", stderr=b""
+        )
+        with patch.object(
+            onvif_play.subprocess, "run", return_value=completed
+        ) as run:
+            onvif_play.file_audio(
+                "source.wav", "pcmu", 0.25, 8000
+            )
+            pcmu_argv = run.call_args.args[0]
+            onvif_play.file_aac(
+                "source.wav", 0.25, 8000, 0
+            )
+            aac_argv = run.call_args.args[0]
+
+        for argv in (pcmu_argv, aac_argv):
+            limit_index = argv.index("-fs")
+            self.assertEqual(
+                argv[limit_index + 1],
+                str(onvif_play.MAX_AUDIO_SOURCE_BYTES + 1),
+            )
 
     def test_pcma_input_bypasses_conversion_and_preserves_payload_after_preroll(self):
         with tempfile.TemporaryDirectory() as directory:
