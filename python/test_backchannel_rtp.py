@@ -4,6 +4,7 @@ import json
 import os
 import pathlib
 import re
+import stat
 import struct
 import subprocess
 import sys
@@ -645,13 +646,21 @@ class SummarizeSendTimingToolTests(unittest.TestCase):
         self.assertEqual(
             summary["checks"],
             {
+                "all_sample_rates_match_expected": True,
                 "all_packet_samples_match_expected": True,
+                "all_packet_durations_match_expected": True,
                 "no_unexpected_timestamp_deltas": True,
                 "no_post_severe_interval_below_75_percent": True,
                 "p99_deadline_error_within_bound": False,
             },
         )
+        self.assertEqual(summary["expected_sample_rate"], 8000)
         self.assertEqual(summary["expected_samples"], 160)
+        self.assertEqual(summary["expected_packet_duration_ns"], 20_000_000)
+        self.assertEqual(summary["severe_lateness_threshold_ns"], 20_000_000)
+        self.assertEqual(
+            summary["post_severe_minimum_interval_ns"], 15_000_000
+        )
         self.assertEqual(summary["deadline_error_limit_ns"], 2_000_000)
         self.assertFalse(summary["pass"])
 
@@ -668,16 +677,14 @@ class SummarizeSendTimingToolTests(unittest.TestCase):
         self.assertFalse(summary["checks"]["p99_deadline_error_within_bound"])
         self.assertFalse(summary["pass"])
 
-    def test_timestamp_mismatch_and_configured_jitter_bound_are_reported(self):
+    def test_timestamp_mismatch_is_reported(self):
         with tempfile.TemporaryDirectory() as directory:
             rows = self.make_rows(directory, "rebase")
         rows[2]["rtp_timestamp"] += 1
-        for row in rows:
-            row["configured_jitter_bound_ns"] = 3_000_000
 
         summary = self.summarizer.summarize_timing(rows)
 
-        self.assertEqual(summary["deadline_error_limit_ns"], 4_000_000)
+        self.assertEqual(summary["deadline_error_limit_ns"], 2_000_000)
         self.assertEqual(
             summary["unexpected_timestamp_deltas"],
             [
@@ -686,6 +693,41 @@ class SummarizeSendTimingToolTests(unittest.TestCase):
             ],
         )
         self.assertFalse(summary["checks"]["no_unexpected_timestamp_deltas"])
+
+    def test_auxiliary_jitter_bounds_cannot_widen_acceptance_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rows = self.make_rows(directory, "rebase")
+        for row in rows:
+            row["configured_jitter_bound_ns"] = 100_000_000
+
+        without_gst = self.summarizer.summarize_timing(rows)
+        with_gst = self.summarizer.summarize_timing(
+            rows,
+            gst_summary={
+                "inter_arrival_ns": {"p99": 9_000_000},
+                "deadline_error_jitter_bound_ns": 100_000_000,
+            },
+        )
+        with_sub_floor_gst = self.summarizer.summarize_timing(
+            rows,
+            gst_summary={
+                "inter_arrival_ns": {"p99": 500_000},
+                "deadline_error_jitter_bound_ns": 100_000_000,
+            },
+        )
+
+        self.assertEqual(without_gst["deadline_error_limit_ns"], 2_000_000)
+        self.assertFalse(
+            without_gst["checks"]["p99_deadline_error_within_bound"]
+        )
+        self.assertEqual(with_gst["deadline_error_limit_ns"], 10_000_000)
+        self.assertFalse(with_gst["checks"]["p99_deadline_error_within_bound"])
+        self.assertEqual(
+            with_sub_floor_gst["deadline_error_limit_ns"], 2_000_000
+        )
+        self.assertFalse(
+            with_sub_floor_gst["checks"]["p99_deadline_error_within_bound"]
+        )
 
     def test_gst_inter_arrival_p99_sets_required_bound_with_semantic_caveat(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -724,7 +766,7 @@ class SummarizeSendTimingToolTests(unittest.TestCase):
                     gst_summary={"inter_arrival_ns": {"p99": p99}},
                 )
 
-    def test_expected_samples_defaults_to_160_and_rejects_self_declared_delta(
+    def test_fixed_samples_reject_self_declared_delta_and_cannot_be_overridden(
         self,
     ):
         clock = FakePacerClock()
@@ -764,11 +806,101 @@ class SummarizeSendTimingToolTests(unittest.TestCase):
         self.assertFalse(summary["checks"]["no_unexpected_timestamp_deltas"])
         self.assertFalse(summary["pass"])
 
-        overridden = self.summarizer.summarize_timing(
-            rows, expected_samples=80
+        with self.assertRaises(TypeError):
+            self.summarizer.summarize_timing(rows, expected_samples=80)
+
+    def test_fixed_profile_rejects_rate_and_packet_duration_mismatches(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rows = self.make_rows(directory, "rebase")
+        gst_summary = {"inter_arrival_ns": {"p99": 49_000_000}}
+
+        for row in rows:
+            row["sample_rate"] = 16_000
+            row["packet_duration_ns"] = 20_000_000
+        wrong_rate = self.summarizer.summarize_timing(
+            rows, gst_summary=gst_summary
         )
-        self.assertEqual(overridden["expected_samples"], 80)
-        self.assertTrue(overridden["pass"])
+
+        for row in rows:
+            row["sample_rate"] = 8_000
+            row["packet_duration_ns"] = 10_000_000
+        wrong_duration = self.summarizer.summarize_timing(
+            rows, gst_summary=gst_summary
+        )
+
+        self.assertFalse(wrong_rate["checks"]["all_sample_rates_match_expected"])
+        self.assertEqual(len(wrong_rate["unexpected_sample_rates"]), 4)
+        self.assertFalse(wrong_rate["pass"])
+        self.assertFalse(
+            wrong_duration["checks"]["all_packet_durations_match_expected"]
+        )
+        self.assertEqual(len(wrong_duration["unexpected_packet_durations"]), 4)
+        self.assertFalse(wrong_duration["pass"])
+
+    def test_severe_and_post_severe_thresholds_ignore_row_metadata(self):
+        def make_rows(*, lateness_ns, duration_ns, flagged):
+            row_one = {
+                "packet_index": 1,
+                "rtp_timestamp": 160,
+                "samples": 160,
+                "sample_rate": 8000,
+                "packet_duration_ns": duration_ns,
+                "target_monotonic_ns": 20_000_000 - lateness_ns,
+                "actual_monotonic_ns": 20_000_000,
+                "lateness_ns": lateness_ns,
+                "interval_ns": 20_000_000,
+                "rebased": flagged,
+            }
+            if flagged:
+                row_one["injected_oversleep_ns"] = 100_000_000
+            return [
+                {
+                    "packet_index": 0,
+                    "rtp_timestamp": 0,
+                    "samples": 160,
+                    "sample_rate": 8000,
+                    "packet_duration_ns": 20_000_000,
+                    "target_monotonic_ns": 0,
+                    "actual_monotonic_ns": 0,
+                    "lateness_ns": 0,
+                    "interval_ns": None,
+                    "rebased": False,
+                },
+                row_one,
+                {
+                    "packet_index": 2,
+                    "rtp_timestamp": 320,
+                    "samples": 160,
+                    "sample_rate": 8000,
+                    "packet_duration_ns": 20_000_000,
+                    "target_monotonic_ns": 34_000_000,
+                    "actual_monotonic_ns": 34_000_000,
+                    "lateness_ns": 0,
+                    "interval_ns": 14_000_000,
+                    "rebased": False,
+                },
+            ]
+
+        severe = self.summarizer.summarize_timing(make_rows(
+            lateness_ns=20_000_000,
+            duration_ns=1,
+            flagged=False,
+        ))
+        merely_flagged = self.summarizer.summarize_timing(make_rows(
+            lateness_ns=0,
+            duration_ns=20_000_000,
+            flagged=True,
+        ))
+
+        self.assertFalse(
+            severe["checks"]["no_post_severe_interval_below_75_percent"]
+        )
+        self.assertEqual(severe["post_oversleep_interval_ns"]["min"], 14_000_000)
+        self.assertTrue(
+            merely_flagged["checks"][
+                "no_post_severe_interval_below_75_percent"
+            ]
+        )
 
     def test_cli_atomically_writes_summary_and_direct_help_works(self):
         environment = os.environ.copy()
@@ -808,7 +940,7 @@ class SummarizeSendTimingToolTests(unittest.TestCase):
         )
         self.assertEqual(help_result.returncode, 0, help_result.stderr)
         self.assertIn("--gst-summary", help_result.stdout)
-        self.assertIn("--expected-samples", help_result.stdout)
+        self.assertNotIn("--expected-samples", help_result.stdout)
 
     def test_cli_returns_nonzero_after_atomically_writing_failing_summary(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -898,6 +1030,85 @@ class SummarizeSendTimingToolTests(unittest.TestCase):
             with mock.patch.object(self.summarizer, "MAX_TIMING_ROWS", 2):
                 with self.assertRaisesRegex(ValueError, "row count exceeds 2"):
                     self.summarizer.load_timing_jsonl(path)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "requires POSIX FIFO support")
+    def test_cli_rejects_fifos_without_blocking(self):
+        environment = os.environ.copy()
+        environment.pop("PYTHONPATH", None)
+        with tempfile.TemporaryDirectory() as directory:
+            directory = pathlib.Path(directory)
+            self.make_rows(directory, "rebase")
+            timing = directory / "rebase.jsonl"
+
+            for option in ("--input", "--gst-summary"):
+                with self.subTest(option=option):
+                    fifo = directory / f"{option[2:]}.fifo"
+                    os.mkfifo(fifo)
+                    output = directory / f"{option[2:]}-summary.json"
+                    arguments = [
+                        sys.executable,
+                        str(SUMMARIZE_TIMING_TOOL),
+                        "--input",
+                        str(fifo if option == "--input" else timing),
+                        "--output",
+                        str(output),
+                    ]
+                    if option == "--gst-summary":
+                        arguments.extend(["--gst-summary", str(fifo)])
+                    try:
+                        completed = subprocess.run(
+                            arguments,
+                            cwd=ROOT,
+                            env=environment,
+                            check=False,
+                            capture_output=True,
+                            text=True,
+                            timeout=1,
+                        )
+                    except subprocess.TimeoutExpired:
+                        completed = None
+
+                    self.assertIsNotNone(completed, "summarizer blocked on FIFO")
+                    self.assertEqual(completed.returncode, 1)
+                    self.assertIn("not a regular file", completed.stderr)
+
+    def test_loaders_enforce_cumulative_bytes_after_zero_size_stat(self):
+        metadata = mock.Mock(st_mode=stat.S_IFREG | 0o600, st_size=0)
+        with tempfile.TemporaryDirectory() as directory:
+            directory = pathlib.Path(directory)
+            timing = directory / "timing.jsonl"
+            timing.write_bytes(b"{}\n" * 4)
+            gst_summary = directory / "gst-summary.json"
+            gst_summary.write_text('{"inter_arrival_ns":{"p99":1}}')
+
+            cases = (
+                (self.summarizer.load_timing_jsonl, timing, "MAX_TIMING_BYTES"),
+                (self.summarizer.load_gst_summary, gst_summary,
+                 "MAX_GST_SUMMARY_BYTES"),
+            )
+            for loader, path, limit_name in cases:
+                with self.subTest(loader=loader.__name__), mock.patch.object(
+                    pathlib.Path, "stat", return_value=metadata
+                ), mock.patch.object(
+                    self.summarizer.os, "fstat", return_value=metadata
+                ), mock.patch.object(
+                    self.summarizer, limit_name, 10
+                ), self.assertRaisesRegex(ValueError, "exceeds 10 bytes"):
+                    loader(path)
+
+    def test_gst_summary_enforces_line_bound_while_reading(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "gst-summary.json"
+            path.write_text('{"inter_arrival_ns":{"p99":1}}')
+
+            with mock.patch.object(
+                self.summarizer,
+                "MAX_GST_SUMMARY_LINE_BYTES",
+                8,
+            ), self.assertRaisesRegex(
+                ValueError, "GST summary line 1 exceeds 8 bytes"
+            ):
+                self.summarizer.load_gst_summary(path)
 
 
 class ParseRtpPacketTests(unittest.TestCase):

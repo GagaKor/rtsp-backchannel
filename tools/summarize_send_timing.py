@@ -8,6 +8,7 @@ import json
 import math
 import os
 import pathlib
+import stat
 import sys
 import tempfile
 
@@ -18,38 +19,77 @@ if __package__ in {None, ""}:
     if _python_root_string not in sys.path:
         sys.path.insert(0, _python_root_string)
 
-from backchannel_rtp import paths_refer_to_same_file
+from backchannel_rtp import (
+    TIMING_LOG_MAX_BYTES,
+    TIMING_LOG_MAX_LINE_BYTES,
+    TIMING_LOG_MAX_ROWS,
+    paths_refer_to_same_file,
+)
 
 
-MAX_TIMING_ROWS = 10_000
-MAX_TIMING_LINE_BYTES = 1024
-MAX_TIMING_BYTES = MAX_TIMING_ROWS * MAX_TIMING_LINE_BYTES
+MAX_TIMING_ROWS = TIMING_LOG_MAX_ROWS
+MAX_TIMING_LINE_BYTES = TIMING_LOG_MAX_LINE_BYTES
+MAX_TIMING_BYTES = TIMING_LOG_MAX_BYTES
 MAX_GST_SUMMARY_BYTES = 16 * 1024 * 1024
+MAX_GST_SUMMARY_LINE_BYTES = 64 * 1024
+TASK5_SAMPLE_RATE = 8000
+TASK5_PACKET_SAMPLES = 160
+TASK5_PACKET_DURATION_NS = 20_000_000
+TASK5_SEVERE_LATENESS_NS = 20_000_000
+TASK5_POST_SEVERE_MINIMUM_NS = 15_000_000
 
 
-def _bounded_size(path, maximum, label):
+def _open_bounded_regular_file(path, maximum, label):
     path = pathlib.Path(path)
-    size = path.stat().st_size
-    if size > maximum:
-        raise ValueError(f"{label} size {size} exceeds {maximum} bytes")
-    return path
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open(path, flags)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError(f"{label} is not a regular file: {path}")
+        if metadata.st_size > maximum:
+            raise ValueError(
+                f"{label} size {metadata.st_size} exceeds {maximum} bytes"
+            )
+        source = os.fdopen(descriptor, "rb")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return source
+
+
+def _bounded_lines(source, *, maximum, line_maximum, label):
+    total_bytes = 0
+    line_number = 0
+    while True:
+        line = source.readline(line_maximum + 1)
+        if not line:
+            return
+        line_number += 1
+        if len(line) > line_maximum:
+            raise ValueError(
+                f"{label} line {line_number} exceeds {line_maximum} bytes"
+            )
+        total_bytes += len(line)
+        if total_bytes > maximum:
+            raise ValueError(
+                f"{label} cumulative size {total_bytes} exceeds {maximum} bytes"
+            )
+        yield line_number, line
 
 
 def load_timing_jsonl(path):
-    path = _bounded_size(path, MAX_TIMING_BYTES, "timing JSONL")
     rows = []
-    with path.open("rb") as source:
-        line_number = 0
-        while True:
-            line = source.readline(MAX_TIMING_LINE_BYTES + 1)
-            if not line:
-                break
-            line_number += 1
-            if len(line) > MAX_TIMING_LINE_BYTES:
-                raise ValueError(
-                    f"timing JSONL line {line_number} exceeds "
-                    f"{MAX_TIMING_LINE_BYTES} bytes"
-                )
+    with _open_bounded_regular_file(
+        path, MAX_TIMING_BYTES, "timing JSONL"
+    ) as source:
+        for line_number, line in _bounded_lines(
+            source,
+            maximum=MAX_TIMING_BYTES,
+            line_maximum=MAX_TIMING_LINE_BYTES,
+            label="timing JSONL",
+        ):
             if not line.strip():
                 continue
             if len(rows) >= MAX_TIMING_ROWS:
@@ -79,9 +119,19 @@ def load_timing_jsonl(path):
 
 
 def load_gst_summary(path):
-    path = _bounded_size(path, MAX_GST_SUMMARY_BYTES, "GST summary")
+    encoded = bytearray()
+    with _open_bounded_regular_file(
+        path, MAX_GST_SUMMARY_BYTES, "GST summary"
+    ) as source:
+        for _, line in _bounded_lines(
+            source,
+            maximum=MAX_GST_SUMMARY_BYTES,
+            line_maximum=MAX_GST_SUMMARY_LINE_BYTES,
+            label="GST summary",
+        ):
+            encoded.extend(line)
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = json.loads(encoded.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError(f"invalid GST summary JSON: {error}") from error
     if not isinstance(value, dict):
@@ -178,24 +228,6 @@ def _stats(values, *, include_min=True):
     return result
 
 
-def _packet_duration_ns(row):
-    duration_ns = row.get("packet_duration_ns")
-    if isinstance(duration_ns, int) and not isinstance(duration_ns, bool):
-        return duration_ns
-    sample_rate = row.get("sample_rate")
-    if isinstance(sample_rate, int) and sample_rate > 0:
-        return row["samples"] * 1_000_000_000 // sample_rate
-    return None
-
-
-def _validate_expected_samples(expected_samples):
-    if isinstance(expected_samples, bool) or not isinstance(expected_samples, int):
-        raise ValueError("expected_samples must be an integer")
-    if not 1 <= expected_samples <= 0xFFFFFFFF:
-        raise ValueError("expected_samples must be between 1 and 4294967295")
-    return expected_samples
-
-
 def _gst_inter_arrival_p99(gst_summary):
     inter_arrival = gst_summary.get("inter_arrival_ns")
     p99 = inter_arrival.get("p99") if isinstance(inter_arrival, dict) else None
@@ -211,17 +243,34 @@ def _gst_inter_arrival_p99(gst_summary):
     return p99
 
 
-def summarize_timing(rows, *, gst_summary=None, expected_samples=160):
-    expected_samples = _validate_expected_samples(expected_samples)
+def summarize_timing(rows, *, gst_summary=None):
     _validate_rows(rows)
+    unexpected_sample_rates = [
+        {
+            "packet_index": row["packet_index"],
+            "expected": TASK5_SAMPLE_RATE,
+            "actual": row.get("sample_rate"),
+        }
+        for row in rows
+        if row.get("sample_rate") != TASK5_SAMPLE_RATE
+    ]
     unexpected_samples = [
         {
             "packet_index": row["packet_index"],
-            "expected": expected_samples,
+            "expected": TASK5_PACKET_SAMPLES,
             "actual": row["samples"],
         }
         for row in rows
-        if row["samples"] != expected_samples
+        if row["samples"] != TASK5_PACKET_SAMPLES
+    ]
+    unexpected_packet_durations = [
+        {
+            "packet_index": row["packet_index"],
+            "expected": TASK5_PACKET_DURATION_NS,
+            "actual": row.get("packet_duration_ns"),
+        }
+        for row in rows
+        if row.get("packet_duration_ns") != TASK5_PACKET_DURATION_NS
     ]
     delta_histogram = {}
     unexpected_deltas = []
@@ -231,10 +280,10 @@ def summarize_timing(rows, *, gst_summary=None, expected_samples=160):
         ) & 0xFFFFFFFF
         key = str(delta)
         delta_histogram[key] = delta_histogram.get(key, 0) + 1
-        if delta != expected_samples:
+        if delta != TASK5_PACKET_SAMPLES:
             unexpected_deltas.append({
                 "packet_index": index,
-                "expected": expected_samples,
+                "expected": TASK5_PACKET_SAMPLES,
                 "actual": delta,
             })
 
@@ -246,46 +295,37 @@ def summarize_timing(rows, *, gst_summary=None, expected_samples=160):
     rebase_indexes = [
         row["packet_index"] for row in rows if row["rebased"]
     ]
-    severe_indexes = set(rebase_indexes)
     injected_indexes = []
     for index, row in enumerate(rows):
         if row.get("injected_oversleep_ns", 0) > 0:
             injected_indexes.append(index)
-            severe_indexes.add(index)
-        elif index > 0:
-            duration_ns = _packet_duration_ns(row)
-            if duration_ns is not None and row["lateness_ns"] >= duration_ns:
-                severe_indexes.add(index)
+    severe_indexes = {
+        index
+        for index, row in enumerate(rows)
+        if row["lateness_ns"] >= TASK5_SEVERE_LATENESS_NS
+    }
 
     post_oversleep_intervals = [
         rows[index + 1]["interval_ns"]
         for index in sorted(severe_indexes)
         if index + 1 < len(rows)
     ]
-    post_interval_checks = []
-    for index in sorted(severe_indexes):
-        if index + 1 >= len(rows):
-            continue
-        duration_ns = _packet_duration_ns(rows[index])
-        if duration_ns is not None:
-            post_interval_checks.append(
-                rows[index + 1]["interval_ns"] >= duration_ns * 3 // 4
-            )
+    post_interval_checks = [
+        rows[index + 1]["interval_ns"] >= TASK5_POST_SEVERE_MINIMUM_NS
+        for index in sorted(severe_indexes)
+        if index + 1 < len(rows)
+    ]
 
     configured_jitter_bound_ns = max(
         (row.get("configured_jitter_bound_ns", 0) for row in rows),
         default=0,
     )
     gst_reference = None
-    deadline_error_limit_ns = max(
-        2_000_000, configured_jitter_bound_ns + 1_000_000
-    )
+    deadline_error_limit_ns = 2_000_000
     if gst_summary is not None:
         gst_p99_ns = _gst_inter_arrival_p99(gst_summary)
         gst_acceptance_bound_ns = gst_p99_ns + 1_000_000
-        deadline_error_limit_ns = max(
-            deadline_error_limit_ns, gst_acceptance_bound_ns
-        )
+        deadline_error_limit_ns = max(2_000_000, gst_acceptance_bound_ns)
         gst_reference = {
             "packet_count": gst_summary.get("packet_count"),
             "inter_arrival_ns": gst_summary.get("inter_arrival_ns"),
@@ -298,21 +338,11 @@ def summarize_timing(rows, *, gst_summary=None, expected_samples=160):
                 "different timing properties."
             ),
         }
-        reference_bound = gst_summary.get("deadline_error_jitter_bound_ns")
-        if (
-            isinstance(reference_bound, int)
-            and not isinstance(reference_bound, bool)
-            and reference_bound >= 0
-        ):
-            configured_jitter_bound_ns = max(
-                configured_jitter_bound_ns, reference_bound
-            )
-            deadline_error_limit_ns = max(
-                deadline_error_limit_ns, reference_bound + 1_000_000
-            )
     absolute_error_stats = _stats(deadline_errors, include_min=False)
     checks = {
+        "all_sample_rates_match_expected": not unexpected_sample_rates,
         "all_packet_samples_match_expected": not unexpected_samples,
+        "all_packet_durations_match_expected": not unexpected_packet_durations,
         "no_unexpected_timestamp_deltas": not unexpected_deltas,
         "no_post_severe_interval_below_75_percent": all(post_interval_checks),
         "p99_deadline_error_within_bound": (
@@ -321,8 +351,14 @@ def summarize_timing(rows, *, gst_summary=None, expected_samples=160):
     }
     summary = {
         "packet_count": len(rows),
-        "expected_samples": expected_samples,
+        "expected_sample_rate": TASK5_SAMPLE_RATE,
+        "expected_samples": TASK5_PACKET_SAMPLES,
+        "expected_packet_duration_ns": TASK5_PACKET_DURATION_NS,
+        "severe_lateness_threshold_ns": TASK5_SEVERE_LATENESS_NS,
+        "post_severe_minimum_interval_ns": TASK5_POST_SEVERE_MINIMUM_NS,
+        "unexpected_sample_rates": unexpected_sample_rates,
         "unexpected_packet_samples": unexpected_samples,
+        "unexpected_packet_durations": unexpected_packet_durations,
         "rtp_timestamp_delta_histogram": delta_histogram,
         "unexpected_timestamp_deltas": unexpected_deltas,
         "interval_ns": _stats(intervals),
@@ -377,7 +413,6 @@ def build_argument_parser():
     parser.add_argument("--input", type=pathlib.Path, required=True)
     parser.add_argument("--output", type=pathlib.Path, required=True)
     parser.add_argument("--gst-summary", type=pathlib.Path)
-    parser.add_argument("--expected-samples", type=int, default=160)
     return parser
 
 
@@ -405,7 +440,6 @@ def main(argv=None):
         summary = summarize_timing(
             rows,
             gst_summary=gst_summary,
-            expected_samples=arguments.expected_samples,
         )
         _atomic_write_json(arguments.output, summary)
     except (OSError, TypeError, ValueError) as error:

@@ -12,6 +12,9 @@ import backchannel_audio
 from backchannel_rtp import (
     RtpPacer,
     RtpPacketizer,
+    TIMING_LOG_MAX_BYTES,
+    TIMING_LOG_MAX_LINE_BYTES,
+    TIMING_LOG_MAX_ROWS,
     atomic_write_jsonl,
     paths_refer_to_same_file,
     remove_output,
@@ -31,6 +34,9 @@ RTSP_MAX_BODY_BYTES = 4 * 1024 * 1024
 RTSP_MAX_BUFFER_BYTES = 8 * 1024 * 1024
 RTSP_MAX_QUEUED_RESPONSES = 64
 MAX_PCMA_INPUT_BYTES = 128 * 1024 * 1024
+MAX_TIMING_ROWS = TIMING_LOG_MAX_ROWS
+MAX_TIMING_LINE_BYTES = TIMING_LOG_MAX_LINE_BYTES
+MAX_TIMING_BYTES = TIMING_LOG_MAX_BYTES
 
 
 # ---------- ONVIF ----------
@@ -828,6 +834,16 @@ def prepare_audio(arguments):
     return payload, None, message
 
 
+def _timing_packet_count(arguments, payload, aac_frames, samples_per_frame):
+    if arguments.codec == "aac":
+        return len(aac_frames)
+    bytes_per_sample = 2 if arguments.codec == "l16" else 1
+    preroll_samples = arguments.sample_rate * arguments.preroll_ms // 1000
+    total_bytes = len(payload) + preroll_samples * bytes_per_sample
+    bytes_per_frame = samples_per_frame * bytes_per_sample
+    return (total_bytes + bytes_per_frame - 1) // bytes_per_frame
+
+
 def build_argument_parser():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="172.168.46.56")
@@ -911,6 +927,15 @@ def main(argv=None):
             )
 
     payload, aac_frames, audio_message = prepare_audio(a)
+    if a.timing_log is not None:
+        timing_packet_count = _timing_packet_count(
+            a, payload, aac_frames, samples_per_frame
+        )
+        if timing_packet_count > MAX_TIMING_ROWS:
+            ap.error(
+                f"--timing-log packet count {timing_packet_count} exceeds "
+                f"{MAX_TIMING_ROWS:,} row limit"
+            )
     print(f"# Python ONVIF 백채널 송출 @ {a.host}")
     uri, model = onvif_stream_uri(a.host, a.user, a.pw)
     print(f"  ✓ ONVIF OK ({model})  stream={redact_rtsp_uri(uri)}")
@@ -1004,7 +1029,7 @@ def main(argv=None):
         sent = 0
         octets_sent = 0
         total_samples_sent = 0
-        timing_rows = []
+        timing_rows = [] if a.timing_log is not None else None
         pacer = RtpPacer(
             a.sample_rate,
             mode=a.pacer,
@@ -1056,25 +1081,32 @@ def main(argv=None):
                 marker = sent == 0 or audio_marker
             else:
                 marker = sent == 0
-            rtp_timestamp = packetizer.timestamp
+            rtp_timestamp = (
+                packetizer.timestamp if timing_rows is not None else None
+            )
             rtp = packetizer.build(chunk, samples_in_packet, marker)
             backchannel.send_rtp(rtp)
-            timing_rows.append({
-                "packet_index": sent,
-                "rtp_timestamp": rtp_timestamp,
-                "samples": samples_in_packet,
-                "sample_rate": a.sample_rate,
-                "pacer": a.pacer,
-                "packet_duration_ns": (
-                    samples_in_packet * 1_000_000_000 // a.sample_rate
-                ),
-                "configured_jitter_bound_ns": 0,
-                "target_monotonic_ns": timing.target_monotonic_ns,
-                "actual_monotonic_ns": timing.actual_monotonic_ns,
-                "lateness_ns": timing.lateness_ns,
-                "interval_ns": timing.interval_ns,
-                "rebased": timing.rebased,
-            })
+            if timing_rows is not None:
+                if len(timing_rows) >= MAX_TIMING_ROWS:
+                    raise RuntimeError(
+                        f"timing log row count exceeds {MAX_TIMING_ROWS}"
+                    )
+                timing_rows.append({
+                    "packet_index": sent,
+                    "rtp_timestamp": rtp_timestamp,
+                    "samples": samples_in_packet,
+                    "sample_rate": a.sample_rate,
+                    "pacer": a.pacer,
+                    "packet_duration_ns": (
+                        samples_in_packet * 1_000_000_000 // a.sample_rate
+                    ),
+                    "configured_jitter_bound_ns": 0,
+                    "target_monotonic_ns": timing.target_monotonic_ns,
+                    "actual_monotonic_ns": timing.actual_monotonic_ns,
+                    "lateness_ns": timing.lateness_ns,
+                    "interval_ns": timing.interval_ns,
+                    "rebased": timing.rebased,
+                })
             sent += 1
             octets_sent += len(chunk)
             total_samples_sent += samples_in_packet
@@ -1092,7 +1124,13 @@ def main(argv=None):
     finally:
         backchannel.close()
     if a.timing_log is not None:
-        atomic_write_jsonl(a.timing_log, timing_rows)
+        atomic_write_jsonl(
+            a.timing_log,
+            timing_rows,
+            max_rows=MAX_TIMING_ROWS,
+            max_line_bytes=MAX_TIMING_LINE_BYTES,
+            max_bytes=MAX_TIMING_BYTES,
+        )
 
 
 if __name__ == "__main__":

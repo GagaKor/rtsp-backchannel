@@ -9,6 +9,11 @@ import time
 from dataclasses import dataclass
 
 
+TIMING_LOG_MAX_ROWS = 10_000
+TIMING_LOG_MAX_LINE_BYTES = 1024
+TIMING_LOG_MAX_BYTES = TIMING_LOG_MAX_ROWS * TIMING_LOG_MAX_LINE_BYTES
+
+
 def _uint(name, value, maximum):
     if isinstance(value, bool) or not isinstance(value, int):
         raise TypeError(f"{name} must be an integer")

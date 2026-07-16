@@ -1186,6 +1186,111 @@ class RtpSenderMainTest(unittest.TestCase):
         )
         self.assertEqual(self.clock.now_ns - self.clock.start_ns, 30_000_000)
 
+    def test_sender_does_not_materialize_timing_fields_without_log(self):
+        accessed_fields = []
+        timestamp_reads = []
+        original_timestamp_getter = onvif_play.RtpPacketizer.timestamp.fget
+
+        def read_timestamp(packetizer):
+            timestamp_reads.append(packetizer)
+            return original_timestamp_getter(packetizer)
+
+        class TimingProbe:
+            def __getattribute__(self, name):
+                values = {
+                    "target_monotonic_ns": 0,
+                    "actual_monotonic_ns": 0,
+                    "lateness_ns": 0,
+                    "interval_ns": None,
+                    "rebased": False,
+                }
+                if name in values:
+                    accessed_fields.append(name)
+                    return values[name]
+                return object.__getattribute__(self, name)
+
+        with patch.object(
+            onvif_play.RtpPacer, "wait", return_value=TimingProbe()
+        ), patch.object(
+            onvif_play.RtpPacketizer,
+            "timestamp",
+            property(read_timestamp),
+        ):
+            self.run_main("--ms", "20")
+
+        self.assertEqual(accessed_fields, [])
+        self.assertEqual(timestamp_reads, [])
+
+    def test_timing_log_preflight_supports_6500_and_rejects_over_bound(self):
+        class ResolverReached(RuntimeError):
+            pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            timing_log = pathlib.Path(directory) / "timing.jsonl"
+            stdout = StringIO()
+            with patch.object(
+                onvif_play,
+                "prepare_audio",
+                return_value=(b"x" * (6_500 * 160), None, "audio"),
+            ), patch.object(
+                onvif_play,
+                "onvif_stream_uri",
+                side_effect=ResolverReached,
+            ) as resolver, redirect_stdout(stdout), self.assertRaises(
+                ResolverReached
+            ):
+                onvif_play.main([
+                    "--ms", "0",
+                    "--preroll-ms", "0",
+                    "--rtcp-interval", "0",
+                    "--timing-log", str(timing_log),
+                ])
+            resolver.assert_called_once()
+
+            timing_log.write_text("stale\n")
+            stderr = StringIO()
+            with patch.object(
+                onvif_play,
+                "prepare_audio",
+                return_value=(b"x" * (10_001 * 160), None, "audio"),
+            ), patch.object(
+                onvif_play,
+                "onvif_stream_uri",
+                side_effect=AssertionError("network resolver called"),
+            ) as resolver, redirect_stdout(stdout), redirect_stderr(
+                stderr
+            ), self.assertRaises(SystemExit):
+                onvif_play.main([
+                    "--ms", "0",
+                    "--preroll-ms", "0",
+                    "--rtcp-interval", "0",
+                    "--timing-log", str(timing_log),
+                ])
+
+            self.assertIn("10,000", stderr.getvalue())
+            resolver.assert_not_called()
+            self.assertFalse(timing_log.exists())
+
+    def test_timing_log_enforces_serialized_bound_atomically(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            onvif_play, "MAX_TIMING_LINE_BYTES", 64
+        ):
+            timing_log = pathlib.Path(directory) / "send-timing.jsonl"
+            timing_log.write_text("stale\n")
+
+            with self.assertRaisesRegex(
+                ValueError, "JSONL line 1 exceeds 64 bytes"
+            ):
+                self.run_main(
+                    "--ms", "20",
+                    "--timing-log", str(timing_log),
+                )
+
+            self.assertFalse(timing_log.exists())
+            self.assertFalse(
+                list(timing_log.parent.glob(f".{timing_log.name}.*.tmp"))
+            )
+
     def test_rebase_timing_log_prevents_catch_up_and_preserves_timestamps(self):
         clock = FakeClock(
             inject_on_sleep=1, injected_overshoot_ns=45_000_000
@@ -1264,6 +1369,22 @@ class RtpSenderMainTest(unittest.TestCase):
 
             self.assertFalse(timing_log.exists())
             self.assertFalse(list(timing_log.parent.glob(f".{timing_log.name}.*.tmp")))
+
+    def test_timing_log_is_not_published_when_teardown_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            timing_log = pathlib.Path(directory) / "send-timing.jsonl"
+            timing_log.write_text("stale complete log\n")
+            with self.assertRaisesRegex(RuntimeError, "TEARDOWN failed"):
+                self.run_main(
+                    "--ms", "20",
+                    "--timing-log", str(timing_log),
+                    rtsp_type=TeardownFailureRtsp,
+                )
+
+            self.assertFalse(timing_log.exists())
+            self.assertFalse(
+                list(timing_log.parent.glob(f".{timing_log.name}.*.tmp"))
+            )
 
     def test_invalid_arguments_remove_stale_timing_log_before_network(self):
         with tempfile.TemporaryDirectory() as directory:
