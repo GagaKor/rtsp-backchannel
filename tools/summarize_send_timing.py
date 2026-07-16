@@ -272,6 +272,35 @@ def summarize_timing(rows, *, gst_summary=None):
         for row in rows
         if row.get("packet_duration_ns") != TASK5_PACKET_DURATION_NS
     ]
+    unexpected_target_deadlines = []
+    for index in range(1, len(rows)):
+        previous = rows[index - 1]
+        deadline_base_ns = (
+            previous["actual_monotonic_ns"]
+            if previous["rebased"]
+            else previous["target_monotonic_ns"]
+        )
+        expected_target_ns = deadline_base_ns + TASK5_PACKET_DURATION_NS
+        actual_target_ns = rows[index]["target_monotonic_ns"]
+        if actual_target_ns != expected_target_ns:
+            unexpected_target_deadlines.append({
+                "packet_index": index,
+                "expected": expected_target_ns,
+                "actual": actual_target_ns,
+                "previous_packet_rebased": previous["rebased"],
+            })
+    incoherent_rebase_flags = []
+    for index, row in enumerate(rows):
+        expected_rebased = (
+            index > 0 and row["lateness_ns"] >= TASK5_SEVERE_LATENESS_NS
+        )
+        if row["rebased"] != expected_rebased:
+            incoherent_rebase_flags.append({
+                "packet_index": index,
+                "expected": expected_rebased,
+                "actual": row["rebased"],
+                "lateness_ns": row["lateness_ns"],
+            })
     delta_histogram = {}
     unexpected_deltas = []
     for index in range(1, len(rows)):
@@ -343,6 +372,8 @@ def summarize_timing(rows, *, gst_summary=None):
         "all_sample_rates_match_expected": not unexpected_sample_rates,
         "all_packet_samples_match_expected": not unexpected_samples,
         "all_packet_durations_match_expected": not unexpected_packet_durations,
+        "no_unexpected_target_deadlines": not unexpected_target_deadlines,
+        "no_incoherent_rebase_flags": not incoherent_rebase_flags,
         "no_unexpected_timestamp_deltas": not unexpected_deltas,
         "no_post_severe_interval_below_75_percent": all(post_interval_checks),
         "p99_deadline_error_within_bound": (
@@ -359,6 +390,8 @@ def summarize_timing(rows, *, gst_summary=None):
         "unexpected_sample_rates": unexpected_sample_rates,
         "unexpected_packet_samples": unexpected_samples,
         "unexpected_packet_durations": unexpected_packet_durations,
+        "unexpected_target_deadlines": unexpected_target_deadlines,
+        "incoherent_rebase_flags": incoherent_rebase_flags,
         "rtp_timestamp_delta_histogram": delta_histogram,
         "unexpected_timestamp_deltas": unexpected_deltas,
         "interval_ns": _stats(intervals),

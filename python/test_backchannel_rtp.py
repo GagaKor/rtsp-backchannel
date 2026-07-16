@@ -608,6 +608,21 @@ class SummarizeSendTimingToolTests(unittest.TestCase):
             },
         ]
 
+    @staticmethod
+    def task5_row(index, target_ns, actual_ns, interval_ns, *, rebased=False):
+        return {
+            "packet_index": index,
+            "rtp_timestamp": index * 160,
+            "samples": 160,
+            "sample_rate": 8000,
+            "packet_duration_ns": 20_000_000,
+            "target_monotonic_ns": target_ns,
+            "actual_monotonic_ns": actual_ns,
+            "lateness_ns": actual_ns - target_ns,
+            "interval_ns": interval_ns,
+            "rebased": rebased,
+        }
+
     def test_rejects_decreasing_actual_send_timestamps(self):
         rows = self.decreasing_timing_rows(interval_ns=0)
 
@@ -621,6 +636,140 @@ class SummarizeSendTimingToolTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "interval_ns must be nonnegative"):
             self.summarizer.summarize_timing(rows)
+
+    def test_rejects_forged_ten_millisecond_target_progression(self):
+        rows = [
+            self.task5_row(
+                index,
+                index * 10_000_000,
+                index * 10_000_000,
+                None if index == 0 else 10_000_000,
+            )
+            for index in range(4)
+        ]
+
+        summary = self.summarizer.summarize_timing(rows)
+
+        self.assertEqual(
+            summary["unexpected_target_deadlines"],
+            [
+                {
+                    "packet_index": index,
+                    "expected": index * 10_000_000 + 10_000_000,
+                    "actual": index * 10_000_000,
+                    "previous_packet_rebased": False,
+                }
+                for index in range(1, 4)
+            ],
+        )
+        self.assertFalse(
+            summary["checks"]["no_unexpected_target_deadlines"]
+        )
+        self.assertFalse(summary["pass"])
+
+    def test_rejects_rebase_flag_without_severe_observed_lateness(self):
+        rows = [
+            self.task5_row(0, 0, 0, None),
+            self.task5_row(
+                1,
+                20_000_000,
+                30_000_000,
+                30_000_000,
+                rebased=True,
+            ),
+            self.task5_row(2, 50_000_000, 50_000_000, 20_000_000),
+        ]
+
+        summary = self.summarizer.summarize_timing(
+            rows,
+            gst_summary={"inter_arrival_ns": {"p99": 10_000_000}},
+        )
+
+        self.assertEqual(
+            summary["incoherent_rebase_flags"],
+            [
+                {
+                    "packet_index": 1,
+                    "expected": False,
+                    "actual": True,
+                    "lateness_ns": 10_000_000,
+                }
+            ],
+        )
+        self.assertTrue(
+            summary["checks"]["no_unexpected_target_deadlines"]
+        )
+        self.assertFalse(
+            summary["checks"]["no_incoherent_rebase_flags"]
+        )
+        self.assertFalse(summary["pass"])
+
+    def test_rejects_missing_rebase_flag_after_severe_observed_lateness(self):
+        rows = [
+            self.task5_row(0, 0, 0, None),
+            self.task5_row(1, 20_000_000, 40_000_000, 40_000_000),
+            self.task5_row(2, 40_000_000, 55_000_000, 15_000_000),
+        ]
+
+        summary = self.summarizer.summarize_timing(
+            rows,
+            gst_summary={"inter_arrival_ns": {"p99": 20_000_000}},
+        )
+
+        self.assertEqual(
+            summary["incoherent_rebase_flags"],
+            [
+                {
+                    "packet_index": 1,
+                    "expected": True,
+                    "actual": False,
+                    "lateness_ns": 20_000_000,
+                }
+            ],
+        )
+        self.assertTrue(
+            summary["checks"]["no_unexpected_target_deadlines"]
+        )
+        self.assertFalse(
+            summary["checks"]["no_incoherent_rebase_flags"]
+        )
+        self.assertFalse(summary["pass"])
+
+    def test_rejects_rebase_flag_on_anchor_row(self):
+        rows = [
+            self.task5_row(
+                0,
+                0,
+                20_000_000,
+                None,
+                rebased=True,
+            ),
+            self.task5_row(1, 40_000_000, 40_000_000, 20_000_000),
+        ]
+
+        summary = self.summarizer.summarize_timing(
+            rows,
+            gst_summary={"inter_arrival_ns": {"p99": 20_000_000}},
+        )
+
+        self.assertEqual(
+            summary["incoherent_rebase_flags"],
+            [
+                {
+                    "packet_index": 0,
+                    "expected": False,
+                    "actual": True,
+                    "lateness_ns": 20_000_000,
+                }
+            ],
+        )
+        self.assertTrue(
+            summary["checks"]["no_unexpected_target_deadlines"]
+        )
+        self.assertFalse(
+            summary["checks"]["no_incoherent_rebase_flags"]
+        )
+        self.assertFalse(summary["pass"])
 
     def test_summary_reports_required_metrics_and_observed_rebase_lateness(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -649,6 +798,8 @@ class SummarizeSendTimingToolTests(unittest.TestCase):
                 "all_sample_rates_match_expected": True,
                 "all_packet_samples_match_expected": True,
                 "all_packet_durations_match_expected": True,
+                "no_unexpected_target_deadlines": True,
+                "no_incoherent_rebase_flags": True,
                 "no_unexpected_timestamp_deltas": True,
                 "no_post_severe_interval_below_75_percent": True,
                 "p99_deadline_error_within_bound": False,
