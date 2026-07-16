@@ -981,14 +981,14 @@ def tone_audio(freq, ms, codec, amp=0.7, rate=8000):
     return bytes(enc(int(amp * 32767 * math.sin(2 * math.pi * freq * i / rate))) for i in range(n))
 
 
-def file_audio(path, codec, volume, sample_rate, encoder="ffmpeg"):
+def file_audio(path, codec, volume, sample_rate, encoder="python-alaw"):
     if codec == "pcma":
         decoded = backchannel_audio.decode_source(path, sample_rate)
         if encoder == "ffmpeg":
             return backchannel_audio.encode_pcma_ffmpeg(
                 decoded, volume, sample_rate
             )
-        if encoder == "gst-compatible":
+        if encoder == "python-alaw":
             return backchannel_audio.encode_pcma_gst_compatible(decoded, volume)
         raise ValueError(f"unsupported PCMA encoder: {encoder}")
     fmt = CODECS[codec][1]
@@ -1320,24 +1320,24 @@ def build_argument_parser():
     input_group.add_argument("--pcma-input", type=pathlib.Path)
     ap.add_argument("--freq", type=int, default=1000)
     ap.add_argument("--ms", type=int, default=3000)
-    ap.add_argument("--volume", type=float, default=0.25,
-                    help="linear output gain, 0.0-1.0 (default: 0.25 / about -12 dB)")
+    ap.add_argument("--volume", type=float, default=0.05,
+                    help="linear output gain, 0.0-1.0 (default: 0.05 / about -26 dB)")
     ap.add_argument("--sample-rate", type=int, choices=[8000, 16000, 32000, 48000, 64000],
                     default=8000, help="PCMA/PCMU RTP clock rate offered by the camera")
-    ap.add_argument("--rtcp-interval", type=float, default=0.5,
-                    help="seconds between RTCP sender reports; 0 disables RTCP")
-    ap.add_argument("--preroll-ms", type=preroll_milliseconds, default=3000,
-                    help="silent RTP warm-up before audio, for camera clock convergence")
+    ap.add_argument("--rtcp-interval", type=float, default=0,
+                    help="seconds between RTCP sender reports; 0 disables RTCP (default)")
+    ap.add_argument("--preroll-ms", type=preroll_milliseconds, default=0,
+                    help="silent RTP warm-up before audio (default: 0)")
     ap.add_argument("--rtp-identity", choices=["legacy", "sender"], default="sender",
                     help="RTP identity source: sender-owned random state or legacy server values")
     ap.add_argument("--marker-mode", choices=["audio-start", "first"], default="first",
                     help="marker policy for G.711/L16 packets")
     packet_group = ap.add_mutually_exclusive_group()
-    packet_group.add_argument("--packet-ms", type=float, default=20,
-                              help="packet duration in milliseconds for G.711/L16")
+    packet_group.add_argument("--packet-ms", type=float, default=40,
+                              help="packet duration in milliseconds for G.711/L16 (default: 40)")
     packet_group.add_argument("--packet-pattern", type=pathlib.Path,
                               help="diagnostic ordered PCMA payload-size manifest")
-    ap.add_argument("--pacer", choices=["legacy", "rebase"], default="legacy",
+    ap.add_argument("--pacer", choices=["legacy", "rebase"], default="rebase",
                     help="RTP pacing implementation")
     ap.add_argument("--timing-log", type=pathlib.Path,
                     help="atomically write per-packet pacing JSONL")
@@ -1345,8 +1345,8 @@ def build_argument_parser():
                     help="backchannel RTP transport: tcp(interleaved) or udp")
     ap.add_argument("--codec", choices=["pcmu", "pcma", "l16", "aac"], default="pcma",
                     help="RTP audio codec: pcma, pcmu, l16, or AAC-LC MPEG4-GENERIC")
-    ap.add_argument("--encoder", choices=["ffmpeg", "gst-compatible"], default="ffmpeg",
-                    help="PCMA terminal encoder for decoded file input")
+    ap.add_argument("--encoder", choices=["ffmpeg", "python-alaw"], default="python-alaw",
+                    help="PCMA terminal encoder; python-alaw uses no GStreamer")
     ap.add_argument(
         "--session-timeout-cycles",
         type=session_timeout_cycles,

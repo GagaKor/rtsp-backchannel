@@ -2233,7 +2233,7 @@ class RtpSenderMainTest(unittest.TestCase):
 
     def test_default_marker_is_only_on_first_packet_across_preroll(self):
         packets, _, _, _ = self.run_main(
-            "--ms", "20", "--preroll-ms", "20"
+            "--ms", "20", "--preroll-ms", "20", "--packet-ms", "20"
         )
 
         self.assertEqual([parse_rtp_packet(packet).marker for packet in packets],
@@ -2243,6 +2243,7 @@ class RtpSenderMainTest(unittest.TestCase):
         packets, _, _, _ = self.run_main(
             "--ms", "20",
             "--preroll-ms", "20",
+            "--packet-ms", "20",
             "--marker-mode", "audio-start",
         )
 
@@ -2279,16 +2280,16 @@ class RtpSenderMainTest(unittest.TestCase):
         )
         self.assertEqual(self.clock.now_ns - self.clock.start_ns, 30_000_000)
 
-    def test_packet_controls_default_to_fixed_20ms_and_accept_one_sample_duration(self):
+    def test_packet_controls_default_to_fixed_40ms_and_accept_one_sample_duration(self):
         parser = onvif_play.build_argument_parser()
         arguments = parser.parse_args([])
-        self.assertEqual(arguments.packet_ms, 20)
+        self.assertEqual(arguments.packet_ms, 40)
         self.assertIsNone(arguments.packet_pattern)
 
         packets, _, _, _ = self.run_main("--ms", "25")
         self.assertEqual(
             [parse_rtp_packet(packet).payload_size for packet in packets],
-            [160, 40],
+            [200],
         )
         self.assertEqual(self.clock.now_ns - self.clock.start_ns, 25_000_000)
 
@@ -2394,6 +2395,8 @@ class RtpSenderMainTest(unittest.TestCase):
     def test_timeout_cycles_repeat_and_trim_fixed_pcma_sample_exactly(self):
         packets, _, _, _ = self.run_main(
             "--ms", "30",
+            "--volume", "0.25",
+            "--packet-ms", "20",
             "--session-timeout-cycles", "2",
             rtsp_type=ShortTimeoutRtsp,
         )
@@ -2433,6 +2436,7 @@ class RtpSenderMainTest(unittest.TestCase):
     def test_timeout_cycles_use_default_sixty_second_session_timeout(self):
         packets, _, _, _ = self.run_main(
             "--ms", "30",
+            "--packet-ms", "20",
             "--session-timeout-cycles", "1",
             rtsp_type=MissingTimeoutRtsp,
         )
@@ -2456,7 +2460,8 @@ class RtpSenderMainTest(unittest.TestCase):
         ) as encode:
             packets, _, _, _ = self.run_main(
                 "--file", "source.wav",
-                "--encoder", "gst-compatible",
+                "--encoder", "python-alaw",
+                "--volume", "0.25",
                 "--session-timeout-cycles", "1",
                 rtsp_type=ShortTimeoutRtsp,
             )
@@ -2486,6 +2491,7 @@ class RtpSenderMainTest(unittest.TestCase):
             ):
                 packets, _, _, _ = self.run_main(
                     "--pcma-input", str(source),
+                    "--packet-ms", "20",
                     "--pacer", "rebase",
                     "--session-timeout-cycles", "1",
                     rtsp_type=ShortTimeoutRtsp,
@@ -2883,6 +2889,7 @@ class RtpSenderMainTest(unittest.TestCase):
             ):
                 onvif_play.main([
                     "--ms", "0",
+                    "--packet-ms", "20",
                     "--preroll-ms", "0",
                     "--rtcp-interval", "0",
                     "--timing-log", str(timing_log),
@@ -2904,6 +2911,7 @@ class RtpSenderMainTest(unittest.TestCase):
             ), self.assertRaises(SystemExit):
                 onvif_play.main([
                     "--ms", "0",
+                    "--packet-ms", "20",
                     "--preroll-ms", "0",
                     "--rtcp-interval", "0",
                     "--timing-log", str(timing_log),
@@ -3032,6 +3040,7 @@ class RtpSenderMainTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "injected RTP send failure"):
                 self.run_main(
                     "--ms", "40",
+                    "--packet-ms", "20",
                     "--timing-log", str(timing_log),
                     rtsp_type=FailingSendRtsp,
                 )
@@ -3244,7 +3253,7 @@ class RtpSenderMainTest(unittest.TestCase):
                     )
 
                 metadata = [parse_rtp_packet(packet) for packet in packets]
-                encoder.assert_called_once_with("fake.aac", 0.25, 8000, 37)
+                encoder.assert_called_once_with("fake.aac", 0.05, 8000, 37)
                 self.assertEqual([packet[12:] for packet in packets], [
                     b"\x00\x10\x00\x10\x11\x22",
                     b"\x00\x10\x00\x08\x33",
@@ -3338,7 +3347,7 @@ class RtpSenderMainTest(unittest.TestCase):
             for index in range(expected_count)
         ]
 
-        encoder.assert_called_once_with("source.wav", 0.25, 8000, 0)
+        encoder.assert_called_once_with("source.wav", 0.05, 8000, 0)
         self.assertEqual(encoded_frames, expected_frames)
         self.assertEqual(len(packets), expected_count)
         self.assertEqual(
@@ -3679,9 +3688,9 @@ class RtpSenderMainTest(unittest.TestCase):
             resolver.assert_not_called()
             self.assertIn(message, stderr.getvalue())
 
-    def test_pacer_defaults_to_legacy_accepts_rebase_and_rejects_unknown_modes(self):
+    def test_pacer_defaults_to_rebase_and_rejects_unknown_modes(self):
         parser = onvif_play.build_argument_parser()
-        self.assertEqual(parser.parse_args([]).pacer, "legacy")
+        self.assertEqual(parser.parse_args([]).pacer, "rebase")
         self.assertEqual(parser.parse_args(["--pacer", "rebase"]).pacer, "rebase")
 
         with patch.object(
@@ -3694,16 +3703,31 @@ class RtpSenderMainTest(unittest.TestCase):
         resolver.assert_not_called()
         self.assertIn("invalid choice", stderr.getvalue())
 
-    def test_encoder_defaults_to_ffmpeg(self):
+    def test_cli_defaults_to_validated_camera_profile(self):
         arguments = onvif_play.build_argument_parser().parse_args([])
 
-        self.assertEqual(arguments.encoder, "ffmpeg")
+        self.assertEqual(arguments.volume, 0.05)
+        self.assertEqual(arguments.rtcp_interval, 0)
+        self.assertEqual(arguments.preroll_ms, 0)
+        self.assertEqual(arguments.packet_ms, 40)
+        self.assertEqual(arguments.pacer, "rebase")
+        self.assertEqual(arguments.transport, "tcp")
+        self.assertEqual(arguments.codec, "pcma")
+        self.assertEqual(arguments.encoder, "python-alaw")
+        self.assertEqual(arguments.rtp_identity, "sender")
+        self.assertEqual(arguments.marker_mode, "first")
+
+    def test_encoder_rejects_old_gst_compatible_name(self):
+        parser = onvif_play.build_argument_parser()
+
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            parser.parse_args(["--encoder", "gst-compatible"])
 
     def test_pcma_file_modes_decode_once_then_select_terminal_encoder(self):
         decoded = struct.pack("<hhh", -1000, 0, 1000)
         for encoder_name, expected in (
             ("ffmpeg", b"ffm"),
-            ("gst-compatible", b"gst"),
+            ("python-alaw", b"gst"),
         ):
             with self.subTest(encoder=encoder_name), patch.object(
                 backchannel_audio, "decode_source", return_value=decoded
