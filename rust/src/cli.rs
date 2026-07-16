@@ -4,7 +4,7 @@ use clap::Parser;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "onvif-backchannel-rs",
+    name = "onvif-backchannel",
     about = "Play one audio file through an ONVIF RTSP backchannel",
     after_help = "Profile: PCMA 8kHz mono, TCP interleaved RTP, 40 ms packets, rebase pacing."
 )]
@@ -50,7 +50,7 @@ mod tests {
 
     #[test]
     fn uses_the_validated_playback_defaults() {
-        let cli = Cli::try_parse_from(["onvif-backchannel-rs", "--file", "event.mp3"]).unwrap();
+        let cli = Cli::try_parse_from(["onvif-backchannel", "--file", "event.mp3"]).unwrap();
 
         assert_eq!(cli.host, "172.168.46.56");
         assert_eq!(cli.user, "admin");
@@ -64,7 +64,7 @@ mod tests {
         for volume in ["NaN", "-0.1", "1.1"] {
             assert!(
                 Cli::try_parse_from([
-                    "onvif-backchannel-rs",
+                    "onvif-backchannel",
                     "--file",
                     "event.mp3",
                     "--volume",

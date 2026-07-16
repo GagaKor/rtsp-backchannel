@@ -1,14 +1,16 @@
+#!/usr/bin/env node
+
 /**
  * M4 — play an audio file out the camera speaker via the ONVIF backchannel.
  *
- *   npm run play -- --host 10.128.10.141 --user admin --pass CHANGEME \
+ *   onvif-backchannel --host 10.128.10.141 --user admin --pass CHANGEME \
  *     --file announce.wav --volume 0.05
  */
 import { openBackchannel, SAMPLE_RATE } from './backchannel.ts';
 import { fileToG711 } from './audio/transcode.ts';
 import { pathToFileURL } from 'node:url';
 
-const HELP = `Usage: npm run play -- --host <camera> --user <user> --pass <password> --file <audio>
+const HELP = `Usage: onvif-backchannel --host <camera> --user <user> --pass <password> --file <audio>
 
 Options:
   --file <path>       audio file to play once
@@ -68,6 +70,9 @@ export async function playFile(
   const { host, user, pass, file, volume } = options;
   dependencies.log(`# play "${file}" -> ${host} speaker (backchannel)`);
   const session = await dependencies.openBackchannel(host, user, pass);
+  let sent = 0;
+  let playbackFailed = false;
+  let playbackError: unknown;
   try {
     dependencies.log(
       `backchannel open: ${session.variant}/${SAMPLE_RATE} ` +
@@ -78,12 +83,36 @@ export async function playFile(
     dependencies.log(
       `transcoded: ${g711.length} bytes (~${seconds}s ${session.variant} 8kHz mono)`,
     );
-    const sent = await session.send(g711);
+    sent = await session.send(g711);
     dependencies.log(`sent ${sent} RTP packets`);
-    return sent;
-  } finally {
-    await session.close();
+  } catch (error) {
+    playbackFailed = true;
+    playbackError = error;
   }
+
+  let cleanupFailed = false;
+  let cleanupError: unknown;
+  try {
+    await session.close();
+  } catch (error) {
+    cleanupFailed = true;
+    cleanupError = error;
+  }
+
+  if (playbackFailed && cleanupFailed) {
+    throw new AggregateError(
+      [playbackError, cleanupError],
+      `${errorMessage(playbackError)}; RTSP cleanup also failed: ${errorMessage(cleanupError)}`,
+      { cause: playbackError },
+    );
+  }
+  if (playbackFailed) throw playbackError;
+  if (cleanupFailed) throw cleanupError;
+  return sent;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 export async function main(argv = process.argv.slice(2)): Promise<void> {

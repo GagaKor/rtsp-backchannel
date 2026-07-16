@@ -17,6 +17,18 @@ test('prints TypeScript playback help without opening a camera connection', () =
   assert.match(result.stdout, /40 ms/);
 });
 
+test('runs the dedicated npm binary entry point', () => {
+  const result = spawnSync(
+    process.execPath,
+    ['--experimental-transform-types', 'src/bin.ts', '--help'],
+    { encoding: 'utf8' },
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Usage: onvif-backchannel/);
+  assert.match(result.stdout, /--file/);
+});
+
 test('parses the validated 0.05 volume default and rejects invalid gain', () => {
   type Parsed = { volume: number };
   type Parser = (argv: string[]) => Parsed;
@@ -136,4 +148,45 @@ test('closes the RTSP session when file conversion fails', async () => {
     /decode failed/,
   );
   assert.equal(closed, 1);
+});
+
+test('preserves playback and cleanup errors when both fail', async () => {
+  const dependencies: PlaybackDependencies = {
+    openBackchannel: async () => ({
+      variant: 'PCMA',
+      payloadType: 8,
+      rtpChannel: 6,
+      send: async () => 0,
+      close: async () => {
+        throw new Error('TEARDOWN failed');
+      },
+    }),
+    fileToG711: async () => {
+      throw new Error('decode failed');
+    },
+    log: () => {},
+  };
+
+  await assert.rejects(
+    playFile()(
+      {
+        host: 'camera',
+        user: 'admin',
+        pass: 'secret',
+        file: 'broken.mp3',
+        volume: 0.05,
+      },
+      dependencies,
+    ),
+    (error: unknown) => {
+      assert.ok(error instanceof AggregateError);
+      assert.match(error.message, /decode failed/);
+      assert.match(error.message, /TEARDOWN failed/);
+      assert.deepEqual(
+        error.errors.map((entry) => (entry as Error).message),
+        ['decode failed', 'TEARDOWN failed'],
+      );
+      return true;
+    },
+  );
 });

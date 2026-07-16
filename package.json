@@ -1,10 +1,44 @@
 {
-  "name": "onvif-backchannel-poc",
+  "name": "onvif-backchannel",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
-  "description": "ONVIF RTSP backchannel audio uplink PoC (MACS F7) — send G.711 audio to a camera speaker",
+  "description": "Play audio through an ONVIF camera RTSP backchannel without GStreamer",
+  "license": "UNLICENSED",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "onvif-backchannel": "./dist/bin.js"
+  },
+  "files": [
+    "dist/index.*",
+    "dist/bin.*",
+    "dist/cli.*",
+    "dist/backchannel.*",
+    "dist/audio",
+    "dist/onvif",
+    "dist/rtp",
+    "dist/rtsp",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/GagaKor/onvif-test.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepare": "npm run build",
     "discover": "node --experimental-transform-types src/discover.ts",
     "audiocheck": "node --experimental-transform-types src/audiocheck.ts",
     "streams": "node --experimental-transform-types src/streams.ts",

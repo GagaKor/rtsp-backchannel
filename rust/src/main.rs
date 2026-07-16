@@ -1,8 +1,8 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::Result;
 use clap::Parser;
-use onvif_backchannel_rs::audio::{G711Variant, decode_file, encode_g711};
-use onvif_backchannel_rs::backchannel::{BackchannelSession, SAMPLE_RATE};
-use onvif_backchannel_rs::cli::Cli;
+use onvif_backchannel::audio::G711Variant;
+use onvif_backchannel::cli::Cli;
+use onvif_backchannel::playback::{PlaybackConfig, play_file};
 
 fn main() {
     if let Err(error) = run() {
@@ -18,39 +18,27 @@ fn run() -> Result<()> {
         cli.file.display(),
         cli.host
     );
-    let samples = decode_file(&cli.file).map_err(|error| anyhow!(error))?;
-
-    let mut session = BackchannelSession::open(&cli.host, &cli.user, &cli.password)
-        .map_err(|error| anyhow!(error))
-        .context("failed to open ONVIF backchannel")?;
+    let result = play_file(&PlaybackConfig {
+        host: cli.host,
+        user: cli.user,
+        password: cli.password,
+        file: cli.file,
+        volume: cli.volume,
+    })?;
     println!(
-        "backchannel open: {}/{} pt={} ch={}",
-        variant_name(session.variant),
-        SAMPLE_RATE,
-        session.payload_type,
-        session.rtp_channel
+        "playback complete: {}/{} pt={} ch={}",
+        variant_name(result.variant),
+        result.sample_rate,
+        result.payload_type,
+        result.rtp_channel
     );
-
-    let playback = (|| -> Result<usize, String> {
-        let encoded = encode_g711(&samples, session.variant, cli.volume)?;
-        println!(
-            "transcoded: {} bytes (~{:.1}s {} 8kHz mono)",
-            encoded.len(),
-            encoded.len() as f64 / SAMPLE_RATE as f64,
-            variant_name(session.variant)
-        );
-        session.send(&encoded)
-    })();
-    let cleanup = session.close();
-    let sent = match (playback, cleanup) {
-        (Ok(sent), Ok(())) => sent,
-        (Err(error), Ok(())) => return Err(anyhow!(error)),
-        (Ok(_), Err(cleanup)) => return Err(anyhow!(cleanup)),
-        (Err(error), Err(cleanup)) => {
-            return Err(anyhow!("{error}; RTSP cleanup also failed: {cleanup}"));
-        }
-    };
-    println!("sent {sent} RTP packets");
+    println!(
+        "encoded: {} bytes (~{:.1}s {} 8kHz mono)",
+        result.encoded_bytes,
+        result.duration_seconds,
+        variant_name(result.variant)
+    );
+    println!("sent {} RTP packets", result.packets_sent);
     Ok(())
 }
 

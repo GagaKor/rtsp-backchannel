@@ -20,6 +20,21 @@ function pacedSender(): PacedSender {
   return candidate;
 }
 
+type SessionCloser = (
+  rtsp: {
+    teardown(uri: string): Promise<unknown>;
+    close(): void;
+  },
+  streamUri: string,
+) => Promise<void>;
+
+function sessionCloser(): SessionCloser {
+  const candidate = (backchannel as unknown as { closeRtspSession?: SessionCloser })
+    .closeRtspSession;
+  assert.ok(candidate);
+  return candidate;
+}
+
 test('sends G.711 in fixed 40ms packets and waits through the final sample', async () => {
   let now = 0;
   const clock: TestClock = {
@@ -90,4 +105,23 @@ test('rebases when RTSP maintenance delays a packet', async () => {
   assert.equal(maintenanceCalls, 2);
   assert.deepEqual(sentAt, [0, 85]);
   assert.equal(now, 125);
+});
+
+test('closes the RTSP socket when TEARDOWN fails', async () => {
+  const calls: string[] = [];
+  const rtsp = {
+    async teardown(uri: string): Promise<unknown> {
+      calls.push(`teardown:${uri}`);
+      throw new Error('TEARDOWN failed');
+    },
+    close(): void {
+      calls.push('close');
+    },
+  };
+
+  await assert.rejects(
+    sessionCloser()(rtsp, 'rtsp://camera/live'),
+    /TEARDOWN failed/,
+  );
+  assert.deepEqual(calls, ['teardown:rtsp://camera/live', 'close']);
 });

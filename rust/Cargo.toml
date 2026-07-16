@@ -1,8 +1,12 @@
 [package]
-name = "onvif-backchannel-rs"
+name = "onvif-backchannel"
 version = "0.1.0"
 edition = "2024"
-publish = false
+rust-version = "1.85"
+description = "Play audio files through an ONVIF RTSP backchannel"
+repository = "https://github.com/GagaKor/onvif-test"
+keywords = ["onvif", "rtsp", "audio", "rtp", "backchannel"]
+categories = ["multimedia::audio", "network-programming"]
 
 [dependencies]
 anyhow = "1"
