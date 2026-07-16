@@ -295,7 +295,22 @@ class CombinedCleanupFailureRtsp(KeepaliveFailureRtsp):
     def close(self):
         self.closed = True
         self.events.append(("close",))
-        raise RuntimeError("RTSP socket close failure")
+        error = RuntimeError("RTSP socket close failure")
+        error.add_note(
+            "additional RTSP close failure: RTSP reader join failure"
+        )
+        error.add_note("RTSP reader remained active after shutdown")
+        raise error
+
+
+class PlayEstablishmentCleanupFailureRtsp(CombinedCleanupFailureRtsp):
+    def request(self, method, uri, headers=None):
+        headers = headers or {}
+        if method == "PLAY":
+            self.requests.append((method, uri, headers))
+            self.events.append(("request", method, uri, headers))
+            return 500, {}, ""
+        return super().request(method, uri, headers)
 
 
 class FakeUdpRtsp(FakeRtsp):
@@ -580,6 +595,34 @@ class RtspSafetyTest(unittest.TestCase):
             finally:
                 rtsp.close()
 
+    def test_reader_socket_cleanup_preserves_nested_failure_notes(self):
+        class FailingSocket:
+            def shutdown(self, how):
+                error = RuntimeError("reader socket shutdown failure")
+                error.add_note("shutdown syscall diagnostic")
+                raise error
+
+            def close(self):
+                error = RuntimeError("reader socket close failure")
+                error.add_note("close syscall diagnostic")
+                raise error
+
+        rtsp = onvif_play.Rtsp.__new__(onvif_play.Rtsp)
+        rtsp.s = FailingSocket()
+        reader_error = RuntimeError("RTSP reader failure")
+
+        rtsp._close_socket_from_reader(reader_error)
+
+        self.assertEqual(
+            reader_error.__notes__,
+            [
+                "RTSP reader shutdown failure: reader socket shutdown failure",
+                "shutdown syscall diagnostic",
+                "RTSP reader socket close failure: reader socket close failure",
+                "close syscall diagnostic",
+            ],
+        )
+
     def test_normal_request_flow_uses_bounded_response_queue(self):
         fake_socket = ScriptedRtspSocket(
             recv_results=[b"RTSP/1.0 200 OK\r\nX-Test: yes\r\n\r\n", b""]
@@ -737,6 +780,41 @@ class RtspSafetyTest(unittest.TestCase):
         self.assertTrue(rtsp.closed)
         self.assertTrue(rtsp.s.close_called)
         self.assertTrue(rtsp.reader.join_called)
+
+    def test_rtsp_close_preserves_nested_secondary_failure_notes(self):
+        class FailingSocket:
+            def shutdown(self, how):
+                pass
+
+            def close(self):
+                raise RuntimeError("RTSP socket close failure")
+
+        class FailingReader:
+            def join(self, timeout=None):
+                error = RuntimeError("RTSP reader join failure")
+                error.add_note("RTSP reader remained active after shutdown")
+                raise error
+
+            def is_alive(self):
+                return False
+
+        rtsp = onvif_play.Rtsp.__new__(onvif_play.Rtsp)
+        rtsp.closed = False
+        rtsp.s = FailingSocket()
+        rtsp.reader = FailingReader()
+
+        with self.assertRaisesRegex(
+            RuntimeError, "RTSP socket close failure"
+        ) as raised:
+            rtsp.close()
+
+        self.assertEqual(
+            raised.exception.__notes__,
+            [
+                "additional RTSP close failure: RTSP reader join failure",
+                "RTSP reader remained active after shutdown",
+            ],
+        )
 
 
 class BackchannelTransportTest(unittest.TestCase):
@@ -1021,6 +1099,8 @@ class BackchannelTransportTest(unittest.TestCase):
                     "additional backchannel cleanup failure: RTSP socket "
                     "close failure"
                 ),
+                "additional RTSP close failure: RTSP reader join failure",
+                "RTSP reader remained active after shutdown",
             ],
         )
         self.assertFalse(transport.keepalive_thread.is_alive())
@@ -1058,6 +1138,37 @@ class BackchannelTransportTest(unittest.TestCase):
             any("TEARDOWN failed" in note for note in raised.exception.__notes__)
         )
         self.assertTrue(FakeRtsp.instances[0].closed)
+
+    def test_play_failure_preserves_complete_establishment_cleanup_details(self):
+        with self.assertRaisesRegex(
+            RuntimeError, "PLAY failed with RTSP status 500"
+        ) as raised:
+            onvif_play.open_backchannel_transport(
+                "example.invalid",
+                "fake-user",
+                "fake-password",
+                stream_uri="rtsp://example.invalid/live",
+                rtsp_factory=PlayEstablishmentCleanupFailureRtsp,
+            )
+
+        self.assertEqual(
+            raised.exception.__notes__,
+            [
+                (
+                    "backchannel cleanup failure: TEARDOWN failed with "
+                    "RTSP status 500"
+                ),
+                (
+                    "additional backchannel cleanup failure: RTSP socket "
+                    "close failure"
+                ),
+                "additional RTSP close failure: RTSP reader join failure",
+                "RTSP reader remained active after shutdown",
+            ],
+        )
+        client = FakeRtsp.instances[0]
+        self.assertEqual(client.requests[-1][0], "TEARDOWN")
+        self.assertTrue(client.closed)
 
     def test_udp_transport_returns_server_target_and_preserves_packet_bytes(self):
         sockets = []
@@ -2470,6 +2581,8 @@ class RtpSenderMainTest(unittest.TestCase):
                     "additional backchannel cleanup failure: RTSP socket "
                     "close failure"
                 ),
+                "additional RTSP close failure: RTSP reader join failure",
+                "RTSP reader remained active after shutdown",
             ],
         )
         client = FakeRtsp.instances[0]

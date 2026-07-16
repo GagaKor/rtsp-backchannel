@@ -241,13 +241,19 @@ class Rtsp:
         except OSError:
             pass
         except BaseException as cleanup_error:
-            if hasattr(error, "add_note"):
-                error.add_note(f"RTSP reader shutdown failure: {cleanup_error}")
+            add_cleanup_failure_notes(
+                error,
+                cleanup_error,
+                prefix="RTSP reader shutdown failure",
+            )
         try:
             self.s.close()
         except BaseException as cleanup_error:
-            if hasattr(error, "add_note"):
-                error.add_note(f"RTSP reader socket close failure: {cleanup_error}")
+            add_cleanup_failure_notes(
+                error,
+                cleanup_error,
+                prefix="RTSP reader socket close failure",
+            )
 
     def _fail_reader(self, error):
         if self.reader_failure is None:
@@ -349,9 +355,12 @@ class Rtsp:
             errors.append(RuntimeError("RTSP reader thread did not stop"))
         if errors:
             primary = errors[0]
-            if hasattr(primary, "add_note"):
-                for error in errors[1:]:
-                    primary.add_note(f"additional RTSP close failure: {error}")
+            for error in errors[1:]:
+                add_cleanup_failure_notes(
+                    primary,
+                    error,
+                    prefix="additional RTSP close failure",
+                )
             raise primary
 
 
@@ -420,11 +429,11 @@ def select_keepalive_method(public_methods):
     return "OPTIONS"
 
 
-def add_cleanup_failure_notes(primary_error, cleanup_error):
+def add_cleanup_failure_notes(primary_error, cleanup_error, *, prefix):
     if not hasattr(primary_error, "add_note") or primary_error is cleanup_error:
         return
-    nested_notes = tuple(getattr(cleanup_error, "__notes__", ()))
-    primary_error.add_note(f"backchannel cleanup failure: {cleanup_error}")
+    nested_notes = tuple(getattr(cleanup_error, "__notes__", ()) or ())
+    primary_error.add_note(f"{prefix}: {cleanup_error}")
     for note in nested_notes:
         primary_error.add_note(note)
 
@@ -576,9 +585,12 @@ class BackchannelTransport:
             self.closed = True
         if errors:
             primary = errors[0]
-            if hasattr(primary, "add_note"):
-                for error in errors[1:]:
-                    primary.add_note(f"additional backchannel cleanup failure: {error}")
+            for error in errors[1:]:
+                add_cleanup_failure_notes(
+                    primary,
+                    error,
+                    prefix="additional backchannel cleanup failure",
+                )
             raise primary
 
     def __enter__(self):
@@ -590,7 +602,11 @@ class BackchannelTransport:
         except BaseException as cleanup_error:
             if exc_value is None:
                 raise
-            add_cleanup_failure_notes(exc_value, cleanup_error)
+            add_cleanup_failure_notes(
+                exc_value,
+                cleanup_error,
+                prefix="backchannel cleanup failure",
+            )
         return False
 
 
@@ -769,8 +785,11 @@ def open_backchannel_transport(
         try:
             result.close()
         except BaseException as cleanup_error:
-            if hasattr(error, "add_note"):
-                error.add_note(f"backchannel cleanup failure: {cleanup_error}")
+            add_cleanup_failure_notes(
+                error,
+                cleanup_error,
+                prefix="backchannel cleanup failure",
+            )
         raise
 
 
@@ -1595,7 +1614,11 @@ def main(argv=None):
         except BaseException as cleanup_error:
             if playback_error is None:
                 raise
-            add_cleanup_failure_notes(playback_error, cleanup_error)
+            add_cleanup_failure_notes(
+                playback_error,
+                cleanup_error,
+                prefix="backchannel cleanup failure",
+            )
     if a.timing_log is not None:
         atomic_write_jsonl(
             a.timing_log,
