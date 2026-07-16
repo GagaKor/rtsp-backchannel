@@ -1,8 +1,10 @@
 """Pure RTP packet construction for the Python backchannel sender."""
 
+import hashlib
 import json
 import os
 import pathlib
+import stat
 import struct
 import tempfile
 import time
@@ -12,6 +14,13 @@ from dataclasses import dataclass
 TIMING_LOG_MAX_ROWS = 10_000
 TIMING_LOG_MAX_LINE_BYTES = 1024
 TIMING_LOG_MAX_BYTES = TIMING_LOG_MAX_ROWS * TIMING_LOG_MAX_LINE_BYTES
+RTP_FIXED_HEADER_BYTES = 12
+MAX_RTP_PACKET_SIZE = 65_535
+PACKET_PATTERN_MAX_ROWS = 10_000
+PACKET_PATTERN_MAX_LINE_BYTES = 1024
+PACKET_PATTERN_MAX_BYTES = (
+    PACKET_PATTERN_MAX_ROWS * PACKET_PATTERN_MAX_LINE_BYTES
+)
 
 
 def _uint(name, value, maximum):
@@ -20,6 +29,332 @@ def _uint(name, value, maximum):
     if not 0 <= value <= maximum:
         raise ValueError(f"{name} must be between 0 and {maximum}")
     return value
+
+
+@dataclass(frozen=True)
+class RtpBoundary:
+    payload: bytes | memoryview
+    payload_offset: int
+    samples: int
+    timestamp_offset: int
+    target_time_ns: int
+    duration_ns: int
+
+    @property
+    def payload_size(self):
+        return len(self.payload)
+
+    @property
+    def timestamp_advance(self):
+        return self.samples
+
+
+@dataclass(frozen=True)
+class RtpBoundaryPlan:
+    sample_rate: int
+    bytes_per_sample: int
+    total_samples: int
+    finish_time_ns: int
+    packet_count: int
+    _payload: bytes
+    _payload_sizes: tuple[int, ...] | None
+    _fixed_payload_size: int | None
+
+    @staticmethod
+    def _coerce_payload(payload):
+        if isinstance(payload, bytes):
+            return payload
+        try:
+            return memoryview(payload).tobytes()
+        except TypeError as error:
+            raise TypeError("payload must be bytes-like") from error
+
+    @staticmethod
+    def _validate_format(sample_rate, bytes_per_sample):
+        if isinstance(sample_rate, bool) or not isinstance(sample_rate, int):
+            raise TypeError("sample_rate must be an integer")
+        if sample_rate <= 0:
+            raise ValueError("sample_rate must be positive")
+        if (
+            isinstance(bytes_per_sample, bool)
+            or not isinstance(bytes_per_sample, int)
+        ):
+            raise TypeError("bytes_per_sample must be an integer")
+        if bytes_per_sample <= 0:
+            raise ValueError("bytes_per_sample must be positive")
+
+    def _iter_payload_sizes(self):
+        if self._payload_sizes is not None:
+            yield from self._payload_sizes
+            return
+        for offset in range(0, len(self._payload), self._fixed_payload_size):
+            yield min(self._fixed_payload_size, len(self._payload) - offset)
+
+    @property
+    def packets(self):
+        payload_view = memoryview(self._payload)
+        payload_offset = 0
+        sample_offset = 0
+        for payload_size in self._iter_payload_sizes():
+            next_payload_offset = payload_offset + payload_size
+            samples = payload_size // self.bytes_per_sample
+            yield RtpBoundary(
+                payload=payload_view[payload_offset:next_payload_offset],
+                payload_offset=payload_offset,
+                samples=samples,
+                timestamp_offset=sample_offset,
+                target_time_ns=(
+                    sample_offset * 1_000_000_000 // self.sample_rate
+                ),
+                duration_ns=samples * 1_000_000_000 // self.sample_rate,
+            )
+            payload_offset = next_payload_offset
+            sample_offset += samples
+
+    @classmethod
+    def from_payload_sizes(
+        cls,
+        payload,
+        payload_sizes,
+        *,
+        sample_rate,
+        bytes_per_sample,
+    ):
+        payload = cls._coerce_payload(payload)
+        cls._validate_format(sample_rate, bytes_per_sample)
+
+        validated_payload_sizes = []
+        payload_offset = 0
+        sample_offset = 0
+        for packet_index, payload_size in enumerate(payload_sizes):
+            if isinstance(payload_size, bool) or not isinstance(payload_size, int):
+                raise TypeError(
+                    f"payload size at index {packet_index} must be an integer"
+                )
+            if payload_size <= 0:
+                raise ValueError(
+                    f"payload size at index {packet_index} must be positive"
+                )
+            if payload_size % bytes_per_sample:
+                raise ValueError(
+                    f"payload size {payload_size} at index {packet_index} "
+                    f"is not divisible by {bytes_per_sample} bytes per sample"
+                )
+            next_payload_offset = payload_offset + payload_size
+            if next_payload_offset > len(payload):
+                raise ValueError(
+                    "boundary plan has too many payload bytes: "
+                    f"needs {next_payload_offset}, payload has {len(payload)}"
+                )
+            samples = payload_size // bytes_per_sample
+            if samples > 0xFFFFFFFF:
+                raise ValueError(
+                    f"sample count at index {packet_index} exceeds uint32"
+                )
+            validated_payload_sizes.append(payload_size)
+            payload_offset = next_payload_offset
+            sample_offset += samples
+
+        if payload_offset < len(payload):
+            raise ValueError(
+                "boundary plan has too few payload bytes: "
+                f"covers {payload_offset}, payload has {len(payload)}"
+            )
+        return cls(
+            sample_rate=sample_rate,
+            bytes_per_sample=bytes_per_sample,
+            total_samples=sample_offset,
+            finish_time_ns=sample_offset * 1_000_000_000 // sample_rate,
+            packet_count=len(validated_payload_sizes),
+            _payload=payload,
+            _payload_sizes=tuple(validated_payload_sizes),
+            _fixed_payload_size=None,
+        )
+
+    @classmethod
+    def fixed(
+        cls,
+        payload,
+        samples_per_packet,
+        *,
+        sample_rate,
+        bytes_per_sample,
+    ):
+        payload = cls._coerce_payload(payload)
+        cls._validate_format(sample_rate, bytes_per_sample)
+        if (
+            isinstance(samples_per_packet, bool)
+            or not isinstance(samples_per_packet, int)
+        ):
+            raise TypeError("samples_per_packet must be an integer")
+        if not 1 <= samples_per_packet <= 0xFFFFFFFF:
+            raise ValueError(
+                "samples_per_packet must be between 1 and 4294967295"
+            )
+        if len(payload) % bytes_per_sample:
+            raise ValueError(
+                f"payload length is not divisible by {bytes_per_sample} "
+                "bytes per sample"
+            )
+        packet_payload_size = samples_per_packet * bytes_per_sample
+        total_samples = len(payload) // bytes_per_sample
+        packet_count = (
+            (len(payload) + packet_payload_size - 1) // packet_payload_size
+            if payload
+            else 0
+        )
+        return cls(
+            sample_rate=sample_rate,
+            bytes_per_sample=bytes_per_sample,
+            total_samples=total_samples,
+            finish_time_ns=total_samples * 1_000_000_000 // sample_rate,
+            packet_count=packet_count,
+            _payload=payload,
+            _payload_sizes=None,
+            _fixed_payload_size=packet_payload_size,
+        )
+
+
+def fixed_packet_size_candidate(payload_sizes):
+    """Return a fixed size only when the capture is fixed packets plus a tail."""
+    payload_sizes = tuple(payload_sizes)
+    for packet_index, payload_size in enumerate(payload_sizes):
+        if isinstance(payload_size, bool) or not isinstance(payload_size, int):
+            raise TypeError(
+                f"payload size at index {packet_index} must be an integer"
+            )
+        if payload_size <= 0:
+            raise ValueError(
+                f"payload size at index {packet_index} must be positive"
+            )
+    if len(payload_sizes) < 2:
+        return None
+    candidate = payload_sizes[0]
+    if all(size == candidate for size in payload_sizes[:-1]):
+        if payload_sizes[-1] <= candidate:
+            return candidate
+    return None
+
+
+@dataclass(frozen=True)
+class NormalizedRtpStream:
+    payload_lengths: tuple[int, ...]
+    sequence_offsets: tuple[int, ...]
+    timestamp_offsets: tuple[int, ...]
+    marker_positions: tuple[int, ...]
+    packet_count: int
+    duration_samples: int
+    duration_ns: int
+    constant_ssrc: bool
+    payload_sha256: str
+
+
+def _parse_rtp_for_normalization(packet, packet_index):
+    try:
+        packet = memoryview(packet).tobytes()
+    except TypeError as error:
+        raise TypeError(f"RTP packet {packet_index} must be bytes-like") from error
+    if len(packet) < 12:
+        raise ValueError(f"RTP packet {packet_index} is shorter than 12 bytes")
+    first, second, sequence, timestamp, ssrc = struct.unpack_from(
+        "!BBHII", packet
+    )
+    if first >> 6 != 2:
+        raise ValueError(f"RTP packet {packet_index} is not version 2")
+    payload_offset = 12 + (first & 0x0F) * 4
+    if payload_offset > len(packet):
+        raise ValueError(f"RTP packet {packet_index} has a truncated CSRC list")
+    if first & 0x10:
+        if payload_offset + 4 > len(packet):
+            raise ValueError(
+                f"RTP packet {packet_index} has a truncated extension header"
+            )
+        extension_words = struct.unpack_from("!H", packet, payload_offset + 2)[0]
+        payload_offset += 4 + extension_words * 4
+        if payload_offset > len(packet):
+            raise ValueError(
+                f"RTP packet {packet_index} has truncated extension data"
+            )
+    payload_end = len(packet)
+    if first & 0x20:
+        padding_size = packet[-1]
+        if padding_size == 0 or padding_size > payload_end - payload_offset:
+            raise ValueError(f"RTP packet {packet_index} has invalid padding")
+        payload_end -= padding_size
+    payload = packet[payload_offset:payload_end]
+    if not payload:
+        raise ValueError(f"RTP packet {packet_index} has an empty PCMA payload")
+    return sequence, timestamp, ssrc, bool(second & 0x80), payload
+
+
+def normalize_pcma_rtp_packets(packets, sample_rate=8000):
+    if isinstance(sample_rate, bool) or not isinstance(sample_rate, int):
+        raise TypeError("sample_rate must be an integer")
+    if sample_rate <= 0:
+        raise ValueError("sample_rate must be positive")
+
+    payload_lengths = []
+    sequence_offsets = []
+    timestamp_offsets = []
+    marker_positions = []
+    ssrcs = []
+    payload_digest = hashlib.sha256()
+    first_sequence = None
+    first_timestamp = None
+    for packet_index, packet in enumerate(packets):
+        sequence, timestamp, ssrc, marker, payload = _parse_rtp_for_normalization(
+            packet, packet_index
+        )
+        if first_sequence is None:
+            first_sequence = sequence
+            first_timestamp = timestamp
+        payload_lengths.append(len(payload))
+        sequence_offsets.append((sequence - first_sequence) & 0xFFFF)
+        timestamp_offsets.append((timestamp - first_timestamp) & 0xFFFFFFFF)
+        if marker:
+            marker_positions.append(packet_index)
+        ssrcs.append(ssrc)
+        payload_digest.update(payload)
+
+    duration_samples = (
+        timestamp_offsets[-1] + payload_lengths[-1]
+        if payload_lengths
+        else 0
+    )
+    return NormalizedRtpStream(
+        payload_lengths=tuple(payload_lengths),
+        sequence_offsets=tuple(sequence_offsets),
+        timestamp_offsets=tuple(timestamp_offsets),
+        marker_positions=tuple(marker_positions),
+        packet_count=len(payload_lengths),
+        duration_samples=duration_samples,
+        duration_ns=duration_samples * 1_000_000_000 // sample_rate,
+        constant_ssrc=len(set(ssrcs)) <= 1,
+        payload_sha256=payload_digest.hexdigest(),
+    )
+
+
+def normalized_rtp_differences(expected, actual):
+    if not isinstance(expected, NormalizedRtpStream):
+        raise TypeError("expected must be a NormalizedRtpStream")
+    if not isinstance(actual, NormalizedRtpStream):
+        raise TypeError("actual must be a NormalizedRtpStream")
+    field_names = (
+        "payload_lengths",
+        "sequence_offsets",
+        "timestamp_offsets",
+        "marker_positions",
+        "packet_count",
+        "duration_samples",
+        "duration_ns",
+        "constant_ssrc",
+        "payload_sha256",
+    )
+    return tuple(
+        field_name
+        for field_name in field_names
+        if getattr(expected, field_name) != getattr(actual, field_name)
+    )
 
 
 @dataclass(frozen=True)
@@ -193,6 +528,121 @@ def paths_refer_to_same_file(first, second):
         raise ValueError(
             f"cannot safely compare paths {first!s} and {second!s}: {error}"
         ) from error
+
+
+def load_packet_pattern(
+    path,
+    *,
+    max_rows=PACKET_PATTERN_MAX_ROWS,
+    max_line_bytes=PACKET_PATTERN_MAX_LINE_BYTES,
+    max_bytes=PACKET_PATTERN_MAX_BYTES,
+    max_rtp_packet_size=MAX_RTP_PACKET_SIZE,
+):
+    """Load an ordered payload-size manifest with bounded binary reads."""
+    for name, value in (
+        ("max_rows", max_rows),
+        ("max_line_bytes", max_line_bytes),
+        ("max_bytes", max_bytes),
+        ("max_rtp_packet_size", max_rtp_packet_size),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"{name} must be an integer")
+        if value <= 0:
+            raise ValueError(f"{name} must be positive")
+    if max_rtp_packet_size <= RTP_FIXED_HEADER_BYTES:
+        raise ValueError(
+            f"max_rtp_packet_size must exceed {RTP_FIXED_HEADER_BYTES}"
+        )
+
+    path = pathlib.Path(path)
+    try:
+        metadata = path.stat()
+    except FileNotFoundError as error:
+        raise ValueError(f"packet pattern does not exist: {path}") from error
+    except OSError as error:
+        raise ValueError(f"cannot inspect packet pattern {path}: {error}") from error
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ValueError(f"packet pattern is not a regular file: {path}")
+    if metadata.st_size > max_bytes:
+        raise ValueError(
+            f"packet pattern {path} exceeds {max_bytes} byte limit"
+        )
+
+    payload_sizes = []
+    bytes_read = 0
+    try:
+        with path.open("rb") as source:
+            while True:
+                line = source.readline(max_line_bytes + 1)
+                if not line:
+                    break
+                line_number = len(payload_sizes) + 1
+                bytes_read += len(line)
+                if len(line) > max_line_bytes:
+                    raise ValueError(
+                        f"packet pattern line {line_number} exceeds "
+                        f"{max_line_bytes} bytes"
+                    )
+                if bytes_read > max_bytes:
+                    raise ValueError(
+                        f"packet pattern {path} exceeds {max_bytes} byte limit"
+                    )
+                if line_number > max_rows:
+                    raise ValueError(
+                        f"packet pattern row count exceeds {max_rows}"
+                    )
+                try:
+                    text = line.decode("utf-8")
+                except UnicodeDecodeError as error:
+                    raise ValueError(
+                        f"packet pattern line {line_number} must be UTF-8"
+                    ) from error
+                try:
+                    row = json.loads(text)
+                except json.JSONDecodeError as error:
+                    raise ValueError(
+                        f"malformed JSON on line {line_number}: {error.msg}"
+                    ) from error
+                if not isinstance(row, dict):
+                    raise ValueError(
+                        f"packet pattern line {line_number} must be a JSON object"
+                    )
+                packet_index = row.get("packet_index")
+                if isinstance(packet_index, bool) or not isinstance(
+                    packet_index, int
+                ):
+                    raise ValueError(
+                        f"packet_index on line {line_number} must be an integer"
+                    )
+                expected_index = len(payload_sizes)
+                if packet_index != expected_index:
+                    raise ValueError(
+                        f"packet_index {packet_index} on line {line_number}; "
+                        f"expected {expected_index}"
+                    )
+                payload_size = row.get("payload_size")
+                if isinstance(payload_size, bool) or not isinstance(
+                    payload_size, int
+                ):
+                    raise ValueError(
+                        f"payload_size on line {line_number} must be an integer"
+                    )
+                if payload_size <= 0:
+                    raise ValueError(
+                        f"payload_size on line {line_number} must be positive"
+                    )
+                rtp_packet_size = RTP_FIXED_HEADER_BYTES + payload_size
+                if rtp_packet_size > max_rtp_packet_size:
+                    raise ValueError(
+                        f"RTP packet size {rtp_packet_size} on line "
+                        f"{line_number} exceeds {max_rtp_packet_size}"
+                    )
+                payload_sizes.append(payload_size)
+    except OSError as error:
+        raise ValueError(f"cannot read packet pattern {path}: {error}") from error
+    if not payload_sizes:
+        raise ValueError(f"packet pattern {path} must not be empty")
+    return tuple(payload_sizes)
 
 
 def atomic_write_jsonl(

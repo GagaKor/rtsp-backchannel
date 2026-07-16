@@ -219,6 +219,389 @@ class FakePacerClock:
         self.now_ns += round(seconds * 1_000_000_000) + extra_ns
 
 
+class RtpBoundaryPlanTests(unittest.TestCase):
+    def setUp(self):
+        self.module = importlib.import_module("backchannel_rtp")
+
+    def test_irregular_pcma_plan_couples_boundaries_timestamps_and_pacing(self):
+        pattern = [192, 192, 160, 192, 64]
+        payload = bytes((index * 37) % 256 for index in range(800))
+        plan = self.module.RtpBoundaryPlan.from_payload_sizes(
+            payload,
+            pattern,
+            sample_rate=8000,
+            bytes_per_sample=1,
+        )
+
+        self.assertEqual(
+            [packet.payload_size for packet in plan.packets], pattern
+        )
+        self.assertEqual([packet.samples for packet in plan.packets], pattern)
+        self.assertEqual(
+            [packet.timestamp_advance for packet in plan.packets], pattern
+        )
+        self.assertEqual(
+            [packet.timestamp_offset for packet in plan.packets],
+            [0, 192, 384, 544, 736],
+        )
+        self.assertEqual(
+            [packet.target_time_ns for packet in plan.packets],
+            [0, 24_000_000, 48_000_000, 68_000_000, 92_000_000],
+        )
+        self.assertEqual(
+            [packet.duration_ns for packet in plan.packets],
+            [24_000_000, 24_000_000, 20_000_000, 24_000_000, 8_000_000],
+        )
+        self.assertEqual(plan.total_samples, 800)
+        self.assertEqual(plan.finish_time_ns, 100_000_000)
+        self.assertEqual(
+            b"".join(packet.payload for packet in plan.packets), payload
+        )
+
+        clock = FakePacerClock()
+        pacer = self.module.RtpPacer(
+            8000,
+            mode="rebase",
+            monotonic_ns=clock.monotonic_ns,
+            sleeper=clock.sleep,
+        )
+        packetizer = self.module.RtpPacketizer(
+            8, ssrc=1, sequence=2, timestamp=1000
+        )
+        timings = []
+        rtp_packets = []
+        for boundary in plan.packets:
+            timings.append(pacer.wait(boundary.samples))
+            rtp_packets.append(
+                packetizer.build(
+                    boundary.payload,
+                    boundary.timestamp_advance,
+                )
+            )
+
+        self.assertEqual(
+            [timing.target_monotonic_ns - clock.start_ns for timing in timings],
+            [0, 24_000_000, 48_000_000, 68_000_000, 92_000_000],
+        )
+        self.assertEqual(pacer.finish() - clock.start_ns, 100_000_000)
+        self.assertEqual(
+            [parse_rtp_packet(packet).timestamp for packet in rtp_packets],
+            [1000, 1192, 1384, 1544, 1736],
+        )
+        self.assertEqual(b"".join(packet[12:] for packet in rtp_packets), payload)
+        self.assertEqual(packetizer.timestamp, 1800)
+
+    def test_plan_rejects_boundaries_that_do_not_consume_payload_exactly(self):
+        for pattern, message in (
+            ([3, 1], "too few"),
+            ([3, 3], "too many"),
+        ):
+            with self.subTest(pattern=pattern), self.assertRaisesRegex(
+                ValueError, message
+            ):
+                self.module.RtpBoundaryPlan.from_payload_sizes(
+                    b"12345",
+                    pattern,
+                    sample_rate=8000,
+                    bytes_per_sample=1,
+                )
+
+    def test_fixed_plan_materializes_reusable_boundaries_lazily(self):
+        payload = b"x" * 1_000
+        with mock.patch.object(
+            self.module,
+            "RtpBoundary",
+            wraps=self.module.RtpBoundary,
+        ) as boundary_type:
+            plan = self.module.RtpBoundaryPlan.fixed(
+                payload,
+                160,
+                sample_rate=8000,
+                bytes_per_sample=1,
+            )
+            boundary_type.assert_not_called()
+            first_pass = [packet.payload_size for packet in plan.packets]
+            second_pass = [packet.payload_size for packet in plan.packets]
+
+        self.assertEqual(plan.packet_count, 7)
+        self.assertEqual(first_pass, [160] * 6 + [40])
+        self.assertEqual(second_pass, first_pass)
+
+    def test_fixed_candidate_requires_every_nonfinal_packet_to_be_uniform(self):
+        captured = [289] + [320] * 249 + [31]
+        cases = (
+            ([320, 320, 31], 320),
+            ([320, 320, 320], 320),
+            ([192, 160, 192, 64], None),
+            (captured, None),
+            ([31], None),
+        )
+
+        for pattern, expected in cases:
+            with self.subTest(pattern=(pattern[:3], len(pattern))):
+                self.assertEqual(
+                    self.module.fixed_packet_size_candidate(pattern), expected
+                )
+        self.assertEqual(sum(captured), 80_000)
+
+
+class NormalizedRtpStreamTests(unittest.TestCase):
+    def setUp(self):
+        self.module = importlib.import_module("backchannel_rtp")
+
+    @staticmethod
+    def make_stream(
+        payload,
+        sizes,
+        *,
+        sequence=100,
+        timestamp=1000,
+        ssrc=10,
+        markers=(0,),
+        sequence_offsets=None,
+        timestamp_offsets=None,
+        ssrcs=None,
+    ):
+        packets = []
+        payload_offset = 0
+        timestamp_offset = 0
+        for index, size in enumerate(sizes):
+            chunk = payload[payload_offset : payload_offset + size]
+            packet_sequence_offset = (
+                index if sequence_offsets is None else sequence_offsets[index]
+            )
+            packet_timestamp_offset = (
+                timestamp_offset
+                if timestamp_offsets is None
+                else timestamp_offsets[index]
+            )
+            packet_ssrc = ssrc if ssrcs is None else ssrcs[index]
+            packets.append(
+                make_rtp_packet(
+                    chunk,
+                    sequence=(sequence + packet_sequence_offset) & 0xFFFF,
+                    timestamp=(timestamp + packet_timestamp_offset) & 0xFFFFFFFF,
+                    ssrc=packet_ssrc,
+                    marker=index in markers,
+                )
+            )
+            payload_offset += size
+            timestamp_offset += size
+        if payload_offset != len(payload):
+            raise AssertionError("test sizes must consume the payload")
+        return packets
+
+    def test_random_rtp_bases_normalize_to_complete_pcma_stream_identity(self):
+        sizes = [192, 192, 160, 192, 64]
+        payload = bytes((index * 19) % 256 for index in range(800))
+        first = self.module.normalize_pcma_rtp_packets(
+            self.make_stream(
+                payload,
+                sizes,
+                sequence=0xFFF0,
+                timestamp=0xFFFFFF00,
+                ssrc=0x01020304,
+            )
+        )
+        second = self.module.normalize_pcma_rtp_packets(
+            self.make_stream(
+                payload,
+                sizes,
+                sequence=77,
+                timestamp=123_456,
+                ssrc=0xAABBCCDD,
+            )
+        )
+
+        self.assertEqual(first, second)
+        self.assertEqual(first.payload_lengths, tuple(sizes))
+        self.assertEqual(first.sequence_offsets, (0, 1, 2, 3, 4))
+        self.assertEqual(first.timestamp_offsets, (0, 192, 384, 544, 736))
+        self.assertEqual(first.marker_positions, (0,))
+        self.assertEqual(first.packet_count, 5)
+        self.assertEqual(first.duration_samples, 800)
+        self.assertEqual(first.duration_ns, 100_000_000)
+        self.assertTrue(first.constant_ssrc)
+        self.assertEqual(first.payload_sha256, hashlib.sha256(payload).hexdigest())
+        self.assertEqual(
+            self.module.normalized_rtp_differences(first, second), ()
+        )
+
+    def test_equal_payload_histograms_with_different_order_do_not_compare_equal(self):
+        payload = bytes((index * 11) % 256 for index in range(608))
+        first = self.module.normalize_pcma_rtp_packets(
+            self.make_stream(payload, [192, 160, 192, 64])
+        )
+        reordered = self.module.normalize_pcma_rtp_packets(
+            self.make_stream(payload, [192, 192, 160, 64])
+        )
+
+        self.assertEqual(sorted(first.payload_lengths), sorted(reordered.payload_lengths))
+        self.assertEqual(first.payload_sha256, reordered.payload_sha256)
+        self.assertNotEqual(first, reordered)
+        self.assertEqual(
+            self.module.normalized_rtp_differences(first, reordered),
+            ("payload_lengths", "timestamp_offsets"),
+        )
+
+    def test_comparison_reports_every_required_nonbase_mismatch(self):
+        payload = b"abcdef"
+        sizes = [2, 2, 2]
+        expected = self.module.normalize_pcma_rtp_packets(
+            self.make_stream(payload, sizes)
+        )
+        cases = {
+            "sequence_offsets": self.make_stream(
+                payload, sizes, sequence_offsets=[0, 1, 3]
+            ),
+            "timestamp_offsets": self.make_stream(
+                payload, sizes, timestamp_offsets=[0, 2, 5]
+            ),
+            "marker_positions": self.make_stream(
+                payload, sizes, markers=(0, 1)
+            ),
+            "packet_count": self.make_stream(payload, [2, 4]),
+            "duration_samples": self.make_stream(
+                payload, sizes, timestamp_offsets=[0, 2, 5]
+            ),
+            "constant_ssrc": self.make_stream(
+                payload, sizes, ssrcs=[10, 11, 10]
+            ),
+            "payload_sha256": self.make_stream(b"abcdeg", sizes),
+        }
+
+        for field, packets in cases.items():
+            with self.subTest(field=field):
+                actual = self.module.normalize_pcma_rtp_packets(packets)
+                self.assertIn(
+                    field,
+                    self.module.normalized_rtp_differences(expected, actual),
+                )
+
+
+class PacketPatternManifestTests(unittest.TestCase):
+    def setUp(self):
+        self.module = importlib.import_module("backchannel_rtp")
+
+    @staticmethod
+    def write_manifest(path, rows):
+        path.write_text(
+            "".join(json.dumps(row) + "\n" for row in rows),
+            encoding="utf-8",
+        )
+
+    def test_loads_complete_ordered_payload_size_sequence(self):
+        rows = [
+            {"packet_index": index, "payload_size": size, "ignored": "metadata"}
+            for index, size in enumerate([192, 192, 160, 192, 64])
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = pathlib.Path(directory) / "manifest.jsonl"
+            self.write_manifest(manifest, rows)
+
+            self.assertEqual(
+                self.module.load_packet_pattern(manifest),
+                (192, 192, 160, 192, 64),
+            )
+
+    def test_rejects_empty_malformed_and_non_object_manifests(self):
+        cases = (
+            (b"", "must not be empty"),
+            (b"{not json}\n", "malformed JSON on line 1"),
+            (b"[]\n", "line 1 must be a JSON object"),
+            (b"\xff\n", "UTF-8"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = pathlib.Path(directory) / "manifest.jsonl"
+            for contents, message in cases:
+                with self.subTest(contents=contents):
+                    manifest.write_bytes(contents)
+                    with self.assertRaisesRegex(ValueError, message):
+                        self.module.load_packet_pattern(manifest)
+
+    def test_requires_zero_based_contiguous_integral_packet_indices(self):
+        cases = (
+            ([{"packet_index": 1, "payload_size": 1}], "expected 0"),
+            (
+                [
+                    {"packet_index": 0, "payload_size": 1},
+                    {"packet_index": 2, "payload_size": 1},
+                ],
+                "expected 1",
+            ),
+            ([{"packet_index": True, "payload_size": 1}], "integer"),
+            ([{"packet_index": 0.0, "payload_size": 1}], "integer"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = pathlib.Path(directory) / "manifest.jsonl"
+            for rows, message in cases:
+                with self.subTest(rows=rows):
+                    self.write_manifest(manifest, rows)
+                    with self.assertRaisesRegex(ValueError, message):
+                        self.module.load_packet_pattern(manifest)
+
+    def test_requires_positive_integral_payload_sizes(self):
+        for payload_size in (0, -1, 1.5, True, "160", None):
+            with self.subTest(payload_size=payload_size), tempfile.TemporaryDirectory() as directory:
+                manifest = pathlib.Path(directory) / "manifest.jsonl"
+                self.write_manifest(
+                    manifest,
+                    [{"packet_index": 0, "payload_size": payload_size}],
+                )
+                with self.assertRaisesRegex(ValueError, "payload_size"):
+                    self.module.load_packet_pattern(manifest)
+
+    def test_rejects_nonregular_and_stat_oversized_files_before_reading(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = pathlib.Path(directory)
+            with self.assertRaisesRegex(ValueError, "regular file"):
+                self.module.load_packet_pattern(directory)
+
+            manifest = directory / "manifest.jsonl"
+            manifest.write_bytes(b"1234")
+            with mock.patch.object(
+                pathlib.Path,
+                "open",
+                side_effect=AssertionError("oversized manifest was read"),
+            ), self.assertRaisesRegex(ValueError, "exceeds 3 byte limit"):
+                self.module.load_packet_pattern(manifest, max_bytes=3)
+
+    def test_enforces_line_row_cumulative_and_rtp_packet_bounds(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = pathlib.Path(directory) / "manifest.jsonl"
+            self.write_manifest(
+                manifest,
+                [
+                    {"packet_index": 0, "payload_size": 1},
+                    {"packet_index": 1, "payload_size": 1},
+                ],
+            )
+            with self.assertRaisesRegex(ValueError, "line 1 exceeds"):
+                self.module.load_packet_pattern(manifest, max_line_bytes=16)
+            with self.assertRaisesRegex(ValueError, "row count exceeds 1"):
+                self.module.load_packet_pattern(manifest, max_rows=1)
+            with mock.patch.object(
+                pathlib.Path,
+                "stat",
+                return_value=type(
+                    "Metadata",
+                    (),
+                    {"st_mode": stat.S_IFREG, "st_size": 0},
+                )(),
+            ), self.assertRaisesRegex(ValueError, "exceeds 40 byte limit"):
+                self.module.load_packet_pattern(manifest, max_bytes=40)
+
+            self.write_manifest(
+                manifest,
+                [{"packet_index": 0, "payload_size": 21}],
+            )
+            with self.assertRaisesRegex(ValueError, "RTP packet size 33"):
+                self.module.load_packet_pattern(
+                    manifest,
+                    max_rtp_packet_size=32,
+                )
+
+
 class RtpPacerTests(unittest.TestCase):
     def setUp(self):
         self.module = importlib.import_module("backchannel_rtp")

@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 import onvif_play
 import backchannel_audio
+import backchannel_rtp
 from tools import replay_rtp_reference
 from tools.rtp_reference import parse_rtp_packet
 
@@ -62,6 +63,18 @@ def write_reference(directory, packets, rows):
         "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
     )
     return packet_path, manifest_path
+
+
+def write_packet_pattern(path, payload_sizes):
+    path.write_text(
+        "".join(
+            json.dumps({"packet_index": index, "payload_size": payload_size})
+            + "\n"
+            for index, payload_size in enumerate(payload_sizes)
+        ),
+        encoding="utf-8",
+    )
+    return path
 
 
 class FakeRtsp:
@@ -1186,6 +1199,274 @@ class RtpSenderMainTest(unittest.TestCase):
         )
         self.assertEqual(self.clock.now_ns - self.clock.start_ns, 30_000_000)
 
+    def test_packet_controls_default_to_fixed_20ms_and_accept_one_sample_duration(self):
+        parser = onvif_play.build_argument_parser()
+        arguments = parser.parse_args([])
+        self.assertEqual(arguments.packet_ms, 20)
+        self.assertIsNone(arguments.packet_pattern)
+
+        packets, _, _, _ = self.run_main("--ms", "25")
+        self.assertEqual(
+            [parse_rtp_packet(packet).payload_size for packet in packets],
+            [160, 40],
+        )
+        self.assertEqual(self.clock.now_ns - self.clock.start_ns, 25_000_000)
+
+        packets, _, _, _ = self.run_main(
+            "--ms", "1", "--packet-ms", "0.125"
+        )
+        self.assertEqual(
+            [parse_rtp_packet(packet).payload_size for packet in packets],
+            [1] * 8,
+        )
+        self.assertEqual(self.clock.now_ns - self.clock.start_ns, 1_000_000)
+
+    def test_explicit_packet_ms_and_packet_pattern_are_mutually_exclusive(self):
+        parser = onvif_play.build_argument_parser()
+        with redirect_stderr(StringIO()) as stderr, self.assertRaises(SystemExit):
+            parser.parse_args([
+                "--packet-ms", "20",
+                "--packet-pattern", "manifest.jsonl",
+            ])
+
+        self.assertIn("not allowed with argument", stderr.getvalue())
+
+    def test_packet_pattern_sends_complete_order_once_with_normalized_identity(self):
+        pattern = [192, 192, 160, 192, 64]
+        payload = bytes((index * 37) % 256 for index in range(800))
+        with tempfile.TemporaryDirectory() as directory:
+            directory = pathlib.Path(directory)
+            pcma_input = directory / "payload.pcma"
+            manifest = directory / "manifest.jsonl"
+            timing_log = directory / "timing.jsonl"
+            pcma_input.write_bytes(payload)
+            write_packet_pattern(manifest, pattern)
+            with patch.object(
+                onvif_play,
+                "load_packet_pattern",
+                wraps=onvif_play.load_packet_pattern,
+            ) as loader:
+                packets, reports, _, _ = self.run_main(
+                    "--pcma-input", str(pcma_input),
+                    "--packet-pattern", str(manifest),
+                    "--pacer", "rebase",
+                    "--timing-log", str(timing_log),
+                    "--rtcp-interval", "0.02",
+                )
+            rows = [
+                json.loads(line) for line in timing_log.read_text().splitlines()
+            ]
+
+        loader.assert_called_once_with(manifest)
+        normalized = backchannel_rtp.normalize_pcma_rtp_packets(packets)
+        self.assertEqual(normalized.payload_lengths, tuple(pattern))
+        self.assertEqual(
+            normalized.timestamp_offsets, (0, 192, 384, 544, 736)
+        )
+        self.assertEqual(normalized.sequence_offsets, (0, 1, 2, 3, 4))
+        self.assertEqual(normalized.marker_positions, (0,))
+        self.assertEqual(normalized.packet_count, 5)
+        self.assertEqual(normalized.duration_samples, 800)
+        self.assertEqual(normalized.duration_ns, 100_000_000)
+        self.assertTrue(normalized.constant_ssrc)
+        self.assertEqual(
+            normalized.payload_sha256, hashlib.sha256(payload).hexdigest()
+        )
+        self.assertEqual(
+            b"".join(packet[12:] for packet in packets), payload
+        )
+        self.assertEqual(
+            [row["samples"] for row in rows], pattern
+        )
+        self.assertEqual(
+            [row["rtp_timestamp"] - rows[0]["rtp_timestamp"] for row in rows],
+            [0, 192, 384, 544, 736],
+        )
+        self.assertEqual(
+            [
+                row["target_monotonic_ns"] - rows[0]["target_monotonic_ns"]
+                for row in rows
+            ],
+            [0, 24_000_000, 48_000_000, 68_000_000, 92_000_000],
+        )
+        self.assertEqual(
+            [row["packet_duration_ns"] for row in rows],
+            [24_000_000, 24_000_000, 20_000_000, 24_000_000, 8_000_000],
+        )
+        self.assertEqual(self.clock.now_ns - self.clock.start_ns, 100_000_000)
+
+        report_fields = [
+            struct.unpack_from("!BBHIIIIII", report) for report in reports
+        ]
+        self.assertEqual([report[7] for report in report_fields], [1, 2, 3, 4, 5, 5])
+        self.assertEqual(
+            [report[8] for report in report_fields],
+            [192, 384, 544, 736, 800, 800],
+        )
+        self.assertEqual(
+            [report[6] for report in report_fields],
+            [
+                (0x778899AA + offset) & 0xFFFFFFFF
+                for offset in (0, 192, 384, 544, 736, 800)
+            ],
+        )
+
+    def test_packet_pattern_preserves_audio_start_marker_across_preroll(self):
+        payload = bytes(range(200))
+        with tempfile.TemporaryDirectory() as directory:
+            directory = pathlib.Path(directory)
+            pcma_input = directory / "payload.pcma"
+            manifest = directory / "manifest.jsonl"
+            pcma_input.write_bytes(payload)
+            write_packet_pattern(manifest, [100, 100, 100, 60])
+
+            packets, _, _, _ = self.run_main(
+                "--pcma-input", str(pcma_input),
+                "--packet-pattern", str(manifest),
+                "--preroll-ms", "20",
+                "--marker-mode", "audio-start",
+            )
+
+        metadata = [parse_rtp_packet(packet) for packet in packets]
+        self.assertEqual([meta.marker for meta in metadata], [True, True, False, False])
+        self.assertEqual(
+            b"".join(packet[12:] for packet in packets),
+            b"\xd5" * 160 + payload,
+        )
+
+    def test_packet_pattern_rebase_keeps_variable_timestamps_without_catch_up(self):
+        pattern = [192, 192, 160, 192, 64]
+        clock = FakeClock(inject_on_sleep=1, injected_overshoot_ns=30_000_000)
+        with tempfile.TemporaryDirectory() as directory:
+            directory = pathlib.Path(directory)
+            pcma_input = directory / "payload.pcma"
+            manifest = directory / "manifest.jsonl"
+            timing_log = directory / "timing.jsonl"
+            pcma_input.write_bytes(b"x" * sum(pattern))
+            write_packet_pattern(manifest, pattern)
+
+            packets, _, _, _ = self.run_main(
+                "--pcma-input", str(pcma_input),
+                "--packet-pattern", str(manifest),
+                "--pacer", "rebase",
+                "--timing-log", str(timing_log),
+                clock=clock,
+            )
+            rows = [
+                json.loads(line) for line in timing_log.read_text().splitlines()
+            ]
+
+        self.assertEqual(
+            [parse_rtp_packet(packet).timestamp for packet in packets],
+            [
+                (0x778899AA + offset) & 0xFFFFFFFF
+                for offset in (0, 192, 384, 544, 736)
+            ],
+        )
+        self.assertEqual(
+            [row["interval_ns"] for row in rows],
+            [None, 54_000_000, 24_000_000, 20_000_000, 24_000_000],
+        )
+        self.assertEqual(
+            [row["rebased"] for row in rows],
+            [False, True, False, False, False],
+        )
+        self.assertEqual(clock.now_ns - clock.start_ns, 130_000_000)
+
+    def test_packet_pattern_sample_mismatch_fails_before_network(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = pathlib.Path(directory)
+            pcma_input = directory / "payload.pcma"
+            pcma_input.write_bytes(b"12345")
+            for pattern, message in (([4], "too few"), ([6], "too many")):
+                manifest = directory / f"manifest-{pattern[0]}.jsonl"
+                write_packet_pattern(manifest, pattern)
+                with self.subTest(pattern=pattern), patch.object(
+                    onvif_play, "onvif_stream_uri"
+                ) as resolver, redirect_stderr(StringIO()) as stderr, \
+                        self.assertRaises(SystemExit):
+                    onvif_play.main([
+                        "--pcma-input", str(pcma_input),
+                        "--packet-pattern", str(manifest),
+                        "--preroll-ms", "0",
+                    ])
+
+                resolver.assert_not_called()
+                self.assertIn(message, stderr.getvalue())
+
+    def test_packet_pattern_restrictions_fail_before_manifest_or_network(self):
+        for arguments, message in (
+            (["--codec", "pcmu"], "only supports --codec pcma"),
+            (["--sample-rate", "16000"], "sample-rate 8000"),
+            (["--codec", "aac"], "only supports --codec pcma"),
+        ):
+            with self.subTest(arguments=arguments), patch.object(
+                onvif_play,
+                "load_packet_pattern",
+                side_effect=AssertionError("manifest loaded"),
+            ) as loader, patch.object(
+                onvif_play, "onvif_stream_uri"
+            ) as resolver, redirect_stderr(StringIO()) as stderr, \
+                    self.assertRaises(SystemExit):
+                onvif_play.main([
+                    "--packet-pattern", "manifest.jsonl",
+                    *arguments,
+                ])
+
+            loader.assert_not_called()
+            resolver.assert_not_called()
+            self.assertIn(message, stderr.getvalue())
+
+    def test_packet_pattern_transport_size_is_validated_before_audio_or_network(self):
+        class ResolverReached(RuntimeError):
+            pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            directory = pathlib.Path(directory)
+            udp_manifest = write_packet_pattern(
+                directory / "udp.jsonl", [65_496]
+            )
+            with patch.object(
+                onvif_play,
+                "prepare_audio",
+                side_effect=AssertionError("audio prepared"),
+            ) as prepare_audio, patch.object(
+                onvif_play, "onvif_stream_uri"
+            ) as resolver, redirect_stderr(StringIO()) as stderr, \
+                    self.assertRaises(SystemExit):
+                onvif_play.main([
+                    "--packet-pattern", str(udp_manifest),
+                    "--transport", "udp",
+                    "--preroll-ms", "0",
+                ])
+
+            prepare_audio.assert_not_called()
+            resolver.assert_not_called()
+            self.assertIn("RTP packet size 65508", stderr.getvalue())
+            self.assertIn("UDP limit 65507", stderr.getvalue())
+
+            tcp_manifest = write_packet_pattern(
+                directory / "tcp.jsonl", [65_523]
+            )
+            with patch.object(
+                onvif_play,
+                "prepare_audio",
+                return_value=(b"x" * 65_523, None, "audio"),
+            ), patch.object(
+                onvif_play,
+                "onvif_stream_uri",
+                side_effect=ResolverReached,
+            ) as resolver, redirect_stdout(StringIO()), self.assertRaises(
+                ResolverReached
+            ):
+                onvif_play.main([
+                    "--packet-pattern", str(tcp_manifest),
+                    "--transport", "tcp",
+                    "--preroll-ms", "0",
+                ])
+
+            resolver.assert_called_once()
+
     def test_sender_does_not_materialize_timing_fields_without_log(self):
         accessed_fields = []
         timestamp_reads = []
@@ -1401,7 +1682,11 @@ class RtpSenderMainTest(unittest.TestCase):
             self.assertFalse(timing_log.exists())
 
     def test_timing_log_aliases_never_delete_file_inputs(self):
-        for option, suffix in (("--file", ".wav"), ("--pcma-input", ".pcma")):
+        for option, suffix in (
+            ("--file", ".wav"),
+            ("--pcma-input", ".pcma"),
+            ("--packet-pattern", ".jsonl"),
+        ):
             for alias_type in ("same", "symlink", "hardlink"):
                 with self.subTest(
                     option=option, alias_type=alias_type

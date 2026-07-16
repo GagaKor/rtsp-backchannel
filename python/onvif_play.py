@@ -10,12 +10,14 @@ import argparse, base64, datetime, hashlib, math, os, pathlib, queue, re, socket
 
 import backchannel_audio
 from backchannel_rtp import (
+    RtpBoundaryPlan,
     RtpPacer,
     RtpPacketizer,
     TIMING_LOG_MAX_BYTES,
     TIMING_LOG_MAX_LINE_BYTES,
     TIMING_LOG_MAX_ROWS,
     atomic_write_jsonl,
+    load_packet_pattern,
     paths_refer_to_same_file,
     remove_output,
 )
@@ -866,8 +868,11 @@ def build_argument_parser():
                     help="RTP identity source: sender-owned random state or legacy server values")
     ap.add_argument("--marker-mode", choices=["audio-start", "first"], default="first",
                     help="marker policy for G.711/L16 packets")
-    ap.add_argument("--packet-ms", type=float, default=20,
-                    help="packet duration in milliseconds for G.711/L16")
+    packet_group = ap.add_mutually_exclusive_group()
+    packet_group.add_argument("--packet-ms", type=float, default=20,
+                              help="packet duration in milliseconds for G.711/L16")
+    packet_group.add_argument("--packet-pattern", type=pathlib.Path,
+                              help="diagnostic ordered PCMA payload-size manifest")
     ap.add_argument("--pacer", choices=["legacy", "rebase"], default="legacy",
                     help="RTP pacing implementation")
     ap.add_argument("--timing-log", type=pathlib.Path,
@@ -887,6 +892,7 @@ def main(argv=None):
     for input_option, input_path in (
         ("--file", a.file),
         ("--pcma-input", a.pcma_input),
+        ("--packet-pattern", a.packet_pattern),
     ):
         if (
             a.timing_log is not None
@@ -907,8 +913,28 @@ def main(argv=None):
         ap.error("--pcma-input only supports --codec pcma")
     if a.pcma_input and a.sample_rate != 8000:
         ap.error("--pcma-input requires --sample-rate 8000")
+    if a.packet_pattern and a.codec != "pcma":
+        ap.error("--packet-pattern only supports --codec pcma")
+    if a.packet_pattern and a.sample_rate != 8000:
+        ap.error("--packet-pattern requires --sample-rate 8000")
+
+    packet_limit = 65535 if a.transport == "tcp" else 65507
+    pattern_payload_sizes = None
     samples_per_frame = None
-    if a.codec != "aac":
+    if a.packet_pattern is not None:
+        try:
+            pattern_payload_sizes = load_packet_pattern(a.packet_pattern)
+        except ValueError as error:
+            ap.error(str(error))
+        for packet_index, payload_size in enumerate(pattern_payload_sizes):
+            rtp_packet_bytes = 12 + payload_size
+            if rtp_packet_bytes > packet_limit:
+                ap.error(
+                    f"--packet-pattern RTP packet size {rtp_packet_bytes} at "
+                    f"packet {packet_index} exceeds {a.transport.upper()} "
+                    f"limit {packet_limit}"
+                )
+    elif a.codec != "aac":
         if not math.isfinite(a.packet_ms) or a.packet_ms <= 0:
             ap.error("--packet-ms must be positive")
         packet_samples = a.sample_rate * a.packet_ms / 1000
@@ -919,7 +945,6 @@ def main(argv=None):
             ap.error("--packet-ms sample count exceeds uint32")
         packet_payload_bytes = samples_per_frame * (2 if a.codec == "l16" else 1)
         rtp_packet_bytes = 12 + packet_payload_bytes
-        packet_limit = 65535 if a.transport == "tcp" else 65507
         if rtp_packet_bytes > packet_limit:
             ap.error(
                 f"RTP packet size {rtp_packet_bytes} exceeds "
@@ -927,9 +952,49 @@ def main(argv=None):
             )
 
     payload, aac_frames, audio_message = prepare_audio(a)
+    boundary_plan = None
+    if a.codec != "aac":
+        bytes_per_sample = 2 if a.codec == "l16" else 1
+        silence_sample = {
+            "pcma": b"\xD5",
+            "pcmu": b"\xFF",
+            "l16": b"\x00\x00",
+        }[a.codec]
+        preroll_samples = int(a.sample_rate * a.preroll_ms / 1000)
+        preroll = silence_sample * preroll_samples
+        audio_start_offset = len(preroll)
+        stream_payload = preroll + payload
+        if pattern_payload_sizes is not None:
+            pattern_samples = sum(pattern_payload_sizes)
+            stream_samples = len(stream_payload)
+            if pattern_samples < stream_samples:
+                ap.error(
+                    "--packet-pattern has too few samples: "
+                    f"{pattern_samples}; stream requires {stream_samples}"
+                )
+            if pattern_samples > stream_samples:
+                ap.error(
+                    "--packet-pattern has too many samples: "
+                    f"{pattern_samples}; stream requires {stream_samples}"
+                )
+            boundary_plan = RtpBoundaryPlan.from_payload_sizes(
+                stream_payload,
+                pattern_payload_sizes,
+                sample_rate=a.sample_rate,
+                bytes_per_sample=1,
+            )
+        else:
+            boundary_plan = RtpBoundaryPlan.fixed(
+                stream_payload,
+                samples_per_frame,
+                sample_rate=a.sample_rate,
+                bytes_per_sample=bytes_per_sample,
+            )
     if a.timing_log is not None:
-        timing_packet_count = _timing_packet_count(
-            a, payload, aac_frames, samples_per_frame
+        timing_packet_count = (
+            len(aac_frames)
+            if a.codec == "aac"
+            else boundary_plan.packet_count
         )
         if timing_packet_count > MAX_TIMING_ROWS:
             ap.error(
@@ -996,15 +1061,8 @@ def main(argv=None):
 
         print(audio_message)
 
-        if a.codec != "aac":
-            bytes_per_sample = 2 if a.codec == "l16" else 1
-            silence_sample = {"pcma": b"\xD5", "pcmu": b"\xFF", "l16": b"\x00\x00"}[a.codec]
-            preroll_samples = int(a.sample_rate * a.preroll_ms / 1000)
-            preroll = silence_sample * preroll_samples
-            audio_start_offset = len(preroll)
-            stream_payload = preroll + payload
-            if preroll:
-                print(f"  무음 preroll: {a.preroll_ms}ms ({len(preroll)} bytes)")
+        if a.codec != "aac" and preroll:
+            print(f"  무음 preroll: {a.preroll_ms}ms ({len(preroll)} bytes)")
 
         if a.rtp_identity == "legacy":
             sequence = advertised_seq
@@ -1066,11 +1124,16 @@ def main(argv=None):
             packet_source = ((aac_rfc3640_payload(frame), 1024, True)
                              for frame in aac_frames)
         else:
-            bytes_per_frame = samples_per_frame * bytes_per_sample
-            packet_source = ((stream_payload[off:off + bytes_per_frame],
-                              len(stream_payload[off:off + bytes_per_frame]) // bytes_per_sample,
-                              off <= audio_start_offset < off + bytes_per_frame)
-                             for off in range(0, len(stream_payload), bytes_per_frame))
+            packet_source = (
+                (
+                    boundary.payload,
+                    boundary.samples,
+                    boundary.payload_offset
+                    <= audio_start_offset
+                    < boundary.payload_offset + boundary.payload_size,
+                )
+                for boundary in boundary_plan.packets
+            )
 
         for chunk, samples_in_packet, audio_marker in packet_source:
             timing = pacer.wait(samples_in_packet)
