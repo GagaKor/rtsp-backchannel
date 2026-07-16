@@ -605,6 +605,8 @@ class RtspSafetyTest(unittest.TestCase):
         rtsp = onvif_play.Rtsp.__new__(onvif_play.Rtsp)
         rtsp.challenge = None
         rtsp.request_lock = threading.Lock()
+        rtsp.response_timeout_seconds = onvif_play.RTSP_IO_TIMEOUT_SECONDS
+        rtsp.monotonic = time.monotonic
         guard = threading.Lock()
         second_exchange_entered = threading.Event()
         first_exchange_entered = threading.Event()
@@ -613,7 +615,7 @@ class RtspSafetyTest(unittest.TestCase):
         results = {}
         errors = []
 
-        def exchange(method, uri, headers):
+        def exchange(method, uri, headers, deadline):
             nonlocal active_exchanges, exchanges_overlapped
             with guard:
                 call_index = len(results)
@@ -803,6 +805,63 @@ class RtspSafetyTest(unittest.TestCase):
                 self.assertIn(b"Authorization: Digest", fake_socket.sent[1])
             finally:
                 rtsp.close()
+
+    def test_digest_retry_and_stale_filter_share_logical_request_deadline(self):
+        class TimedDigestQueue:
+            def __init__(self, clock):
+                self.clock = clock
+                self.timeouts = []
+                self.results = [
+                    (
+                        7.0,
+                        (
+                            401,
+                            {
+                                "cseq": "1",
+                                "www-authenticate": (
+                                    'Digest realm="camera", nonce="nonce"'
+                                ),
+                            },
+                            "",
+                        ),
+                    ),
+                    (0.0, (200, {"cseq": "1"}, "stale")),
+                    (2.0, (200, {"cseq": "2"}, "too late")),
+                ]
+
+            def get(self, timeout):
+                self.timeouts.append(timeout)
+                delay, result = self.results.pop(0)
+                if delay > timeout:
+                    self.clock[0] += timeout
+                    raise queue.Empty
+                self.clock[0] += delay
+                return result
+
+        now = [0.0]
+        fake_socket = ScriptedRtspSocket()
+        rtsp = onvif_play.Rtsp.__new__(onvif_play.Rtsp)
+        rtsp.s = fake_socket
+        rtsp.user = "fake-user"
+        rtsp.pw = "fake-password"
+        rtsp.cseq = 0
+        rtsp.challenge = None
+        rtsp.reader_failure = None
+        rtsp.response_timeout_seconds = 8.0
+        rtsp.monotonic = lambda: now[0]
+        rtsp.responses = TimedDigestQueue(now)
+        rtsp.write_lock = threading.Lock()
+        rtsp.request_lock = threading.Lock()
+
+        with self.assertRaisesRegex(TimeoutError, "response timeout"):
+            rtsp.request("OPTIONS", "rtsp://example.invalid/live")
+
+        self.assertEqual(rtsp.responses.timeouts, [8.0, 1.0, 1.0])
+        self.assertEqual(now[0], 8.0)
+        self.assertEqual(len(fake_socket.sent), 2)
+        self.assertIn(b"CSeq: 1\r\n", fake_socket.sent[0])
+        self.assertIn(b"CSeq: 2\r\n", fake_socket.sent[1])
+        self.assertIn(b"Authorization: Digest", fake_socket.sent[1])
 
     def test_send_timeout_propagates_with_finite_socket_timeout(self):
         fake_socket = ScriptedRtspSocket(

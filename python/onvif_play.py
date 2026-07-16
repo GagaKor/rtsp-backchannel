@@ -227,7 +227,7 @@ class Rtsp:
         return (f'Digest username="{self.user}", realm="{c["realm"]}", '
                 f'nonce="{c["nonce"]}", uri="{uri}", response="{resp}"')
 
-    def _send(self, method, uri, extra):
+    def _send(self, method, uri, extra, deadline):
         self._raise_reader_failure()
         self.cseq += 1
         expected_cseq = self.cseq
@@ -245,7 +245,7 @@ class Rtsp:
         with self.write_lock:
             self._raise_reader_failure()
             self.s.sendall(msg.encode())
-        return self._read(expected_cseq)
+        return self._read(expected_cseq, deadline=deadline)
 
     def _raise_reader_failure(self):
         if self.reader_failure is not None:
@@ -317,8 +317,9 @@ class Rtsp:
         except Exception as exc:
             self._fail_reader(exc)
 
-    def _read(self, expected_cseq):
-        deadline = self.monotonic() + self.response_timeout_seconds
+    def _read(self, expected_cseq, *, deadline=None):
+        if deadline is None:
+            deadline = self.monotonic() + self.response_timeout_seconds
         expected_text = str(expected_cseq)
         while True:
             self._raise_reader_failure()
@@ -360,8 +361,9 @@ class Rtsp:
             return result
 
     def request(self, method, uri, extra=None):
+        deadline = self.monotonic() + self.response_timeout_seconds
         with self.request_lock:
-            st, h, b = self._send(method, uri, extra or {})
+            st, h, b = self._send(method, uri, extra or {}, deadline)
             if st == 401 and "www-authenticate" in h:
                 wa = h["www-authenticate"]
                 realm = re.search(r'realm="([^"]*)"', wa)
@@ -371,7 +373,9 @@ class Rtsp:
                         "realm": realm.group(1),
                         "nonce": nonce.group(1),
                     }
-                    st, h, b = self._send(method, uri, extra or {})
+                    st, h, b = self._send(
+                        method, uri, extra or {}, deadline
+                    )
             return st, h, b
 
     def send_interleaved(self, channel, rtp):
