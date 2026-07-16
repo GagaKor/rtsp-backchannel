@@ -1212,8 +1212,11 @@ class RtpSenderMainTest(unittest.TestCase):
         self.assertEqual([row["pacer"] for row in rows], ["rebase"] * 4)
         self.assertEqual([row["interval_ns"] for row in rows], [None, 65_000_000, 20_000_000, 20_000_000])
         self.assertEqual([row["rebased"] for row in rows], [False, True, False, False])
-        self.assertEqual(rows[1]["target_monotonic_ns"], rows[1]["actual_monotonic_ns"])
-        self.assertEqual(rows[1]["lateness_ns"], 0)
+        self.assertEqual(
+            rows[1]["actual_monotonic_ns"] - rows[1]["target_monotonic_ns"],
+            45_000_000,
+        )
+        self.assertEqual(rows[1]["lateness_ns"], 45_000_000)
         rendered = json.dumps(rows)
         self.assertNotIn("fake-user", rendered)
         self.assertNotIn("fake-password", rendered)
@@ -1275,6 +1278,48 @@ class RtpSenderMainTest(unittest.TestCase):
 
             resolver.assert_not_called()
             self.assertFalse(timing_log.exists())
+
+    def test_timing_log_aliases_never_delete_file_inputs(self):
+        for option, suffix in (("--file", ".wav"), ("--pcma-input", ".pcma")):
+            for alias_type in ("same", "symlink", "hardlink"):
+                with self.subTest(
+                    option=option, alias_type=alias_type
+                ), tempfile.TemporaryDirectory() as directory:
+                    directory = pathlib.Path(directory)
+                    source = directory / f"source{suffix}"
+                    source.write_bytes(b"source audio")
+                    if alias_type == "same":
+                        timing_log = source
+                    else:
+                        timing_log = directory / f"timing-{alias_type}.jsonl"
+                        if alias_type == "symlink":
+                            timing_log.symlink_to(source)
+                        else:
+                            timing_log.hardlink_to(source)
+                    source_contents = source.read_bytes()
+                    timing_contents = timing_log.read_bytes()
+                    stderr = StringIO()
+                    with patch.object(
+                        onvif_play,
+                        "prepare_audio",
+                        side_effect=AssertionError("audio preparation called"),
+                    ) as prepare_audio, patch.object(
+                        onvif_play, "onvif_stream_uri"
+                    ) as resolver, redirect_stderr(stderr), self.assertRaises(
+                        SystemExit
+                    ):
+                        onvif_play.main([
+                            option, str(source),
+                            "--timing-log", str(timing_log),
+                        ])
+
+                    self.assertIn("same file", stderr.getvalue())
+                    prepare_audio.assert_not_called()
+                    resolver.assert_not_called()
+                    self.assertTrue(source.exists())
+                    self.assertTrue(timing_log.exists())
+                    self.assertEqual(source.read_bytes(), source_contents)
+                    self.assertEqual(timing_log.read_bytes(), timing_contents)
 
     def test_aac_packetization_is_isolated_from_g711_packet_controls(self):
         frames = [b"\x11\x22", b"\x33"]

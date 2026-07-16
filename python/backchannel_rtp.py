@@ -58,7 +58,6 @@ class RtpPacer:
         self._segment_samples = 0
         self._total_samples = 0
         self._next_target_ns = None
-        self._previous_duration_ns = None
         self._last_actual_ns = None
         self._current_target_ns = None
         self._current_stream_samples = 0
@@ -99,7 +98,8 @@ class RtpPacer:
     def wait(self, samples):
         """Wait until the packet's send deadline and register its media duration."""
         samples = self._validate_samples(samples)
-        if self._next_target_ns is None:
+        had_scheduled_target = self._next_target_ns is not None
+        if not had_scheduled_target:
             actual_ns = self._read_clock()
             self._anchor_ns = actual_ns
             target_ns = actual_ns
@@ -108,14 +108,17 @@ class RtpPacer:
             actual_ns = self._sleep_until(target_ns)
 
         lateness_ns = actual_ns - target_ns
+        next_segment_samples = self._segment_samples + samples
+        scheduled_next_target_ns = self._anchor_ns + (
+            next_segment_samples * 1_000_000_000 // self.sample_rate
+        )
+        duration_to_next_target_ns = scheduled_next_target_ns - target_ns
         rebased = False
         if (
             self.mode == "rebase"
-            and self._previous_duration_ns is not None
-            and lateness_ns >= self._previous_duration_ns
+            and had_scheduled_target
+            and lateness_ns >= duration_to_next_target_ns
         ):
-            target_ns = actual_ns
-            lateness_ns = 0
             rebased = True
             self.rebase_count += 1
             self._anchor_ns = actual_ns
@@ -126,12 +129,11 @@ class RtpPacer:
             if self._last_actual_ns is None
             else actual_ns - self._last_actual_ns
         )
-        self._current_target_ns = target_ns
+        self._current_target_ns = actual_ns if rebased else target_ns
         self._current_stream_samples = self._total_samples
         self._total_samples += samples
         self._segment_samples += samples
         self._next_target_ns = self._target_after_segment_samples()
-        self._previous_duration_ns = self._next_target_ns - target_ns
         self._last_actual_ns = actual_ns
         return PacingTiming(
             target_monotonic_ns=target_ns,
@@ -172,7 +174,30 @@ def remove_output(path):
         pass
 
 
-def atomic_write_jsonl(path, rows):
+def paths_refer_to_same_file(first, second):
+    """Return whether two path spellings resolve to the same filesystem object."""
+    first = pathlib.Path(first).expanduser()
+    second = pathlib.Path(second).expanduser()
+    try:
+        if first.resolve(strict=False) == second.resolve(strict=False):
+            return True
+        return first.samefile(second)
+    except FileNotFoundError:
+        return False
+    except (OSError, RuntimeError) as error:
+        raise ValueError(
+            f"cannot safely compare paths {first!s} and {second!s}: {error}"
+        ) from error
+
+
+def atomic_write_jsonl(
+    path,
+    rows,
+    *,
+    max_rows=None,
+    max_line_bytes=None,
+    max_bytes=None,
+):
     """Publish complete timing rows with a same-directory atomic replace."""
     path = pathlib.Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -181,8 +206,28 @@ def atomic_write_jsonl(path, rows):
     )
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as output:
-            for row in rows:
-                output.write(json.dumps(row, sort_keys=True) + "\n")
+            bytes_written = 0
+            for index, row in enumerate(rows):
+                if max_rows is not None and index >= max_rows:
+                    raise ValueError(
+                        f"JSONL row count exceeds {max_rows}"
+                    )
+                rendered = json.dumps(row, sort_keys=True) + "\n"
+                rendered_bytes = len(rendered.encode("utf-8"))
+                if (
+                    max_line_bytes is not None
+                    and rendered_bytes > max_line_bytes
+                ):
+                    raise ValueError(
+                        f"JSONL line {index + 1} exceeds "
+                        f"{max_line_bytes} bytes"
+                    )
+                bytes_written += rendered_bytes
+                if max_bytes is not None and bytes_written > max_bytes:
+                    raise ValueError(
+                        f"JSONL output exceeds {max_bytes} bytes"
+                    )
+                output.write(rendered)
             output.flush()
             os.fsync(output.fileno())
         os.replace(temporary_name, path)

@@ -13,6 +13,7 @@ from backchannel_rtp import (
     RtpPacer,
     RtpPacketizer,
     atomic_write_jsonl,
+    paths_refer_to_same_file,
     remove_output,
 )
 
@@ -867,6 +868,18 @@ def build_argument_parser():
 def main(argv=None):
     ap = build_argument_parser()
     a = ap.parse_args(argv)
+    for input_option, input_path in (
+        ("--file", a.file),
+        ("--pcma-input", a.pcma_input),
+    ):
+        if (
+            a.timing_log is not None
+            and input_path is not None
+            and paths_refer_to_same_file(a.timing_log, input_path)
+        ):
+            ap.error(
+                f"--timing-log must not refer to the same file as {input_option}"
+            )
     remove_output(a.timing_log)
     if not math.isfinite(a.volume) or not 0.0 <= a.volume <= 1.0:
         ap.error("--volume must be finite and between 0.0 and 1.0")

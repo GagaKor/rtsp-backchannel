@@ -27,7 +27,9 @@ from backchannel_rtp import (
 
 
 MAX_DURATION_SECONDS = 6 * 60 * 60
-MAX_PACKET_COUNT = 1_000_000
+MAX_PACKET_COUNT = 10_000
+MAX_TIMING_LINE_BYTES = 1024
+MAX_TIMING_OUTPUT_BYTES = MAX_PACKET_COUNT * MAX_TIMING_LINE_BYTES
 MAX_INJECT_MS = 60_000
 
 
@@ -173,7 +175,13 @@ def run_pacer(
             injection_armed = True
 
     pacer.finish()
-    atomic_write_jsonl(output, rows)
+    atomic_write_jsonl(
+        output,
+        rows,
+        max_rows=MAX_PACKET_COUNT,
+        max_line_bytes=MAX_TIMING_LINE_BYTES,
+        max_bytes=MAX_TIMING_OUTPUT_BYTES,
+    )
     return rows
 
 

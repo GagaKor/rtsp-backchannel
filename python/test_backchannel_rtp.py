@@ -291,9 +291,57 @@ class RtpPacerTests(unittest.TestCase):
         timings = [pacer.wait(160) for _ in range(1503)]
 
         self.assertTrue(timings[1500].rebased)
-        self.assertEqual(timings[1500].lateness_ns, 0)
+        self.assertEqual(
+            timings[1500].target_monotonic_ns - clock.start_ns,
+            30_000_000_000,
+        )
+        self.assertEqual(timings[1500].lateness_ns, 45_000_000)
+        self.assertEqual(
+            timings[1500].actual_monotonic_ns
+            - timings[1500].target_monotonic_ns,
+            45_000_000,
+        )
         self.assertEqual(timings[1501].interval_ns, 20_000_000)
         self.assertEqual(timings[1502].interval_ns, 20_000_000)
+
+    def test_variable_packet_rebase_uses_duration_to_next_deadline(self):
+        clock = FakePacerClock(
+            inject_on_sleep=1, injected_overshoot_ns=10_000_000
+        )
+        pacer = self.make_pacer(clock, mode="rebase")
+        packetizer = self.module.RtpPacketizer(
+            8, ssrc=1, sequence=2, timestamp=0
+        )
+
+        samples = (160, 40, 160)
+        timings = []
+        timestamps = []
+        for packet_samples in samples:
+            timings.append(pacer.wait(packet_samples))
+            timestamps.append(
+                parse_rtp_packet(
+                    packetizer.build(b"x", packet_samples)
+                ).timestamp
+            )
+
+        self.assertEqual(
+            [timing.target_monotonic_ns - clock.start_ns for timing in timings],
+            [0, 20_000_000, 35_000_000],
+        )
+        self.assertEqual(
+            [timing.lateness_ns for timing in timings],
+            [0, 10_000_000, 0],
+        )
+        self.assertEqual(
+            [timing.interval_ns for timing in timings],
+            [None, 30_000_000, 5_000_000],
+        )
+        self.assertEqual(
+            [timing.rebased for timing in timings],
+            [False, True, False],
+        )
+        self.assertEqual(timestamps, [0, 160, 200])
+        self.assertEqual(packetizer.timestamp, 360)
 
     def test_variable_tail_finish_waits_exact_final_media_duration(self):
         for mode in ("legacy", "rebase"):
@@ -459,6 +507,45 @@ class RunRtpPacerToolTests(unittest.TestCase):
             self.assertFalse(output.exists())
             self.assertFalse(list(output.parent.glob(f".{output.name}.*.tmp")))
 
+    def test_runner_limits_match_memory_bounded_summarizer_capacity(self):
+        summarizer = importlib.import_module("tools.summarize_send_timing")
+
+        self.assertLessEqual(self.runner.MAX_PACKET_COUNT, 10_000)
+        self.assertEqual(
+            self.runner.MAX_PACKET_COUNT, summarizer.MAX_TIMING_ROWS
+        )
+        self.assertEqual(
+            getattr(self.runner, "MAX_TIMING_LINE_BYTES", None),
+            summarizer.MAX_TIMING_LINE_BYTES,
+        )
+        self.assertEqual(
+            getattr(self.runner, "MAX_TIMING_OUTPUT_BYTES", None),
+            summarizer.MAX_TIMING_BYTES,
+        )
+        self.assertEqual(
+            self.runner.MAX_TIMING_OUTPUT_BYTES,
+            self.runner.MAX_PACKET_COUNT * self.runner.MAX_TIMING_LINE_BYTES,
+        )
+
+    def test_runner_enforces_serialized_row_bound_and_cleans_temporary_file(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            self.runner, "MAX_TIMING_LINE_BYTES", 64, create=True
+        ):
+            output = pathlib.Path(directory) / "timing.jsonl"
+            with self.assertRaisesRegex(ValueError, "JSONL line 1 exceeds 64 bytes"):
+                self.runner.run_pacer(
+                    duration=0.02,
+                    sample_rate=8000,
+                    packet_samples=160,
+                    mode="rebase",
+                    inject_after_packet=None,
+                    inject_ms=0,
+                    output=output,
+                )
+
+            self.assertFalse(output.exists())
+            self.assertFalse(list(output.parent.glob(f".{output.name}.*.tmp")))
+
     def test_direct_help_runs_without_pythonpath(self):
         environment = os.environ.copy()
         environment.pop("PYTHONPATH", None)
@@ -534,7 +621,7 @@ class SummarizeSendTimingToolTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "interval_ns must be nonnegative"):
             self.summarizer.summarize_timing(rows)
 
-    def test_summary_reports_required_metrics_and_rebase_passes(self):
+    def test_summary_reports_required_metrics_and_observed_rebase_lateness(self):
         with tempfile.TemporaryDirectory() as directory:
             rows = self.make_rows(directory, "rebase")
             summary = self.summarizer.summarize_timing(rows)
@@ -548,7 +635,8 @@ class SummarizeSendTimingToolTests(unittest.TestCase):
         )
         self.assertEqual(
             summary["absolute_deadline_error_ns"],
-            {"p50": 0, "p95": 0, "p99": 0, "max": 0},
+            {"p50": 0, "p95": 45_000_000, "p99": 45_000_000,
+             "max": 45_000_000},
         )
         self.assertEqual(summary["rebase_count"], 1)
         self.assertEqual(summary["rebase_indexes"], [1])
@@ -557,13 +645,15 @@ class SummarizeSendTimingToolTests(unittest.TestCase):
         self.assertEqual(
             summary["checks"],
             {
+                "all_packet_samples_match_expected": True,
                 "no_unexpected_timestamp_deltas": True,
                 "no_post_severe_interval_below_75_percent": True,
-                "p99_deadline_error_within_bound": True,
+                "p99_deadline_error_within_bound": False,
             },
         )
+        self.assertEqual(summary["expected_samples"], 160)
         self.assertEqual(summary["deadline_error_limit_ns"], 2_000_000)
-        self.assertTrue(summary["pass"])
+        self.assertFalse(summary["pass"])
 
     def test_legacy_summary_exposes_catch_up_and_deadline_error_failure(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -597,21 +687,88 @@ class SummarizeSendTimingToolTests(unittest.TestCase):
         )
         self.assertFalse(summary["checks"]["no_unexpected_timestamp_deltas"])
 
-    def test_gst_inter_arrival_is_labeled_not_comparable_to_deadline_error(self):
+    def test_gst_inter_arrival_p99_sets_required_bound_with_semantic_caveat(self):
         with tempfile.TemporaryDirectory() as directory:
             rows = self.make_rows(directory, "rebase")
             gst_path = pathlib.Path(directory) / "gst-summary.json"
             gst_path.write_text(json.dumps({
                 "packet_count": 4,
-                "inter_arrival_ns": {"p99": 9_000_000},
+                "inter_arrival_ns": {"p99": 49_244_216.34},
             }))
             gst = self.summarizer.load_gst_summary(gst_path)
             summary = self.summarizer.summarize_timing(rows, gst_summary=gst)
 
-        self.assertEqual(summary["deadline_error_limit_ns"], 2_000_000)
-        self.assertEqual(summary["gst_reference"]["comparison"], "not_comparable")
+        self.assertEqual(summary["deadline_error_limit_ns"], 50_244_216.34)
+        self.assertEqual(
+            summary["gst_reference"]["acceptance_metric"],
+            "inter_arrival_ns.p99 + 1000000ns",
+        )
+        self.assertEqual(
+            summary["gst_reference"]["comparison"], "semantic_caveat"
+        )
         self.assertIn("inter-arrival", summary["gst_reference"]["note"])
         self.assertIn("deadline-error", summary["gst_reference"]["note"])
+        self.assertTrue(summary["checks"]["p99_deadline_error_within_bound"])
+        self.assertTrue(summary["pass"])
+
+    def test_gst_summary_requires_finite_nonnegative_inter_arrival_p99(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rows = self.make_rows(directory, "rebase")
+
+        for p99 in (None, True, -1, float("nan"), float("inf")):
+            with self.subTest(p99=p99), self.assertRaisesRegex(
+                ValueError, "inter_arrival_ns.p99"
+            ):
+                self.summarizer.summarize_timing(
+                    rows,
+                    gst_summary={"inter_arrival_ns": {"p99": p99}},
+                )
+
+    def test_expected_samples_defaults_to_160_and_rejects_self_declared_delta(
+        self,
+    ):
+        clock = FakePacerClock()
+        with tempfile.TemporaryDirectory() as directory:
+            rows = self.runner.run_pacer(
+                duration=0.04,
+                sample_rate=8000,
+                packet_samples=80,
+                mode="rebase",
+                inject_after_packet=None,
+                inject_ms=0,
+                output=pathlib.Path(directory) / "timing.jsonl",
+                monotonic_ns=clock.monotonic_ns,
+                sleeper=clock.sleep,
+            )
+
+        summary = self.summarizer.summarize_timing(rows)
+
+        self.assertEqual(summary["expected_samples"], 160)
+        self.assertEqual(
+            summary["unexpected_packet_samples"],
+            [
+                {"packet_index": index, "expected": 160, "actual": 80}
+                for index in range(4)
+            ],
+        )
+        self.assertEqual(
+            summary["unexpected_timestamp_deltas"],
+            [
+                {"packet_index": index, "expected": 160, "actual": 80}
+                for index in range(1, 4)
+            ],
+        )
+        self.assertFalse(
+            summary["checks"]["all_packet_samples_match_expected"]
+        )
+        self.assertFalse(summary["checks"]["no_unexpected_timestamp_deltas"])
+        self.assertFalse(summary["pass"])
+
+        overridden = self.summarizer.summarize_timing(
+            rows, expected_samples=80
+        )
+        self.assertEqual(overridden["expected_samples"], 80)
+        self.assertTrue(overridden["pass"])
 
     def test_cli_atomically_writes_summary_and_direct_help_works(self):
         environment = os.environ.copy()
@@ -619,10 +776,17 @@ class SummarizeSendTimingToolTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             self.make_rows(directory, "rebase")
             timing = pathlib.Path(directory) / "rebase.jsonl"
+            gst_summary = pathlib.Path(directory) / "gst-summary.json"
+            gst_summary.write_text(json.dumps({
+                "packet_count": 4,
+                "inter_arrival_ns": {"p99": 49_000_000},
+            }))
             output = pathlib.Path(directory) / "summary.json"
             completed = subprocess.run(
                 [sys.executable, str(SUMMARIZE_TIMING_TOOL),
-                 "--input", str(timing), "--output", str(output)],
+                 "--input", str(timing),
+                 "--gst-summary", str(gst_summary),
+                 "--output", str(output)],
                 cwd=ROOT,
                 env=environment,
                 check=False,
@@ -644,6 +808,66 @@ class SummarizeSendTimingToolTests(unittest.TestCase):
         )
         self.assertEqual(help_result.returncode, 0, help_result.stderr)
         self.assertIn("--gst-summary", help_result.stdout)
+        self.assertIn("--expected-samples", help_result.stdout)
+
+    def test_cli_returns_nonzero_after_atomically_writing_failing_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = pathlib.Path(directory)
+            self.make_rows(directory, "legacy")
+            timing = directory / "legacy.jsonl"
+            output = directory / "summary.json"
+            output.write_text("stale\n")
+
+            result = self.summarizer.main([
+                "--input", str(timing),
+                "--output", str(output),
+            ])
+
+            self.assertEqual(result, 1)
+            summary = json.loads(output.read_text())
+            self.assertFalse(summary["pass"])
+            self.assertFalse(list(output.parent.glob(f".{output.name}.*.tmp")))
+
+    def test_cli_rejects_output_aliases_before_deleting_inputs(self):
+        for option in ("--input", "--gst-summary"):
+            for alias_type in ("same", "symlink", "hardlink"):
+                with self.subTest(
+                    option=option, alias_type=alias_type
+                ), tempfile.TemporaryDirectory() as directory:
+                    directory = pathlib.Path(directory)
+                    self.make_rows(directory, "rebase")
+                    timing = directory / "rebase.jsonl"
+                    gst_summary = directory / "gst-summary.json"
+                    gst_summary.write_text(json.dumps({
+                        "packet_count": 4,
+                        "inter_arrival_ns": {"p99": 9_000_000},
+                    }))
+                    source = timing if option == "--input" else gst_summary
+                    if alias_type == "same":
+                        output = source
+                    else:
+                        output = directory / f"output-{alias_type}.json"
+                        if alias_type == "symlink":
+                            output.symlink_to(source)
+                        else:
+                            output.hardlink_to(source)
+                    source_contents = source.read_bytes()
+                    output_contents = output.read_bytes()
+                    stderr = StringIO()
+                    arguments = [
+                        "--input", str(timing),
+                        "--gst-summary", str(gst_summary),
+                        "--output", str(output),
+                    ]
+                    with redirect_stderr(stderr):
+                        result = self.summarizer.main(arguments)
+
+                    self.assertEqual(result, 1)
+                    self.assertIn("same file", stderr.getvalue())
+                    self.assertTrue(source.exists())
+                    self.assertTrue(output.exists())
+                    self.assertEqual(source.read_bytes(), source_contents)
+                    self.assertEqual(output.read_bytes(), output_contents)
 
     def test_malformed_and_oversized_jsonl_remove_stale_output(self):
         cases = (

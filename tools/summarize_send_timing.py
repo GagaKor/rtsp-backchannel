@@ -11,10 +11,19 @@ import pathlib
 import sys
 import tempfile
 
+if __package__ in {None, ""}:
+    _REPOSITORY_ROOT = pathlib.Path(__file__).resolve().parents[1]
+    _PYTHON_ROOT = _REPOSITORY_ROOT / "python"
+    _python_root_string = str(_PYTHON_ROOT)
+    if _python_root_string not in sys.path:
+        sys.path.insert(0, _python_root_string)
 
-MAX_TIMING_BYTES = 128 * 1024 * 1024
-MAX_TIMING_LINE_BYTES = 16 * 1024
-MAX_TIMING_ROWS = 1_000_000
+from backchannel_rtp import paths_refer_to_same_file
+
+
+MAX_TIMING_ROWS = 10_000
+MAX_TIMING_LINE_BYTES = 1024
+MAX_TIMING_BYTES = MAX_TIMING_ROWS * MAX_TIMING_LINE_BYTES
 MAX_GST_SUMMARY_BYTES = 16 * 1024 * 1024
 
 
@@ -179,8 +188,41 @@ def _packet_duration_ns(row):
     return None
 
 
-def summarize_timing(rows, *, gst_summary=None):
+def _validate_expected_samples(expected_samples):
+    if isinstance(expected_samples, bool) or not isinstance(expected_samples, int):
+        raise ValueError("expected_samples must be an integer")
+    if not 1 <= expected_samples <= 0xFFFFFFFF:
+        raise ValueError("expected_samples must be between 1 and 4294967295")
+    return expected_samples
+
+
+def _gst_inter_arrival_p99(gst_summary):
+    inter_arrival = gst_summary.get("inter_arrival_ns")
+    p99 = inter_arrival.get("p99") if isinstance(inter_arrival, dict) else None
+    if (
+        isinstance(p99, bool)
+        or not isinstance(p99, (int, float))
+        or not math.isfinite(p99)
+        or p99 < 0
+    ):
+        raise ValueError(
+            "GST summary inter_arrival_ns.p99 must be a finite nonnegative number"
+        )
+    return p99
+
+
+def summarize_timing(rows, *, gst_summary=None, expected_samples=160):
+    expected_samples = _validate_expected_samples(expected_samples)
     _validate_rows(rows)
+    unexpected_samples = [
+        {
+            "packet_index": row["packet_index"],
+            "expected": expected_samples,
+            "actual": row["samples"],
+        }
+        for row in rows
+        if row["samples"] != expected_samples
+    ]
     delta_histogram = {}
     unexpected_deltas = []
     for index in range(1, len(rows)):
@@ -189,11 +231,10 @@ def summarize_timing(rows, *, gst_summary=None):
         ) & 0xFFFFFFFF
         key = str(delta)
         delta_histogram[key] = delta_histogram.get(key, 0) + 1
-        expected = rows[index - 1]["samples"]
-        if delta != expected:
+        if delta != expected_samples:
             unexpected_deltas.append({
                 "packet_index": index,
-                "expected": expected,
+                "expected": expected_samples,
                 "actual": delta,
             })
 
@@ -212,8 +253,8 @@ def summarize_timing(rows, *, gst_summary=None):
             injected_indexes.append(index)
             severe_indexes.add(index)
         elif index > 0:
-            prior_duration_ns = _packet_duration_ns(rows[index - 1])
-            if prior_duration_ns is not None and row["lateness_ns"] >= prior_duration_ns:
+            duration_ns = _packet_duration_ns(row)
+            if duration_ns is not None and row["lateness_ns"] >= duration_ns:
                 severe_indexes.add(index)
 
     post_oversleep_intervals = [
@@ -236,14 +277,25 @@ def summarize_timing(rows, *, gst_summary=None):
         default=0,
     )
     gst_reference = None
+    deadline_error_limit_ns = max(
+        2_000_000, configured_jitter_bound_ns + 1_000_000
+    )
     if gst_summary is not None:
+        gst_p99_ns = _gst_inter_arrival_p99(gst_summary)
+        gst_acceptance_bound_ns = gst_p99_ns + 1_000_000
+        deadline_error_limit_ns = max(
+            deadline_error_limit_ns, gst_acceptance_bound_ns
+        )
         gst_reference = {
             "packet_count": gst_summary.get("packet_count"),
             "inter_arrival_ns": gst_summary.get("inter_arrival_ns"),
-            "comparison": "not_comparable",
+            "acceptance_metric": "inter_arrival_ns.p99 + 1000000ns",
+            "acceptance_bound_ns": gst_acceptance_bound_ns,
+            "comparison": "semantic_caveat",
             "note": (
-                "GST inter-arrival statistics are not deadline-error statistics; "
-                "unlike metrics were not compared."
+                "Task 5 applies the GST inter-arrival p99 as the acceptance "
+                "bound even though inter-arrival and deadline-error measure "
+                "different timing properties."
             ),
         }
         reference_bound = gst_summary.get("deadline_error_jitter_bound_ns")
@@ -255,12 +307,12 @@ def summarize_timing(rows, *, gst_summary=None):
             configured_jitter_bound_ns = max(
                 configured_jitter_bound_ns, reference_bound
             )
-
-    deadline_error_limit_ns = max(
-        2_000_000, configured_jitter_bound_ns + 1_000_000
-    )
+            deadline_error_limit_ns = max(
+                deadline_error_limit_ns, reference_bound + 1_000_000
+            )
     absolute_error_stats = _stats(deadline_errors, include_min=False)
     checks = {
+        "all_packet_samples_match_expected": not unexpected_samples,
         "no_unexpected_timestamp_deltas": not unexpected_deltas,
         "no_post_severe_interval_below_75_percent": all(post_interval_checks),
         "p99_deadline_error_within_bound": (
@@ -269,6 +321,8 @@ def summarize_timing(rows, *, gst_summary=None):
     }
     summary = {
         "packet_count": len(rows),
+        "expected_samples": expected_samples,
+        "unexpected_packet_samples": unexpected_samples,
         "rtp_timestamp_delta_histogram": delta_histogram,
         "unexpected_timestamp_deltas": unexpected_deltas,
         "interval_ns": _stats(intervals),
@@ -323,25 +377,41 @@ def build_argument_parser():
     parser.add_argument("--input", type=pathlib.Path, required=True)
     parser.add_argument("--output", type=pathlib.Path, required=True)
     parser.add_argument("--gst-summary", type=pathlib.Path)
+    parser.add_argument("--expected-samples", type=int, default=160)
     return parser
 
 
 def main(argv=None):
     arguments = build_argument_parser().parse_args(argv)
-    _remove_output(arguments.output)
     try:
+        for input_option, input_path in (
+            ("--input", arguments.input),
+            ("--gst-summary", arguments.gst_summary),
+        ):
+            if (
+                input_path is not None
+                and paths_refer_to_same_file(arguments.output, input_path)
+            ):
+                raise ValueError(
+                    f"--output must not refer to the same file as {input_option}"
+                )
+        _remove_output(arguments.output)
         rows = load_timing_jsonl(arguments.input)
         gst_summary = (
             load_gst_summary(arguments.gst_summary)
             if arguments.gst_summary is not None
             else None
         )
-        summary = summarize_timing(rows, gst_summary=gst_summary)
+        summary = summarize_timing(
+            rows,
+            gst_summary=gst_summary,
+            expected_samples=arguments.expected_samples,
+        )
         _atomic_write_json(arguments.output, summary)
     except (OSError, TypeError, ValueError) as error:
         print(f"summarize_send_timing: {error}", file=sys.stderr)
         return 1
-    return 0
+    return 0 if summary["pass"] else 1
 
 
 if __name__ == "__main__":
