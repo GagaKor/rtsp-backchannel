@@ -1,3 +1,4 @@
+import errno
 import hashlib
 import importlib
 import json
@@ -9,6 +10,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stderr
 from io import StringIO
@@ -327,6 +329,37 @@ class RtpBoundaryPlanTests(unittest.TestCase):
         self.assertEqual(first_pass, [160] * 6 + [40])
         self.assertEqual(second_pass, first_pass)
 
+    def test_boundary_durations_use_adjacent_cumulative_targets_at_48khz(self):
+        plan = self.module.RtpBoundaryPlan.fixed(
+            b"abc",
+            1,
+            sample_rate=48_000,
+            bytes_per_sample=1,
+        )
+        packets = list(plan.packets)
+        targets = [packet.target_time_ns for packet in packets]
+        next_targets = targets[1:] + [plan.finish_time_ns]
+
+        self.assertEqual(targets, [0, 20_833, 41_666])
+        self.assertEqual(plan.finish_time_ns, 62_500)
+        self.assertEqual(
+            [packet.duration_ns for packet in packets],
+            [20_833, 20_833, 20_834],
+        )
+        self.assertEqual(
+            [packet.duration_ns for packet in packets],
+            [
+                next_target - target
+                for target, next_target in zip(
+                    targets, next_targets, strict=True
+                )
+            ],
+        )
+        self.assertEqual(
+            sum(packet.duration_ns for packet in packets),
+            plan.finish_time_ns,
+        )
+
     def test_fixed_candidate_requires_every_nonfinal_packet_to_be_uniform(self):
         captured = [289] + [320] * 249 + [31]
         cases = (
@@ -358,6 +391,7 @@ class NormalizedRtpStreamTests(unittest.TestCase):
         timestamp=1000,
         ssrc=10,
         markers=(0,),
+        payload_types=None,
         sequence_offsets=None,
         timestamp_offsets=None,
         ssrcs=None,
@@ -375,10 +409,12 @@ class NormalizedRtpStreamTests(unittest.TestCase):
                 if timestamp_offsets is None
                 else timestamp_offsets[index]
             )
+            payload_type = 8 if payload_types is None else payload_types[index]
             packet_ssrc = ssrc if ssrcs is None else ssrcs[index]
             packets.append(
                 make_rtp_packet(
                     chunk,
+                    payload_type=payload_type,
                     sequence=(sequence + packet_sequence_offset) & 0xFFFF,
                     timestamp=(timestamp + packet_timestamp_offset) & 0xFFFFFFFF,
                     ssrc=packet_ssrc,
@@ -415,8 +451,10 @@ class NormalizedRtpStreamTests(unittest.TestCase):
 
         self.assertEqual(first, second)
         self.assertEqual(first.payload_lengths, tuple(sizes))
+        self.assertEqual(first.payload_types, (8, 8, 8, 8, 8))
         self.assertEqual(first.sequence_offsets, (0, 1, 2, 3, 4))
         self.assertEqual(first.timestamp_offsets, (0, 192, 384, 544, 736))
+        self.assertEqual(first.ssrc_segments, (0, 0, 0, 0, 0))
         self.assertEqual(first.marker_positions, (0,))
         self.assertEqual(first.packet_count, 5)
         self.assertEqual(first.duration_samples, 800)
@@ -442,6 +480,56 @@ class NormalizedRtpStreamTests(unittest.TestCase):
         self.assertEqual(
             self.module.normalized_rtp_differences(first, reordered),
             ("payload_lengths", "timestamp_offsets"),
+        )
+
+    def test_payload_type_difference_is_not_normalized_away(self):
+        payload = b"abcdef"
+        expected = self.module.normalize_pcma_rtp_packets(
+            self.make_stream(payload, [2, 2, 2], payload_types=[8, 8, 8])
+        )
+        wrong_payload_type = self.module.normalize_pcma_rtp_packets(
+            self.make_stream(payload, [2, 2, 2], payload_types=[0, 0, 0])
+        )
+
+        self.assertEqual(
+            self.module.normalized_rtp_differences(
+                expected, wrong_payload_type
+            ),
+            ("payload_types",),
+        )
+
+    def test_distinct_ssrc_change_positions_are_not_normalized_away(self):
+        payload = b"abcdefgh"
+        expected = self.module.normalize_pcma_rtp_packets(
+            self.make_stream(
+                payload,
+                [2, 2, 2, 2],
+                ssrcs=[10, 10, 20, 20],
+            )
+        )
+        same_segments = self.module.normalize_pcma_rtp_packets(
+            self.make_stream(
+                payload,
+                [2, 2, 2, 2],
+                ssrcs=[1_000, 1_000, 2_000, 2_000],
+            )
+        )
+        wrong_segments = self.module.normalize_pcma_rtp_packets(
+            self.make_stream(
+                payload,
+                [2, 2, 2, 2],
+                ssrcs=[100, 200, 200, 200],
+            )
+        )
+
+        self.assertFalse(expected.constant_ssrc)
+        self.assertEqual(expected, same_segments)
+        self.assertFalse(wrong_segments.constant_ssrc)
+        self.assertEqual(expected.ssrc_segments, (0, 0, 1, 1))
+        self.assertEqual(wrong_segments.ssrc_segments, (0, 1, 1, 1))
+        self.assertEqual(
+            self.module.normalized_rtp_differences(expected, wrong_segments),
+            ("ssrc_segments",),
         )
 
     def test_comparison_reports_every_required_nonbase_mismatch(self):
@@ -551,7 +639,7 @@ class PacketPatternManifestTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "payload_size"):
                     self.module.load_packet_pattern(manifest)
 
-    def test_rejects_nonregular_and_stat_oversized_files_before_reading(self):
+    def test_rejects_nonregular_and_descriptor_oversized_files_before_reading(self):
         with tempfile.TemporaryDirectory() as directory:
             directory = pathlib.Path(directory)
             with self.assertRaisesRegex(ValueError, "regular file"):
@@ -560,11 +648,84 @@ class PacketPatternManifestTests(unittest.TestCase):
             manifest = directory / "manifest.jsonl"
             manifest.write_bytes(b"1234")
             with mock.patch.object(
-                pathlib.Path,
-                "open",
+                self.module.os,
+                "fdopen",
                 side_effect=AssertionError("oversized manifest was read"),
             ), self.assertRaisesRegex(ValueError, "exceeds 3 byte limit"):
                 self.module.load_packet_pattern(manifest, max_bytes=3)
+
+    def test_fifo_replacement_race_fails_without_blocking_or_leaking_fd(self):
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("FIFO replacement requires mkfifo")
+
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = pathlib.Path(directory) / "manifest.jsonl"
+            self.write_manifest(
+                manifest,
+                [{"packet_index": 0, "payload_size": 1}],
+            )
+            original_path_stat = pathlib.Path.stat
+            original_os_open = os.open
+            replaced = False
+            replacement_lock = threading.Lock()
+            outcomes = []
+
+            def replace_with_fifo():
+                nonlocal replaced
+                with replacement_lock:
+                    if replaced:
+                        return
+                    manifest.unlink()
+                    os.mkfifo(manifest)
+                    replaced = True
+
+            def racing_stat(path, *args, **kwargs):
+                metadata = original_path_stat(path, *args, **kwargs)
+                if pathlib.Path(path) == manifest:
+                    replace_with_fifo()
+                return metadata
+
+            def racing_open(path, flags, *args, **kwargs):
+                if pathlib.Path(path) == manifest:
+                    replace_with_fifo()
+                return original_os_open(path, flags, *args, **kwargs)
+
+            def run_loader():
+                try:
+                    outcomes.append(self.module.load_packet_pattern(manifest))
+                except BaseException as error:
+                    outcomes.append(error)
+
+            with mock.patch.object(
+                pathlib.Path, "stat", new=racing_stat
+            ), mock.patch.object(
+                self.module.os, "open", side_effect=racing_open
+            ):
+                loader = threading.Thread(target=run_loader, daemon=True)
+                loader.start()
+                loader.join(1)
+                blocked = loader.is_alive()
+                if blocked:
+                    writer = original_os_open(
+                        manifest, os.O_WRONLY | os.O_NONBLOCK
+                    )
+                    try:
+                        os.write(
+                            writer,
+                            b'{"packet_index": 0, "payload_size": 1}\n',
+                        )
+                    finally:
+                        os.close(writer)
+                    loader.join(1)
+
+            self.assertFalse(blocked, "packet pattern open blocked on a FIFO")
+            self.assertFalse(loader.is_alive(), "blocked loader did not exit")
+            self.assertEqual(len(outcomes), 1)
+            self.assertIsInstance(outcomes[0], ValueError)
+            self.assertIn("regular file", str(outcomes[0]))
+            with self.assertRaises(OSError) as raised:
+                original_os_open(manifest, os.O_WRONLY | os.O_NONBLOCK)
+            self.assertEqual(raised.exception.errno, errno.ENXIO)
 
     def test_enforces_line_row_cumulative_and_rtp_packet_bounds(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -581,8 +742,8 @@ class PacketPatternManifestTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "row count exceeds 1"):
                 self.module.load_packet_pattern(manifest, max_rows=1)
             with mock.patch.object(
-                pathlib.Path,
-                "stat",
+                self.module.os,
+                "fstat",
                 return_value=type(
                     "Metadata",
                     (),

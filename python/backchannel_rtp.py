@@ -98,15 +98,21 @@ class RtpBoundaryPlan:
         for payload_size in self._iter_payload_sizes():
             next_payload_offset = payload_offset + payload_size
             samples = payload_size // self.bytes_per_sample
+            target_time_ns = (
+                sample_offset * 1_000_000_000 // self.sample_rate
+            )
+            next_target_time_ns = (
+                (sample_offset + samples)
+                * 1_000_000_000
+                // self.sample_rate
+            )
             yield RtpBoundary(
                 payload=payload_view[payload_offset:next_payload_offset],
                 payload_offset=payload_offset,
                 samples=samples,
                 timestamp_offset=sample_offset,
-                target_time_ns=(
-                    sample_offset * 1_000_000_000 // self.sample_rate
-                ),
-                duration_ns=samples * 1_000_000_000 // self.sample_rate,
+                target_time_ns=target_time_ns,
+                duration_ns=next_target_time_ns - target_time_ns,
             )
             payload_offset = next_payload_offset
             sample_offset += samples
@@ -239,9 +245,11 @@ def fixed_packet_size_candidate(payload_sizes):
 @dataclass(frozen=True)
 class NormalizedRtpStream:
     payload_lengths: tuple[int, ...]
+    payload_types: tuple[int, ...]
     sequence_offsets: tuple[int, ...]
     timestamp_offsets: tuple[int, ...]
     marker_positions: tuple[int, ...]
+    ssrc_segments: tuple[int, ...]
     packet_count: int
     duration_samples: int
     duration_ns: int
@@ -284,7 +292,7 @@ def _parse_rtp_for_normalization(packet, packet_index):
     payload = packet[payload_offset:payload_end]
     if not payload:
         raise ValueError(f"RTP packet {packet_index} has an empty PCMA payload")
-    return sequence, timestamp, ssrc, bool(second & 0x80), payload
+    return second & 0x7F, sequence, timestamp, ssrc, bool(second & 0x80), payload
 
 
 def normalize_pcma_rtp_packets(packets, sample_rate=8000):
@@ -294,26 +302,36 @@ def normalize_pcma_rtp_packets(packets, sample_rate=8000):
         raise ValueError("sample_rate must be positive")
 
     payload_lengths = []
+    payload_types = []
     sequence_offsets = []
     timestamp_offsets = []
     marker_positions = []
-    ssrcs = []
+    ssrc_segments = []
+    ssrc_labels = {}
     payload_digest = hashlib.sha256()
     first_sequence = None
     first_timestamp = None
     for packet_index, packet in enumerate(packets):
-        sequence, timestamp, ssrc, marker, payload = _parse_rtp_for_normalization(
-            packet, packet_index
-        )
+        (
+            payload_type,
+            sequence,
+            timestamp,
+            ssrc,
+            marker,
+            payload,
+        ) = _parse_rtp_for_normalization(packet, packet_index)
         if first_sequence is None:
             first_sequence = sequence
             first_timestamp = timestamp
         payload_lengths.append(len(payload))
+        payload_types.append(payload_type)
         sequence_offsets.append((sequence - first_sequence) & 0xFFFF)
         timestamp_offsets.append((timestamp - first_timestamp) & 0xFFFFFFFF)
         if marker:
             marker_positions.append(packet_index)
-        ssrcs.append(ssrc)
+        if ssrc not in ssrc_labels:
+            ssrc_labels[ssrc] = len(ssrc_labels)
+        ssrc_segments.append(ssrc_labels[ssrc])
         payload_digest.update(payload)
 
     duration_samples = (
@@ -323,13 +341,15 @@ def normalize_pcma_rtp_packets(packets, sample_rate=8000):
     )
     return NormalizedRtpStream(
         payload_lengths=tuple(payload_lengths),
+        payload_types=tuple(payload_types),
         sequence_offsets=tuple(sequence_offsets),
         timestamp_offsets=tuple(timestamp_offsets),
         marker_positions=tuple(marker_positions),
+        ssrc_segments=tuple(ssrc_segments),
         packet_count=len(payload_lengths),
         duration_samples=duration_samples,
         duration_ns=duration_samples * 1_000_000_000 // sample_rate,
-        constant_ssrc=len(set(ssrcs)) <= 1,
+        constant_ssrc=len(ssrc_labels) <= 1,
         payload_sha256=payload_digest.hexdigest(),
     )
 
@@ -341,9 +361,11 @@ def normalized_rtp_differences(expected, actual):
         raise TypeError("actual must be a NormalizedRtpStream")
     field_names = (
         "payload_lengths",
+        "payload_types",
         "sequence_offsets",
         "timestamp_offsets",
         "marker_positions",
+        "ssrc_segments",
         "packet_count",
         "duration_samples",
         "duration_ns",
@@ -555,23 +577,36 @@ def load_packet_pattern(
         )
 
     path = pathlib.Path(path)
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
     try:
-        metadata = path.stat()
+        descriptor = os.open(path, flags)
     except FileNotFoundError as error:
         raise ValueError(f"packet pattern does not exist: {path}") from error
     except OSError as error:
-        raise ValueError(f"cannot inspect packet pattern {path}: {error}") from error
-    if not stat.S_ISREG(metadata.st_mode):
-        raise ValueError(f"packet pattern is not a regular file: {path}")
-    if metadata.st_size > max_bytes:
-        raise ValueError(
-            f"packet pattern {path} exceeds {max_bytes} byte limit"
-        )
+        raise ValueError(f"cannot open packet pattern {path}: {error}") from error
+    try:
+        try:
+            metadata = os.fstat(descriptor)
+        except OSError as error:
+            raise ValueError(
+                f"cannot inspect packet pattern {path}: {error}"
+            ) from error
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError(f"packet pattern is not a regular file: {path}")
+        if metadata.st_size > max_bytes:
+            raise ValueError(
+                f"packet pattern {path} exceeds {max_bytes} byte limit"
+            )
+        source = os.fdopen(descriptor, "rb")
+    except BaseException:
+        os.close(descriptor)
+        raise
 
     payload_sizes = []
     bytes_read = 0
     try:
-        with path.open("rb") as source:
+        with source:
             while True:
                 line = source.readline(max_line_bytes + 1)
                 if not line:
