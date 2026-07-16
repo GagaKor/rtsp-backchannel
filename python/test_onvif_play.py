@@ -279,6 +279,25 @@ class KeepaliveFailureRtsp(ParameterizedSessionRtsp):
         return super().request(method, uri, headers)
 
 
+class CombinedCleanupFailureRtsp(KeepaliveFailureRtsp):
+    def request(self, method, uri, headers=None):
+        headers = headers or {}
+        if method == "TEARDOWN":
+            if self.transport is not None:
+                self.worker_alive_at_teardown = (
+                    self.transport.keepalive_thread.is_alive()
+                )
+            self.requests.append((method, uri, headers))
+            self.events.append(("request", method, uri, headers))
+            return 500, {}, ""
+        return super().request(method, uri, headers)
+
+    def close(self):
+        self.closed = True
+        self.events.append(("close",))
+        raise RuntimeError("RTSP socket close failure")
+
+
 class FakeUdpRtsp(FakeRtsp):
     def request(self, method, uri, headers=None):
         if method == "SETUP":
@@ -964,6 +983,49 @@ class BackchannelTransportTest(unittest.TestCase):
         )
         self.assertFalse(transport.keepalive_thread.is_alive())
         self.assertFalse(client.worker_alive_at_teardown)
+
+    def test_primary_error_preserves_all_ordered_cleanup_failure_details(self):
+        keepalive_event = ControlledKeepaliveEvent()
+        transport = onvif_play.open_backchannel_transport(
+            "example.invalid",
+            "fake-user",
+            "fake-password",
+            stream_uri="rtsp://example.invalid/live",
+            rtsp_factory=CombinedCleanupFailureRtsp,
+            keepalive_event_factory=lambda: keepalive_event,
+        )
+        client = FakeRtsp.instances[0]
+        client.transport = transport
+        self.assertTrue(keepalive_event.wait_started.wait(timeout=1))
+        keepalive_event.trigger()
+        self.assertTrue(client.keepalive_received.wait(timeout=1))
+
+        with self.assertRaisesRegex(
+            RuntimeError, "primary playback failure"
+        ) as raised:
+            with transport:
+                raise RuntimeError("primary playback failure")
+
+        self.assertEqual(
+            raised.exception.__notes__,
+            [
+                (
+                    "backchannel cleanup failure: SET_PARAMETER failed "
+                    "with RTSP status 500"
+                ),
+                (
+                    "additional backchannel cleanup failure: TEARDOWN "
+                    "failed with RTSP status 500"
+                ),
+                (
+                    "additional backchannel cleanup failure: RTSP socket "
+                    "close failure"
+                ),
+            ],
+        )
+        self.assertFalse(transport.keepalive_thread.is_alive())
+        self.assertFalse(client.worker_alive_at_teardown)
+        self.assertTrue(client.closed)
 
     def test_teardown_occurs_when_replay_raises(self):
         with self.assertRaisesRegex(RuntimeError, "send failed"):
@@ -2360,6 +2422,59 @@ class RtpSenderMainTest(unittest.TestCase):
                 for note in raised.exception.__notes__
             )
         )
+
+    def test_main_preserves_all_ordered_cleanup_failure_details(self):
+        keepalive_event = ControlledKeepaliveEvent()
+
+        class CombinedPlaybackCleanupFailureRtsp(
+            CombinedCleanupFailureRtsp
+        ):
+            def send_interleaved(self, channel, payload):
+                if channel == 6:
+                    keepalive_event.trigger()
+                    if not self.keepalive_received.wait(timeout=1):
+                        raise AssertionError("keepalive request was not sent")
+                    raise RuntimeError("primary playback failure")
+                super().send_interleaved(channel, payload)
+
+        original_open = onvif_play.open_backchannel_transport
+
+        def open_with_controlled_keepalive(*args, **kwargs):
+            kwargs["keepalive_event_factory"] = lambda: keepalive_event
+            return original_open(*args, **kwargs)
+
+        with patch.object(
+            onvif_play,
+            "open_backchannel_transport",
+            side_effect=open_with_controlled_keepalive,
+        ), self.assertRaisesRegex(
+            RuntimeError, "primary playback failure"
+        ) as raised:
+            self.run_main(
+                "--ms", "20",
+                rtsp_type=CombinedPlaybackCleanupFailureRtsp,
+            )
+
+        self.assertEqual(
+            raised.exception.__notes__,
+            [
+                (
+                    "backchannel cleanup failure: SET_PARAMETER failed "
+                    "with RTSP status 500"
+                ),
+                (
+                    "additional backchannel cleanup failure: TEARDOWN "
+                    "failed with RTSP status 500"
+                ),
+                (
+                    "additional backchannel cleanup failure: RTSP socket "
+                    "close failure"
+                ),
+            ],
+        )
+        client = FakeRtsp.instances[0]
+        self.assertEqual(client.requests[-1][0], "TEARDOWN")
+        self.assertTrue(client.closed)
 
     def test_timing_log_is_not_published_when_teardown_fails(self):
         with tempfile.TemporaryDirectory() as directory:

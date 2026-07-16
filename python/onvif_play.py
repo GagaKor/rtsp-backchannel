@@ -420,6 +420,15 @@ def select_keepalive_method(public_methods):
     return "OPTIONS"
 
 
+def add_cleanup_failure_notes(primary_error, cleanup_error):
+    if not hasattr(primary_error, "add_note") or primary_error is cleanup_error:
+        return
+    nested_notes = tuple(getattr(cleanup_error, "__notes__", ()))
+    primary_error.add_note(f"backchannel cleanup failure: {cleanup_error}")
+    for note in nested_notes:
+        primary_error.add_note(note)
+
+
 class BackchannelTransport:
     """An established ONVIF RTSP backchannel and its RTP destination."""
 
@@ -581,8 +590,7 @@ class BackchannelTransport:
         except BaseException as cleanup_error:
             if exc_value is None:
                 raise
-            if hasattr(exc_value, "add_note"):
-                exc_value.add_note(f"backchannel cleanup failure: {cleanup_error}")
+            add_cleanup_failure_notes(exc_value, cleanup_error)
         return False
 
 
@@ -1587,10 +1595,7 @@ def main(argv=None):
         except BaseException as cleanup_error:
             if playback_error is None:
                 raise
-            if hasattr(playback_error, "add_note"):
-                playback_error.add_note(
-                    f"backchannel cleanup failure: {cleanup_error}"
-                )
+            add_cleanup_failure_notes(playback_error, cleanup_error)
     if a.timing_log is not None:
         atomic_write_jsonl(
             a.timing_log,
