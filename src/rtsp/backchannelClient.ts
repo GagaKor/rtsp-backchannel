@@ -2,7 +2,7 @@
  * Minimal RTSP client over a raw TCP socket (Node built-ins only).
  *
  * M1 scope: connect, OPTIONS, DESCRIBE (incl. ONVIF backchannel Require header),
- * with HTTP Digest / Basic auth. SETUP/RECORD + interleaved RTP are added in M2/M3
+ * with HTTP Digest / Basic auth. SETUP/PLAY + interleaved RTP are added in M2/M3
  * on top of the same persistent socket.
  */
 import net from 'node:net';
@@ -53,7 +53,8 @@ export class RtspClient {
         this.socket = sock;
         sock.on('data', (chunk) => {
           this.rxBuf = Buffer.concat([this.rxBuf, chunk]);
-          this.rxWaiter?.();
+          if (this.rxWaiter) this.rxWaiter();
+          else this.discardInterleavedFrames();
         });
         resolve();
       });
@@ -170,29 +171,45 @@ export class RtspClient {
   }
 
   private session?: string;
+  sessionTimeoutSeconds = 60;
 
-  /**
-   * SETUP the backchannel track over interleaved TCP. Returns the RTP channel
-   * the camera assigned (we send our audio on it). Requires the backchannel
-   * Require header so the camera keeps the sendonly track in the session.
-   */
-  async setup(trackUri: string, opts: { rtpChannel?: number } = {}): Promise<{ session: string; rtpChannel: number }> {
+  /** SETUP one interleaved TCP track, optionally as the backchannel track. */
+  async setup(
+    trackUri: string,
+    opts: { rtpChannel?: number; backchannel?: boolean } = {},
+  ): Promise<{ session: string; rtpChannel: number }> {
     const rtp = opts.rtpChannel ?? 0;
-    const res = await this.request('SETUP', trackUri, {
-      Require: BACKCHANNEL_REQUIRE,
+    const headers: Record<string, string> = {
       Transport: `RTP/AVP/TCP;unicast;interleaved=${rtp}-${rtp + 1}`,
-    });
+    };
+    if (this.session) headers['Session'] = this.session;
+    if (opts.backchannel) headers['Require'] = BACKCHANNEL_REQUIRE;
+    const res = await this.request('SETUP', trackUri, headers);
     if (res.status !== 200) {
       throw new Error(`SETUP failed: ${res.statusLine}`);
     }
-    this.session = (res.headers['session'] ?? '').split(';')[0].trim();
+    const sessionHeader = res.headers['session'] ?? '';
+    this.session = sessionHeader.split(';')[0].trim();
+    const timeout = /(?:^|;)\s*timeout=(\d+)/i.exec(sessionHeader);
+    if (timeout && Number(timeout[1]) > 0) {
+      this.sessionTimeoutSeconds = Number(timeout[1]);
+    }
     const il = /interleaved=(\d+)-(\d+)/.exec(res.headers['transport'] ?? '');
     return { session: this.session, rtpChannel: il ? Number(il[1]) : rtp };
   }
 
-  async record(uri: string): Promise<RtspResponse> {
-    if (!this.session) throw new Error('SETUP must precede RECORD');
-    return this.request('RECORD', uri, { Session: this.session, Range: 'npt=0.000-' });
+  async play(uri: string): Promise<RtspResponse> {
+    if (!this.session) throw new Error('SETUP must precede PLAY');
+    return this.request('PLAY', uri, {
+      Session: this.session,
+      Range: 'npt=now-',
+      Require: BACKCHANNEL_REQUIRE,
+    });
+  }
+
+  async keepAlive(uri: string): Promise<RtspResponse> {
+    if (!this.session) throw new Error('SETUP must precede keepalive');
+    return this.request('OPTIONS', uri, { Session: this.session });
   }
 
   async teardown(uri: string): Promise<void> {
@@ -210,6 +227,16 @@ export class RtspClient {
     this.socket.write(frame);
   }
 
+  /** Drop complete RTP/RTCP frames arriving on an interleaved RTSP socket. */
+  private discardInterleavedFrames(): void {
+    while (this.rxBuf.length > 0 && this.rxBuf[0] === 0x24) {
+      if (this.rxBuf.length < 4) return;
+      const frameLength = this.rxBuf.readUInt16BE(2);
+      if (this.rxBuf.length < frameLength + 4) return;
+      this.rxBuf = this.rxBuf.subarray(frameLength + 4);
+    }
+  }
+
   private readResponse(): Promise<RtspResponse> {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -218,6 +245,7 @@ export class RtspClient {
       }, this.timeoutMs);
 
       const tryParse = () => {
+        this.discardInterleavedFrames();
         const sep = this.rxBuf.indexOf('\r\n\r\n');
         if (sep < 0) return false;
         const headerText = this.rxBuf.subarray(0, sep).toString('utf8');

@@ -85,7 +85,7 @@ async function main(): Promise<void> {
       `   ▶ 송출 코덱 선택: PT=${send?.payloadType} ${send?.encoding}/${send?.clockRate}` +
         ` ${send?.encoding === 'PCMU' || send?.encoding === 'PCMA' ? '(G.711 — 단순/권장)' : ''}`,
     );
-    console.log('   → 다음(M2): 이 트랙으로 SETUP + RECORD 세션 수립');
+    console.log('   → 다음(M2): 이 트랙으로 SETUP + PLAY 세션 수립');
   } else {
     console.log('\n❌ M1 FAIL — no sendonly audio backchannel track found.');
     process.exitCode = 1;

@@ -6,17 +6,19 @@ export interface RtpPacketizerOptions {
   clockRate: number; // 8000 for G.711
   ssrc?: number;
   seqStart?: number;
+  timestampStart?: number;
 }
 
 export class RtpPacketizer {
   private seq: number;
-  private timestamp = 0;
+  private timestamp: number;
   private readonly ssrc: number;
   private firstPacket = true;
 
   constructor(private readonly opts: RtpPacketizerOptions) {
     this.ssrc = opts.ssrc ?? crypto.randomBytes(4).readUInt32BE(0);
     this.seq = opts.seqStart ?? crypto.randomBytes(2).readUInt16BE(0);
+    this.timestamp = opts.timestampStart ?? crypto.randomBytes(4).readUInt32BE(0);
   }
 
   /**
