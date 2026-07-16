@@ -93,6 +93,14 @@ onvif-backchannel = "0.1"
 onvif-backchannel = { git = "https://github.com/GagaKor/onvif-test.git", branch = "onvif-rtsp-two-way-audio" }
 ```
 
+Private GitHub 저장소에서 Cargo의 기본 Git 클라이언트가 인증 정보를 찾지 못하면 소비자
+프로젝트의 `.cargo/config.toml`에 시스템 Git credential helper 사용을 설정합니다.
+
+```toml
+[net]
+git-fetch-with-cli = true
+```
+
 ```rust
 use std::path::PathBuf;
 
