@@ -486,6 +486,53 @@ class RunRtpPacerToolTests(unittest.TestCase):
                     self.runner.run_pacer(**arguments)
                 self.assertFalse(output.exists())
 
+    def test_run_rejects_ceil_padded_media_duration_above_six_hours(self):
+        clock = FakePacerClock()
+        with tempfile.TemporaryDirectory() as directory:
+            output = pathlib.Path(directory) / "timing.jsonl"
+            output.write_text("stale\n")
+
+            with self.assertRaisesRegex(
+                ValueError, "represented media duration exceeds 21600 seconds"
+            ):
+                self.runner.run_pacer(
+                    duration=1,
+                    sample_rate=1,
+                    packet_samples=0xFFFFFFFF,
+                    mode="rebase",
+                    inject_after_packet=None,
+                    inject_ms=0,
+                    output=output,
+                    monotonic_ns=clock.monotonic_ns,
+                    sleeper=clock.sleep,
+                )
+
+            self.assertEqual(clock.sleeps, [])
+            self.assertFalse(output.exists())
+
+    def test_run_allows_ceil_padded_media_duration_at_six_hour_boundary(self):
+        clock = FakePacerClock()
+        with tempfile.TemporaryDirectory() as directory:
+            output = pathlib.Path(directory) / "timing.jsonl"
+            rows = self.runner.run_pacer(
+                duration=10_800.1,
+                sample_rate=1,
+                packet_samples=10_800,
+                mode="rebase",
+                inject_after_packet=None,
+                inject_ms=0,
+                output=output,
+                monotonic_ns=clock.monotonic_ns,
+                sleeper=clock.sleep,
+            )
+
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(
+                clock.now_ns - clock.start_ns,
+                self.runner.MAX_DURATION_SECONDS * 1_000_000_000,
+            )
+            self.assertTrue(output.exists())
+
     def test_run_failure_removes_stale_output_and_temporary_file(self):
         def failing_sleep(_seconds):
             raise RuntimeError("sleep failed")
@@ -916,6 +963,46 @@ class SummarizeSendTimingToolTests(unittest.TestCase):
                     rows,
                     gst_summary={"inter_arrival_ns": {"p99": p99}},
                 )
+
+    def test_cli_rejects_overflowing_gst_p99_without_traceback_or_output(self):
+        environment = os.environ.copy()
+        environment.pop("PYTHONPATH", None)
+        with tempfile.TemporaryDirectory() as directory:
+            directory = pathlib.Path(directory)
+            self.make_rows(directory, "rebase")
+            timing = directory / "rebase.jsonl"
+            gst_summary = directory / "gst-summary.json"
+            gst_summary.write_text(
+                '{"inter_arrival_ns":{"p99":' + "9" * 400 + "}}"
+            )
+            output = directory / "summary.json"
+            output.write_text("stale\n")
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(SUMMARIZE_TIMING_TOOL),
+                    "--input", str(timing),
+                    "--gst-summary", str(gst_summary),
+                    "--output", str(output),
+                ],
+                cwd=ROOT,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(completed.returncode, 1)
+            self.assertIn(
+                "inter_arrival_ns.p99 must be a finite nonnegative number",
+                completed.stderr,
+            )
+            self.assertNotIn("Traceback", completed.stderr)
+            self.assertFalse(output.exists())
+            self.assertFalse(
+                list(output.parent.glob(f".{output.name}.*.tmp"))
+            )
 
     def test_fixed_samples_reject_self_declared_delta_and_cannot_be_overridden(
         self,

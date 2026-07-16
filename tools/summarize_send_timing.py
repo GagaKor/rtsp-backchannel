@@ -231,12 +231,13 @@ def _stats(values, *, include_min=True):
 def _gst_inter_arrival_p99(gst_summary):
     inter_arrival = gst_summary.get("inter_arrival_ns")
     p99 = inter_arrival.get("p99") if isinstance(inter_arrival, dict) else None
-    if (
-        isinstance(p99, bool)
-        or not isinstance(p99, (int, float))
-        or not math.isfinite(p99)
-        or p99 < 0
-    ):
+    valid = not isinstance(p99, bool) and isinstance(p99, (int, float))
+    if valid:
+        try:
+            valid = p99 >= 0 and math.isfinite(p99)
+        except OverflowError:
+            valid = False
+    if not valid:
         raise ValueError(
             "GST summary inter_arrival_ns.p99 must be a finite nonnegative number"
         )

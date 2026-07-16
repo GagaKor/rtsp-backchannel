@@ -81,6 +81,12 @@ def _validate_run(
         raise ValueError(
             f"packet count {packet_count} exceeds {MAX_PACKET_COUNT}"
         )
+    represented_samples = packet_count * packet_samples
+    if represented_samples > MAX_DURATION_SECONDS * sample_rate:
+        raise ValueError(
+            "represented media duration exceeds "
+            f"{MAX_DURATION_SECONDS} seconds"
+        )
 
     if (
         isinstance(inject_ms, bool)
