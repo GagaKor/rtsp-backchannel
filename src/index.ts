@@ -20,3 +20,14 @@ export {
   pcm16ToG711,
 } from './audio/g711.ts';
 export type { G711Variant } from './audio/g711.ts';
+
+export { discoverDevices } from './onvif/discovery.ts';
+export type {
+  DiscoveredDevice,
+  DiscoveryOptions,
+} from './onvif/discovery.ts';
+export { getStreamUris } from './onvif/streams.ts';
+export type {
+  StreamUri,
+  StreamUriOptions,
+} from './onvif/streams.ts';

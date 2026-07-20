@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "onvif-backchannel"
 version = "0.1.0"
-description = "Play audio through an ONVIF camera RTSP backchannel without GStreamer"
+description = "Discover ONVIF cameras, resolve RTSP streams, and play backchannel audio without GStreamer"
 requires-python = ">=3.11"
 dependencies = []
 

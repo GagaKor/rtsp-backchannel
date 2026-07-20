@@ -1,6 +1,6 @@
 # ONVIF RTSP Audio Backchannel
 
-카메라의 ONVIF RTSP 백채널로 음원 파일을 한 번 전송하고 종료하는 Python/TypeScript/Rust 라이브러리 및 CLI입니다.
+ONVIF 카메라 검색, 프로필별 RTSP URI 조회, RTSP 백채널 음원 재생을 제공하는 Python/TypeScript/Rust 라이브러리 및 CLI입니다.
 GStreamer는 사용하지 않습니다. FFmpeg는 입력 파일을 mono 8kHz PCM으로 디코딩할 때만 사용하고,
 PCMA(A-law) 인코딩과 RTP/RTSP 전송은 각 언어의 코드가 처리합니다.
 
@@ -122,6 +122,96 @@ fn main() -> anyhow::Result<()> {
 
 위 Rust 예제처럼 `anyhow::Result`를 사용하려면 소비자 프로젝트에 `anyhow = "1"`도
 추가합니다.
+
+## ONVIF 장치 검색과 RTSP URI 조회
+
+설치된 세 패키지는 동일한 CLI 명령을 제공합니다. `discover`는 같은 네트워크의 ONVIF
+장치를 WS-Discovery로 찾고, `streams`는 인증 후 모든 Media Profile의 RTSP URI를
+반환합니다. 출력은 결과 하나당 JSON 한 줄입니다.
+
+```bash
+# 같은 서브넷의 ONVIF 장치 검색
+onvif-backchannel discover --timeout-ms 3000
+
+# 여러 NIC/VLAN에서 검색할 때 IPv4 인터페이스를 반복 지정
+onvif-backchannel discover \
+  --interface 10.128.10.20 \
+  --interface 192.168.0.20
+
+# 카메라의 모든 profile token/name/RTSP URI 조회
+ONVIF_PASSWORD='<CAMERA_PASSWORD>' onvif-backchannel streams \
+  --host 10.128.10.141 \
+  --user admin
+```
+
+저장소에서 직접 실행할 때는 언어별로 다음 명령을 사용합니다.
+
+```bash
+# TypeScript
+npm run play -- discover --timeout-ms 3000
+npm run play -- streams --host 10.128.10.141 --user admin --pass '<CAMERA_PASSWORD>'
+
+# Python
+PYTHONPATH=python python3 -m onvif_backchannel.cli discover --timeout-ms 3000
+PYTHONPATH=python python3 -m onvif_backchannel.cli streams \
+  --host 10.128.10.141 --user admin --pass '<CAMERA_PASSWORD>'
+
+# Rust
+cargo run --release --manifest-path rust/Cargo.toml -- discover --timeout-ms 3000
+ONVIF_PASSWORD='<CAMERA_PASSWORD>' cargo run --release \
+  --manifest-path rust/Cargo.toml -- streams --host 10.128.10.141 --user admin
+```
+
+TypeScript 라이브러리 API:
+
+```typescript
+import { discoverDevices, getStreamUris } from 'onvif-backchannel';
+
+const devices = await discoverDevices({ timeoutMs: 3000 });
+const streams = await getStreamUris({
+  host: devices[0].ip,
+  user: 'admin',
+  pass: process.env.ONVIF_PASSWORD ?? '',
+  deviceUrls: devices[0].xaddrs,
+});
+```
+
+Python 라이브러리 API:
+
+```python
+import os
+
+from onvif_backchannel import discover_devices, get_stream_uris
+
+devices = discover_devices(timeout=3.0)
+streams = get_stream_uris(
+    host=devices[0].ip,
+    user="admin",
+    password=os.environ["ONVIF_PASSWORD"],
+    device_urls=devices[0].xaddrs,
+)
+```
+
+Rust 라이브러리 API:
+
+```rust
+use onvif_backchannel::discovery::{DiscoveryOptions, discover_devices};
+use onvif_backchannel::onvif::{StreamUriOptions, get_stream_uris};
+
+let devices = discover_devices(&DiscoveryOptions::default());
+let first = devices.first().ok_or("no ONVIF device")?;
+let mut options = StreamUriOptions::new(
+    first.ip.to_string(),
+    "admin",
+    std::env::var("ONVIF_PASSWORD")?,
+);
+options.device_urls.clone_from(&first.xaddrs);
+let streams = get_stream_uris(&options)?;
+```
+
+RTSP URI는 SOAP 응답값 그대로 반환하며 사용자명이나 비밀번호를 URI에 삽입하지 않습니다.
+RTSP 클라이언트에는 URI와 인증정보를 각각 전달합니다. WS-Discovery multicast는 라우터를
+통과하지 않으므로 카메라와 같은 서브넷/VLAN에 연결된 IPv4 인터페이스에서 실행해야 합니다.
 
 ## Python으로 한 번 재생
 

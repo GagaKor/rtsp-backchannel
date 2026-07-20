@@ -1,5 +1,6 @@
 import importlib
 import io
+import json
 import pathlib
 import tomllib
 import unittest
@@ -13,6 +14,10 @@ class LibraryApiTests(unittest.TestCase):
 
         self.assertTrue(callable(getattr(library, "play_file", None)))
         self.assertIsNotNone(getattr(library, "PlaybackResult", None))
+        self.assertTrue(callable(getattr(library, "discover_devices", None)))
+        self.assertTrue(callable(getattr(library, "get_stream_uris", None)))
+        self.assertIsNotNone(getattr(library, "DiscoveredDevice", None))
+        self.assertIsNotNone(getattr(library, "StreamUri", None))
 
     def test_plays_pcma_in_40ms_packets_and_closes_the_session(self):
         from onvif_backchannel import PlaybackResult, play_file
@@ -157,6 +162,94 @@ class LibraryApiTests(unittest.TestCase):
             volume=0.05,
         )
         self.assertEqual(output.getvalue(), "sent 2 RTP packets\n")
+
+    def test_installed_cli_dispatches_discovery_as_json_lines(self):
+        cli = importlib.import_module("onvif_backchannel.cli")
+        library = importlib.import_module("onvif_backchannel.onvif")
+        device = library.DiscoveredDevice(
+            ip="10.128.10.141",
+            xaddrs=["http://10.128.10.141/onvif/device_service"],
+            scopes=["onvif://www.onvif.org/name/Front%20Door"],
+            name="Front Door",
+            endpoint_reference="urn:uuid:camera-1",
+        )
+
+        with (
+            patch.object(
+                cli, "discover_devices", return_value=[device]
+            ) as discover,
+            redirect_stdout(io.StringIO()) as output,
+        ):
+            cli.main(
+                [
+                    "discover",
+                    "--timeout-ms",
+                    "1500",
+                    "--interface",
+                    "10.0.0.10",
+                    "--interface",
+                    "192.168.0.20",
+                ]
+            )
+
+        discover.assert_called_once_with(
+            timeout=1.5,
+            interfaces=["10.0.0.10", "192.168.0.20"],
+        )
+        self.assertEqual(
+            json.loads(output.getvalue()),
+            {
+                "ip": "10.128.10.141",
+                "xaddrs": ["http://10.128.10.141/onvif/device_service"],
+                "scopes": ["onvif://www.onvif.org/name/Front%20Door"],
+                "name": "Front Door",
+                "endpointReference": "urn:uuid:camera-1",
+            },
+        )
+
+    def test_installed_cli_dispatches_stream_lookup_as_json_lines(self):
+        cli = importlib.import_module("onvif_backchannel.cli")
+        library = importlib.import_module("onvif_backchannel.onvif")
+        stream = library.StreamUri(
+            profile_token="main",
+            profile_name="Main Stream",
+            uri="rtsp://camera/live?channel=1&stream=main",
+        )
+
+        with (
+            patch.object(
+                cli, "get_stream_uris", return_value=[stream]
+            ) as lookup,
+            redirect_stdout(io.StringIO()) as output,
+        ):
+            cli.main(
+                [
+                    "streams",
+                    "--host",
+                    "camera",
+                    "--user",
+                    "admin@example.com",
+                    "--pass",
+                    "p@ss:/?#[]",
+                    "--device-url",
+                    "http://camera/onvif/device_service",
+                ]
+            )
+
+        lookup.assert_called_once_with(
+            host="camera",
+            user="admin@example.com",
+            password="p@ss:/?#[]",
+            device_urls=["http://camera/onvif/device_service"],
+        )
+        self.assertEqual(
+            json.loads(output.getvalue()),
+            {
+                "profileToken": "main",
+                "profileName": "Main Stream",
+                "uri": "rtsp://camera/live?channel=1&stream=main",
+            },
+        )
 
 
 if __name__ == "__main__":

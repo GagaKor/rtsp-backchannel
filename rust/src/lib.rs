@@ -1,6 +1,7 @@
 pub mod audio;
 pub mod backchannel;
 pub mod cli;
+pub mod discovery;
 pub mod onvif;
 pub mod playback;
 pub mod rtp;

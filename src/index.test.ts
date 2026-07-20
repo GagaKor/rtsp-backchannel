@@ -10,6 +10,8 @@ test('exports the supported npm library surface from one entry point', () => {
   assert.equal(typeof library.fileToG711, 'function');
   assert.equal(typeof library.pcm16ToG711, 'function');
   assert.equal(typeof library.linearToALaw, 'function');
+  assert.equal(typeof library.discoverDevices, 'function');
+  assert.equal(typeof library.getStreamUris, 'function');
   assert.equal(library.SAMPLE_RATE, 8000);
   assert.equal(library.PACKET_MS, 40);
 });

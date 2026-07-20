@@ -1,3 +1,5 @@
+use std::ffi::OsString;
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -6,7 +8,8 @@ use clap::Parser;
 #[command(
     name = "onvif-backchannel",
     about = "Play one audio file through an ONVIF RTSP backchannel",
-    after_help = "Profile: PCMA 8kHz mono, TCP interleaved RTP, 40 ms packets, rebase pacing."
+    after_help = "Commands: onvif-backchannel discover; onvif-backchannel streams\n\
+                  Profile: PCMA 8kHz mono, TCP interleaved RTP, 40 ms packets, rebase pacing."
 )]
 pub struct Cli {
     #[arg(long, default_value = "172.168.46.56")]
@@ -28,6 +31,74 @@ pub struct Cli {
 
     #[arg(long, default_value = "0.05", value_parser = parse_volume)]
     pub volume: f64,
+}
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "onvif-backchannel discover",
+    about = "Discover ONVIF devices with WS-Discovery"
+)]
+pub struct DiscoveryCli {
+    #[arg(long, default_value_t = 3000)]
+    pub timeout_ms: u64,
+
+    #[arg(long = "interface")]
+    pub interfaces: Vec<Ipv4Addr>,
+}
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "onvif-backchannel streams",
+    about = "Resolve every ONVIF media profile RTSP URI"
+)]
+pub struct StreamsCli {
+    #[arg(long, default_value = "172.168.46.56")]
+    pub host: String,
+
+    #[arg(long, default_value = "admin")]
+    pub user: String,
+
+    #[arg(
+        long = "pass",
+        env = "ONVIF_PASSWORD",
+        hide_env_values = true,
+        default_value = "CHANGEME"
+    )]
+    pub password: String,
+
+    #[arg(long = "device-url")]
+    pub device_urls: Vec<String>,
+}
+
+#[derive(Debug)]
+pub enum Invocation {
+    Play(Cli),
+    Discover(DiscoveryCli),
+    Streams(StreamsCli),
+}
+
+pub fn parse_invocation_from<I, T>(arguments: I) -> Result<Invocation, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    let arguments: Vec<OsString> = arguments.into_iter().map(Into::into).collect();
+    let program = arguments
+        .first()
+        .cloned()
+        .unwrap_or_else(|| OsString::from("onvif-backchannel"));
+    let command = arguments.get(1).and_then(|value| value.to_str());
+    let delegated = |skip: usize| {
+        std::iter::once(program.clone())
+            .chain(arguments.iter().skip(skip).cloned())
+            .collect::<Vec<_>>()
+    };
+    match command {
+        Some("discover") => DiscoveryCli::try_parse_from(delegated(2)).map(Invocation::Discover),
+        Some("streams") => StreamsCli::try_parse_from(delegated(2)).map(Invocation::Streams),
+        Some("play") => Cli::try_parse_from(delegated(2)).map(Invocation::Play),
+        _ => Cli::try_parse_from(arguments).map(Invocation::Play),
+    }
 }
 
 fn parse_volume(value: &str) -> Result<f64, String> {

@@ -44,6 +44,21 @@ test('parses the validated 0.05 volume default and rejects invalid gain', () => 
   }
 });
 
+test('uses ONVIF_PASSWORD when --pass is omitted', () => {
+  type Parsed = { pass: string };
+  type Parser = (argv: string[]) => Parsed;
+  const parse = (cli as unknown as { parseCliArgs?: Parser }).parseCliArgs;
+  assert.ok(parse);
+  const previous = process.env.ONVIF_PASSWORD;
+  process.env.ONVIF_PASSWORD = 'environment-secret';
+  try {
+    assert.equal(parse(['--file', 'event.mp3']).pass, 'environment-secret');
+  } finally {
+    if (previous === undefined) delete process.env.ONVIF_PASSWORD;
+    else process.env.ONVIF_PASSWORD = previous;
+  }
+});
+
 interface FakeSession {
   variant: 'PCMA';
   payloadType: number;
@@ -189,4 +204,79 @@ test('preserves playback and cleanup errors when both fail', async () => {
       return true;
     },
   );
+});
+
+interface CommandDependencies extends PlaybackDependencies {
+  discoverDevices(options: unknown): Promise<unknown[]>;
+  getStreamUris(options: unknown): Promise<unknown[]>;
+}
+
+type CommandMain = (
+  argv: string[],
+  dependencies: CommandDependencies,
+) => Promise<void>;
+
+function commandMain(): CommandMain {
+  const candidate = (cli as unknown as { main?: CommandMain }).main;
+  assert.ok(candidate);
+  return candidate;
+}
+
+function commandDependencies(logs: string[]): CommandDependencies {
+  return {
+    openBackchannel: async () => {
+      throw new Error('playback should not run');
+    },
+    fileToG711: async () => {
+      throw new Error('playback should not run');
+    },
+    log: (message) => logs.push(message),
+    discoverDevices: async () => [],
+    getStreamUris: async () => [],
+  };
+}
+
+test('dispatches discover and streams commands as JSON Lines', async () => {
+  const logs: string[] = [];
+  const dependencies = commandDependencies(logs);
+  dependencies.discoverDevices = async (options) => {
+    assert.deepEqual(options, {
+      timeoutMs: 1_500,
+      interfaces: ['10.0.0.10', '192.168.0.20'],
+    });
+    return [{ ip: '10.128.10.141', xaddrs: [], scopes: [], name: 'Front Door' }];
+  };
+
+  await commandMain()(
+    ['discover', '--timeout-ms', '1500', '--interface', '10.0.0.10', '--interface', '192.168.0.20'],
+    dependencies,
+  );
+  assert.deepEqual(JSON.parse(logs.pop() ?? ''), {
+    ip: '10.128.10.141',
+    xaddrs: [],
+    scopes: [],
+    name: 'Front Door',
+  });
+
+  dependencies.getStreamUris = async (options) => {
+    assert.deepEqual(options, {
+      host: 'camera',
+      user: 'admin',
+      pass: 'p@ss:/?#[]',
+      deviceUrls: ['http://camera/onvif/device_service'],
+    });
+    return [{ profileToken: 'main', profileName: 'Main', uri: 'rtsp://camera/live' }];
+  };
+  await commandMain()(
+    [
+      'streams', '--host', 'camera', '--user', 'admin', '--pass', 'p@ss:/?#[]',
+      '--device-url', 'http://camera/onvif/device_service',
+    ],
+    dependencies,
+  );
+  assert.deepEqual(JSON.parse(logs.pop() ?? ''), {
+    profileToken: 'main',
+    profileName: 'Main',
+    uri: 'rtsp://camera/live',
+  });
 });

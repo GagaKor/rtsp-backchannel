@@ -1,18 +1,53 @@
 use anyhow::Result;
-use clap::Parser;
 use onvif_backchannel::audio::G711Variant;
-use onvif_backchannel::cli::Cli;
+use onvif_backchannel::cli::{Cli, Invocation, parse_invocation_from};
+use onvif_backchannel::discovery::{DiscoveryOptions, discover_devices};
+use onvif_backchannel::onvif::{StreamUriOptions, get_stream_uris};
 use onvif_backchannel::playback::{PlaybackConfig, play_file};
+use std::time::Duration;
 
 fn main() {
-    if let Err(error) = run() {
-        eprintln!("play error: {error:#}");
+    let invocation = match parse_invocation_from(std::env::args_os()) {
+        Ok(invocation) => invocation,
+        Err(error) => error.exit(),
+    };
+    if let Err(error) = run(invocation) {
+        eprintln!("error: {error:#}");
         std::process::exit(1);
     }
 }
 
-fn run() -> Result<()> {
-    let cli = Cli::parse();
+fn run(invocation: Invocation) -> Result<()> {
+    match invocation {
+        Invocation::Play(cli) => run_playback(cli),
+        Invocation::Discover(cli) => {
+            let devices = discover_devices(&DiscoveryOptions {
+                timeout: Duration::from_millis(cli.timeout_ms),
+                interfaces: cli.interfaces,
+            });
+            for device in devices {
+                println!("{}", serde_json::to_string(&device)?);
+            }
+            Ok(())
+        }
+        Invocation::Streams(cli) => {
+            let streams = get_stream_uris(&StreamUriOptions {
+                host: cli.host,
+                user: cli.user,
+                password: cli.password,
+                device_urls: cli.device_urls,
+                timeout: Duration::from_secs(8),
+            })
+            .map_err(anyhow::Error::msg)?;
+            for stream in streams {
+                println!("{}", serde_json::to_string(&stream)?);
+            }
+            Ok(())
+        }
+    }
+}
+
+fn run_playback(cli: Cli) -> Result<()> {
     println!(
         "# play \"{}\" -> {} speaker (backchannel)",
         cli.file.display(),
