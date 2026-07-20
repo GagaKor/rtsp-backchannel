@@ -18,6 +18,9 @@ const WSU_NS =
   'http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd';
 const PWD_DIGEST =
   'http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest';
+const DEFAULT_TIMEOUT_MS = 8_000;
+const MAX_RESPONSE_HEADER_BYTES = 64 * 1024;
+const MAX_RESPONSE_BODY_BYTES = 1024 * 1024;
 
 function decodeXml(value: string): string {
   return value
@@ -93,8 +96,8 @@ export class OnvifDevice {
 
   constructor(
     private readonly host: string,
-    private readonly user: string,
-    private readonly pass: string,
+    private readonly user = '',
+    private readonly pass = '',
     private readonly opts: OnvifOptions = {},
   ) {}
 
@@ -135,6 +138,7 @@ export class OnvifDevice {
   }
 
   private securityHeader(): string {
+    if (!this.user && !this.pass) return '';
     const nonce = crypto.randomBytes(16);
     const created = this.now().toISOString().replace(/\.\d+Z$/, 'Z');
     const digest = crypto
@@ -158,6 +162,10 @@ export class OnvifDevice {
       `<s:Header>${header}</s:Header><s:Body>${body}</s:Body></s:Envelope>`;
     const u = new URL(url);
     const lib = u.protocol === 'https:' ? https : http;
+    const timeoutMs = this.opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      return Promise.reject(new RangeError('timeoutMs must be finite and greater than 0'));
+    }
     const options: https.RequestOptions = {
       method: 'POST',
       hostname: u.hostname,
@@ -167,26 +175,66 @@ export class OnvifDevice {
         'Content-Type': 'application/soap+xml; charset=utf-8',
         'Content-Length': Buffer.byteLength(envelope),
       },
-      timeout: this.opts.timeoutMs ?? 8000,
+      maxHeaderSize: MAX_RESPONSE_HEADER_BYTES,
       ...(u.protocol === 'https:' ? { rejectUnauthorized: false } : {}),
     };
     return new Promise((resolve, reject) => {
-      const req = lib.request(options, (res) => {
-        const chunks: Buffer[] = [];
-        res.on('data', (c) => chunks.push(c));
-        res.on('end', () => {
-          const text = Buffer.concat(chunks).toString('utf8');
-          // ONVIF returns 200 on success, 4xx (with SOAP Fault) on auth errors.
-          if ((res.statusCode ?? 0) >= 500 && !text.includes('Envelope')) {
-            reject(new Error(`HTTP ${res.statusCode} from ${url}`));
-          } else {
-            resolve(text);
-          }
+      let settled = false;
+      let req: http.ClientRequest | undefined;
+      let res: http.IncomingMessage | undefined;
+      let timer: NodeJS.Timeout | undefined;
+      const settle = (error?: Error, text?: string) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        if (error) {
+          req?.destroy(error);
+          res?.destroy(error);
+          reject(error);
+        } else {
+          resolve(text ?? '');
+        }
+      };
+      timer = setTimeout(() => settle(new Error('request timeout')), timeoutMs);
+
+      try {
+        req = lib.request(options, (response) => {
+          res = response;
+          const chunks: Buffer[] = [];
+          let bodyBytes = 0;
+          response.on('data', (chunk: Buffer | string) => {
+            if (settled) return;
+            const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+            bodyBytes += buffer.length;
+            if (bodyBytes > MAX_RESPONSE_BODY_BYTES) {
+              settle(new Error(`response body exceeds ${MAX_RESPONSE_BODY_BYTES} bytes`));
+              return;
+            }
+            chunks.push(buffer);
+          });
+          response.once('aborted', () =>
+            settle(new Error('response aborted before completion')),
+          );
+          response.once('error', (error) => settle(error));
+          response.once('close', () => {
+            if (!response.complete) settle(new Error('response closed before completion'));
+          });
+          response.once('end', () => {
+            if (settled) return;
+            const text = Buffer.concat(chunks).toString('utf8');
+            // ONVIF returns 200 on success, 4xx (with SOAP Fault) on auth errors.
+            if ((response.statusCode ?? 0) >= 500 && !text.includes('Envelope')) {
+              settle(new Error(`HTTP ${response.statusCode} from ${url}`));
+            } else {
+              settle(undefined, text);
+            }
+          });
         });
-      });
-      req.on('error', reject);
-      req.on('timeout', () => req.destroy(new Error('request timeout')));
-      req.end(envelope);
+        req.once('error', (error) => settle(error));
+        req.end(envelope);
+      } catch (error) {
+        settle(error instanceof Error ? error : new Error(String(error)));
+      }
     });
   }
 

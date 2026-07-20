@@ -6,7 +6,8 @@ Python equivalent of the TS PoC (m3/cli) for cross-verification.
   ONVIF_PASSWORD='<password>' python3 python/onvif_play.py --host camera.local
   ONVIF_PASSWORD='<password>' python3 python/onvif_play.py --file test.mp3 --host camera.local
 """
-import argparse, base64, datetime, hashlib, math, os, pathlib, queue, re, socket, ssl, stat, struct, subprocess, threading, time, urllib.parse, urllib.request
+import argparse, base64, datetime, hashlib, ipaddress, math, os, pathlib, queue, re, socket, ssl, stat, struct, subprocess, threading, time, urllib.parse, urllib.request
+from xml.sax.saxutils import escape, unescape
 
 import backchannel_audio
 from backchannel_rtp import (
@@ -81,7 +82,7 @@ def wsse(user, pw, when):
     c = when.strftime("%Y-%m-%dT%H:%M:%SZ")
     d = base64.b64encode(hashlib.sha1(base64.b64decode(n) + c.encode() + pw.encode()).digest())
     return (f'<wsse:Security xmlns:wsse="{WSSE}" xmlns:wsu="{WSU}"><wsse:UsernameToken>'
-            f'<wsse:Username>{user}</wsse:Username>'
+            f'<wsse:Username>{escape(user)}</wsse:Username>'
             f'<wsse:Password Type="{PDT}">{d.decode()}</wsse:Password>'
             f'<wsse:Nonce>{n.decode()}</wsse:Nonce><wsu:Created>{c}</wsu:Created>'
             f'</wsse:UsernameToken></wsse:Security>')
@@ -90,19 +91,34 @@ def wsse(user, pw, when):
 def onvif_stream_uri(host, user, pw):
     durl = f"http://{host}/onvif/device_service"
     when = dev_time(durl)
-    info = soap(durl, f'<GetDeviceInformation xmlns="{DEV}"/>', wsse(user, pw, when))
+
+    def security_header():
+        return wsse(user, pw, when) if user or pw else ""
+
+    info = soap(
+        durl,
+        f'<GetDeviceInformation xmlns="{DEV}"/>',
+        security_header(),
+    )
     if "GetDeviceInformationResponse" not in info:
         raise RuntimeError("ONVIF 인증 실패: " + (re.search(r"ter:\w+", info) or ["?"])[0])
     model = re.search(r"Model>([^<]+)<", info)
-    cap = soap(durl, f'<GetCapabilities xmlns="{DEV}"><Category>Media</Category></GetCapabilities>', wsse(user, pw, when))
+    cap = soap(
+        durl,
+        f'<GetCapabilities xmlns="{DEV}"><Category>Media</Category></GetCapabilities>',
+        security_header(),
+    )
     m = re.search(r'XAddr>(https?://[^<]*media[^<]*)<', cap)
     murl = m.group(1) if m else f"http://{host}/onvif/media_service"
-    prof = soap(murl, f'<GetProfiles xmlns="{MED}"/>', wsse(user, pw, when))
-    tok = re.search(r'token="([^"]+)"', prof).group(1)
+    prof = soap(murl, f'<GetProfiles xmlns="{MED}"/>', security_header())
+    tok = unescape(
+        re.search(r'token="([^"]+)"', prof).group(1),
+        {"&quot;": '"', "&apos;": "'"},
+    )
     body = (f'<GetStreamUri xmlns="{MED}"><StreamSetup><Stream xmlns="{SCHEMA}">RTP-Unicast</Stream>'
             f'<Transport xmlns="{SCHEMA}"><Protocol>RTSP</Protocol></Transport></StreamSetup>'
-            f'<ProfileToken>{tok}</ProfileToken></GetStreamUri>')
-    su = soap(murl, body, wsse(user, pw, when))
+            f'<ProfileToken>{escape(tok)}</ProfileToken></GetStreamUri>')
+    su = soap(murl, body, security_header())
     uri = re.search(r"<[^>]*Uri>([^<]+)<", su).group(1).replace("&amp;", "&")
     return uri, (model.group(1) if model else "?")
 
@@ -110,6 +126,81 @@ def onvif_stream_uri(host, user, pw):
 # ---------- RTSP ----------
 def md5(s):
     return hashlib.md5(s.encode()).hexdigest()
+
+
+def _validate_rtsp_header_value(name, value, *, error_type=RuntimeError):
+    if any(ord(character) < 0x20 or ord(character) == 0x7f for character in value):
+        raise error_type(f"RTSP {name} contains control characters")
+    return value
+
+
+def _quote_digest_value(name, value):
+    value = _validate_rtsp_header_value(f"Digest {name}", value)
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _parse_digest_challenge(value, previous=None):
+    scheme, separator, parameters = value.strip().partition(" ")
+    if scheme.lower() != "digest" or not separator:
+        return None
+    try:
+        parsed = urllib.request.parse_keqv_list(
+            urllib.request.parse_http_list(parameters)
+        )
+    except (TypeError, ValueError) as error:
+        raise RuntimeError("invalid RTSP Digest challenge") from error
+    parsed = {key.lower(): item for key, item in parsed.items()}
+    realm = parsed.get("realm")
+    nonce = parsed.get("nonce")
+    if realm is None or nonce is None:
+        return None
+    _validate_rtsp_header_value("Digest realm", realm)
+    _validate_rtsp_header_value("Digest nonce", nonce)
+
+    algorithm = parsed.get("algorithm", "MD5")
+    _validate_rtsp_header_value("Digest algorithm", algorithm)
+    if algorithm.lower() != "md5":
+        raise RuntimeError(
+            f"unsupported RTSP Digest algorithm: {algorithm}"
+        )
+
+    raw_qop = parsed.get("qop")
+    qop = None
+    if raw_qop is not None:
+        _validate_rtsp_header_value("Digest qop", raw_qop)
+        qop_options = [item.strip().lower() for item in raw_qop.split(",")]
+        if "auth" not in qop_options:
+            raise RuntimeError(f"unsupported RTSP Digest qop: {raw_qop}")
+        qop = "auth"
+
+    challenge = {
+        "realm": realm,
+        "nonce": nonce,
+        "qop": qop,
+        "nonce_count": 0,
+        "cnonce": None,
+    }
+    opaque = parsed.get("opaque")
+    if opaque is not None:
+        _validate_rtsp_header_value("Digest opaque", opaque)
+        challenge["opaque"] = opaque
+    if qop == "auth":
+        if (
+            previous
+            and previous.get("nonce") == nonce
+            and previous.get("qop") == "auth"
+        ):
+            challenge["nonce_count"] = previous["nonce_count"]
+            challenge["cnonce"] = previous["cnonce"]
+        else:
+            challenge["cnonce"] = os.urandom(8).hex()
+    return challenge
+
+
+def _parse_auth_challenge(value, previous=None):
+    if re.match(r"^\s*Basic(?:\s|$)", value, re.IGNORECASE):
+        return {"scheme": "basic"}
+    return _parse_digest_challenge(value, previous)
 
 
 class RtspStreamParser:
@@ -199,6 +290,12 @@ class RtspStreamParser:
 
 class Rtsp:
     def __init__(self, host, port, user, pw):
+        _validate_rtsp_header_value(
+            "username", user, error_type=ValueError
+        )
+        _validate_rtsp_header_value(
+            "password", pw, error_type=ValueError
+        )
         self.user, self.pw = user, pw
         self.s = socket.create_connection(
             (host, port), timeout=RTSP_IO_TIMEOUT_SECONDS
@@ -221,13 +318,43 @@ class Rtsp:
         c = self.challenge
         if not c:
             return None
+        if c.get("scheme") == "basic":
+            credentials = base64.b64encode(
+                f"{self.user}:{self.pw}".encode()
+            ).decode("ascii")
+            return f"Basic {credentials}"
+        username = _quote_digest_value("username", self.user)
+        realm = _quote_digest_value("realm", c["realm"])
+        nonce = _quote_digest_value("nonce", c["nonce"])
+        quoted_uri = _quote_digest_value("uri", uri)
+        opaque = ""
+        if c.get("opaque") is not None:
+            quoted_opaque = _quote_digest_value("opaque", c["opaque"])
+            opaque = f', opaque="{quoted_opaque}"'
         ha1 = md5(f"{self.user}:{c['realm']}:{self.pw}")
         ha2 = md5(f"{method}:{uri}")
+        if c["qop"] == "auth":
+            if c["nonce_count"] >= 0xffffffff:
+                raise RuntimeError("RTSP Digest nonce count exhausted")
+            c["nonce_count"] += 1
+            nonce_count = f'{c["nonce_count"]:08x}'
+            cnonce = c["cnonce"]
+            resp = md5(
+                f"{ha1}:{c['nonce']}:{nonce_count}:{cnonce}:auth:{ha2}"
+            )
+            return (
+                f'Digest username="{username}", realm="{realm}", '
+                f'nonce="{nonce}", uri="{quoted_uri}", response="{resp}", '
+                f'qop=auth, nc={nonce_count}, cnonce="{cnonce}"{opaque}'
+            )
         resp = md5(f"{ha1}:{c['nonce']}:{ha2}")
-        return (f'Digest username="{self.user}", realm="{c["realm"]}", '
-                f'nonce="{c["nonce"]}", uri="{uri}", response="{resp}"')
+        return (
+            f'Digest username="{username}", realm="{realm}", '
+            f'nonce="{nonce}", uri="{quoted_uri}", response="{resp}"{opaque}'
+        )
 
     def _send(self, method, uri, extra, deadline):
+        uri = _sanitize_rtsp_uri(uri)
         self._raise_reader_failure()
         self.cseq += 1
         expected_cseq = self.cseq
@@ -271,16 +398,17 @@ class Rtsp:
                 prefix="RTSP reader socket close failure",
             )
 
-    def _fail_reader(self, error):
+    def _fail_reader(self, error, *, preserve_responses=False):
         if self.reader_failure is None:
             self.reader_failure = error
         else:
             error = self.reader_failure
-        while True:
-            try:
-                self.responses.get_nowait()
-            except queue.Empty:
-                break
+        if not preserve_responses:
+            while True:
+                try:
+                    self.responses.get_nowait()
+                except queue.Empty:
+                    break
         try:
             self.responses.put_nowait(error)
         except queue.Full:
@@ -307,7 +435,12 @@ class Rtsp:
                 except socket.timeout:
                     continue
                 if not chunk:
-                    break
+                    if not self.closed:
+                        self._fail_reader(
+                            ConnectionError("RTSP connection closed by peer"),
+                            preserve_responses=True,
+                        )
+                    return
                 for response in parser.feed(chunk):
                     if not self._enqueue_response(response):
                         return
@@ -322,15 +455,20 @@ class Rtsp:
             deadline = self.monotonic() + self.response_timeout_seconds
         expected_text = str(expected_cseq)
         while True:
-            self._raise_reader_failure()
             remaining = deadline - self.monotonic()
             if remaining <= 0:
                 raise TimeoutError("RTSP response timeout")
-            try:
-                result = self.responses.get(timeout=remaining)
-            except queue.Empty as exc:
-                self._raise_reader_failure()
-                raise TimeoutError("RTSP response timeout") from exc
+            if self.reader_failure is not None:
+                try:
+                    result = self.responses.get_nowait()
+                except queue.Empty:
+                    self._raise_reader_failure()
+            else:
+                try:
+                    result = self.responses.get(timeout=remaining)
+                except queue.Empty as exc:
+                    self._raise_reader_failure()
+                    raise TimeoutError("RTSP response timeout") from exc
             if isinstance(result, Exception):
                 raise result
             _, headers, _ = result
@@ -365,14 +503,11 @@ class Rtsp:
         with self.request_lock:
             st, h, b = self._send(method, uri, extra or {}, deadline)
             if st == 401 and "www-authenticate" in h:
-                wa = h["www-authenticate"]
-                realm = re.search(r'realm="([^"]*)"', wa)
-                nonce = re.search(r'nonce="([^"]*)"', wa)
-                if realm and nonce:
-                    self.challenge = {
-                        "realm": realm.group(1),
-                        "nonce": nonce.group(1),
-                    }
+                challenge = _parse_auth_challenge(
+                    h["www-authenticate"], self.challenge
+                )
+                if challenge:
+                    self.challenge = challenge
                     st, h, b = self._send(
                         method, uri, extra or {}, deadline
                     )
@@ -426,9 +561,34 @@ def track_control(track):
 
 
 def resolve_track_uri(base_uri, content_base, control):
-    if control.startswith("rtsp://"):
-        return control
-    return (content_base or base_uri).rstrip("/") + "/" + control
+    try:
+        control_parts = urllib.parse.urlsplit(control)
+    except ValueError as error:
+        raise ValueError("invalid RTSP control URI") from error
+    if control_parts.scheme.lower() == "rtsp":
+        return _sanitize_rtsp_uri(control)
+
+    base = _sanitize_rtsp_uri(content_base or base_uri)
+    resolution_base = base
+    is_relative_path = (
+        not control_parts.scheme and not control.startswith(("/", "?", "#"))
+    )
+    if not content_base and is_relative_path:
+        base_parts = urllib.parse.urlsplit(base)
+        path = base_parts.path
+        if not path.endswith("/"):
+            path += "/"
+        resolution_base = urllib.parse.urlunsplit(
+            (
+                base_parts.scheme,
+                base_parts.netloc,
+                path,
+                base_parts.query,
+                "",
+            )
+        )
+    resolved = urllib.parse.urljoin(resolution_base, control)
+    return _sanitize_rtsp_uri(resolved)
 
 
 def rtp_info_for_track(header, control):
@@ -723,22 +883,72 @@ def _require_rtsp_success(method, status):
         raise RuntimeError(f"{method} failed with RTSP status {status}")
 
 
+def _sanitize_rtsp_uri(uri):
+    _validate_rtsp_header_value("URI", uri, error_type=ValueError)
+    try:
+        parsed = urllib.parse.urlsplit(uri)
+        hostname = parsed.hostname
+        port = parsed.port
+    except (TypeError, ValueError) as error:
+        raise ValueError("invalid RTSP stream URI") from error
+    if parsed.scheme.lower() == "rtsp":
+        if not hostname or port == 0:
+            raise ValueError("invalid RTSP stream URI")
+        if ":" in hostname:
+            hostname = f"[{hostname}]"
+        netloc = hostname
+        if port is not None:
+            netloc += f":{port}"
+    else:
+        netloc = parsed.netloc
+    return urllib.parse.urlunsplit(
+        (parsed.scheme, netloc, parsed.path, parsed.query, "")
+    )
+
+
 def redact_rtsp_uri(uri):
-    """Remove userinfo and query data before displaying an RTSP endpoint."""
-    parsed = urllib.parse.urlsplit(uri)
-    hostname = parsed.hostname or ""
-    if ":" in hostname:
-        hostname = f"[{hostname}]"
-    netloc = hostname
-    if parsed.port is not None:
-        netloc += f":{parsed.port}"
-    return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+    """Remove userinfo, query data, and fragments before displaying a URI."""
+    parsed = urllib.parse.urlsplit(_sanitize_rtsp_uri(uri))
+    netloc = parsed.netloc.rsplit("@", 1)[-1]
+    return urllib.parse.urlunsplit(
+        (parsed.scheme, netloc, parsed.path, "", "")
+    )
+
+
+def _rtsp_target(uri, user, password):
+    try:
+        parsed = urllib.parse.urlsplit(uri)
+        if parsed.scheme.lower() != "rtsp" or not parsed.hostname:
+            raise ValueError("invalid RTSP stream URI")
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError("invalid RTSP stream URI") from error
+    if port == 0:
+        raise ValueError("invalid RTSP stream URI")
+
+    hostname = parsed.hostname
+    stream_uri = _sanitize_rtsp_uri(uri)
+    url_user = urllib.parse.unquote(parsed.username or "")
+    url_password = urllib.parse.unquote(parsed.password or "")
+    _validate_rtsp_header_value(
+        "username", url_user, error_type=ValueError
+    )
+    _validate_rtsp_header_value(
+        "password", url_password, error_type=ValueError
+    )
+    return (
+        stream_uri,
+        hostname,
+        port or 554,
+        user if user else url_user,
+        password if password else url_password,
+    )
 
 
 def open_backchannel_transport(
     host,
-    user,
-    password,
+    user="",
+    password="",
     *,
     transport="tcp",
     stream_uri=None,
@@ -754,18 +964,35 @@ def open_backchannel_transport(
     """Open and PLAY an ONVIF backchannel, returning a closable RTP transport."""
     if transport not in {"tcp", "udp"}:
         raise ValueError(f"unsupported backchannel transport: {transport}")
-    if stream_uri is None:
+    if stream_uri is None and urllib.parse.urlsplit(host).scheme.lower() == "rtsp":
+        stream_uri = host
+        model = None
+    elif stream_uri is None:
         resolver = onvif_uri_resolver or onvif_stream_uri
         stream_uri, model = resolver(host, user, password)
     else:
         model = None
 
-    parsed_uri = urllib.parse.urlsplit(stream_uri)
-    if parsed_uri.scheme.lower() != "rtsp" or not parsed_uri.hostname:
-        raise ValueError("ONVIF returned an invalid RTSP stream URI")
-    camera_host = parsed_uri.hostname
-    camera_port = parsed_uri.port or 554
-    rtsp = (rtsp_factory or Rtsp)(camera_host, camera_port, user, password)
+    (
+        stream_uri,
+        camera_host,
+        camera_port,
+        rtsp_user,
+        rtsp_password,
+    ) = _rtsp_target(stream_uri, user, password)
+    if transport == "udp":
+        try:
+            is_ipv6 = ipaddress.ip_address(camera_host).version == 6
+        except ValueError:
+            is_ipv6 = ":" in camera_host
+        if is_ipv6:
+            raise ValueError("IPv6 UDP backchannel is not supported")
+    rtsp = (rtsp_factory or Rtsp)(
+        camera_host,
+        camera_port,
+        rtsp_user,
+        rtsp_password,
+    )
     result = BackchannelTransport(
         stream_uri,
         rtsp,
@@ -793,7 +1020,7 @@ def open_backchannel_transport(
             "Require": BACKCHANNEL,
         })
         _require_rtsp_success("DESCRIBE", status)
-        result.describe_headers = describe_headers
+        result.describe_headers = dict(describe_headers)
         result.sdp = sdp
 
         tracks = sdp_tracks(sdp)
@@ -806,9 +1033,21 @@ def open_backchannel_transport(
         send_control = track_control(send_track)
         if send_control is None:
             raise RuntimeError("backchannel track has no control URI")
+        try:
+            send_control_parts = urllib.parse.urlsplit(send_control)
+        except ValueError as error:
+            raise ValueError("invalid RTSP control URI") from error
+        safe_send_control = (
+            _sanitize_rtsp_uri(send_control)
+            if send_control_parts.scheme.lower() == "rtsp"
+            else send_control
+        )
         result.send_track = send_track
-        result.send_control = send_control
+        result.send_control = safe_send_control
         content_base = describe_headers.get("content-base")
+        if content_base:
+            content_base = _sanitize_rtsp_uri(content_base)
+            result.describe_headers["content-base"] = content_base
 
         if transport == "tcp":
             requested_channel = 0
@@ -832,7 +1071,7 @@ def open_backchannel_transport(
                 status, setup_headers, _ = rtsp.request(
                     "SETUP", receive_uri, headers
                 )
-                _require_rtsp_success(f"SETUP({receive_control})", status)
+                _require_rtsp_success("SETUP(receive track)", status)
                 result.update_session(setup_headers.get("session", ""))
                 requested_channel += 2
 
@@ -981,24 +1220,38 @@ def tone_audio(freq, ms, codec, amp=0.7, rate=8000):
     return bytes(enc(int(amp * 32767 * math.sin(2 * math.pi * freq * i / rate))) for i in range(n))
 
 
+def _bounded_file_audio_output(codec, payload):
+    if len(payload) > MAX_AUDIO_SOURCE_BYTES:
+        raise ValueError(
+            f"{codec.upper()} encoded output exceeds "
+            f"{MAX_AUDIO_SOURCE_BYTES} byte limit"
+        )
+    return payload
+
+
 def file_audio(path, codec, volume, sample_rate, encoder="python-alaw"):
     if codec == "pcma":
         decoded = backchannel_audio.decode_source(path, sample_rate)
         if encoder == "ffmpeg":
-            return backchannel_audio.encode_pcma_ffmpeg(
+            payload = backchannel_audio.encode_pcma_ffmpeg(
                 decoded, volume, sample_rate
             )
-        if encoder == "python-alaw":
-            return backchannel_audio.encode_pcma_gst_compatible(decoded, volume)
-        raise ValueError(f"unsupported PCMA encoder: {encoder}")
+        elif encoder == "python-alaw":
+            payload = backchannel_audio.encode_pcma_gst_compatible(
+                decoded, volume
+            )
+        else:
+            raise ValueError(f"unsupported PCMA encoder: {encoder}")
+        return _bounded_file_audio_output(codec, payload)
     fmt = CODECS[codec][1]
     p = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", path,
                         "-af", f"volume={volume}", "-ar", str(sample_rate), "-ac", "1",
                         "-fs", str(MAX_AUDIO_SOURCE_BYTES + 1),
-                        "-f", fmt, "-"], capture_output=True)
+                        "-f", fmt, "-"], capture_output=True,
+                        timeout=backchannel_audio.FFMPEG_TIMEOUT_SECONDS)
     if p.returncode != 0:
         raise RuntimeError("ffmpeg: " + p.stderr.decode().strip())
-    return p.stdout
+    return _bounded_file_audio_output(codec, p.stdout)
 
 
 def parse_adts_frames(data, max_frames=None):
@@ -1020,6 +1273,10 @@ def parse_adts_frames(data, max_frames=None):
         header_length = 7 if protection_absent else 9
         if frame_length < header_length or offset + frame_length > len(data):
             raise RuntimeError(f"truncated ADTS frame at byte {offset}")
+        if data[offset + 6] & 0x03:
+            raise RuntimeError(
+                f"unsupported ADTS raw_data_blocks at byte {offset}"
+            )
         if len(frames) >= max_frames:
             raise ValueError(
                 f"AAC source frame count exceeds {max_frames} frame limit"
@@ -1046,7 +1303,7 @@ def file_aac(
         "-c:a", "aac", "-profile:a", "aac_low", "-b:a", f"{bitrate_kbps}k",
         "-fs", str(MAX_AUDIO_SOURCE_BYTES + 1),
         "-f", "adts", "-",
-    ], capture_output=True)
+    ], capture_output=True, timeout=backchannel_audio.FFMPEG_TIMEOUT_SECONDS)
     if p.returncode != 0:
         raise RuntimeError("ffmpeg AAC: " + p.stderr.decode().strip())
     if len(p.stdout) > MAX_AUDIO_SOURCE_BYTES:
@@ -1055,6 +1312,50 @@ def file_aac(
             f"{MAX_AUDIO_SOURCE_BYTES} byte limit"
         )
     return parse_adts_frames(p.stdout, max_frames=max_frames)
+
+
+def file_g726(path, volume, sample_rate, code_size):
+    if sample_rate != 8000:
+        raise ValueError("G.726 requires an 8000 Hz sample rate")
+    if isinstance(code_size, bool) or code_size not in {2, 3, 4, 5}:
+        raise ValueError("G.726 code_size must be 2, 3, 4, or 5")
+
+    decoded = backchannel_audio.decode_source(path, sample_rate)
+    pcm = backchannel_audio.apply_q11_volume_s16le(decoded, volume)
+    sample_count = len(pcm) // 2
+    padded_sample_count = (sample_count + 7) // 8 * 8
+    if padded_sample_count > sample_count:
+        pcm += b"\x00\x00" * (padded_sample_count - sample_count)
+
+    command = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-f", "s16le", "-ar", str(sample_rate), "-ac", "1", "-i", "-",
+        "-c:a", "g726le", "-code_size", str(code_size),
+        "-fs", str(MAX_AUDIO_SOURCE_BYTES + 1),
+        "-f", "g726le", "-",
+    ]
+    process = subprocess.run(
+        command,
+        input=pcm,
+        capture_output=True,
+        timeout=backchannel_audio.FFMPEG_TIMEOUT_SECONDS,
+    )
+    if process.returncode != 0:
+        raise RuntimeError(
+            "ffmpeg G.726: " + process.stderr.decode("utf-8", "replace").strip()
+        )
+    if len(process.stdout) > MAX_AUDIO_SOURCE_BYTES:
+        raise ValueError(
+            "G.726 encoded output exceeds "
+            f"{MAX_AUDIO_SOURCE_BYTES} byte limit"
+        )
+    expected_size = padded_sample_count * code_size // 8
+    if len(process.stdout) != expected_size:
+        raise RuntimeError(
+            "ffmpeg G.726 returned an unexpected payload size: "
+            f"expected {expected_size}, got {len(process.stdout)}"
+        )
+    return process.stdout
 
 
 def aac_rfc3640_payload(frame):
@@ -1313,8 +1614,8 @@ def preroll_sample_count(sample_rate, preroll_ms):
 def build_argument_parser():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host")
-    ap.add_argument("--user", default="admin")
-    ap.add_argument("--pass", dest="pw", default=os.environ.get("ONVIF_PASSWORD"))
+    ap.add_argument("--user", default="")
+    ap.add_argument("--pass", dest="pw", default=os.environ.get("ONVIF_PASSWORD", ""))
     input_group = ap.add_mutually_exclusive_group()
     input_group.add_argument("--file")
     input_group.add_argument("--pcma-input", type=pathlib.Path)
@@ -1462,9 +1763,6 @@ def main(argv=None):
 
     if not a.host:
         ap.error("--host is required")
-    if not a.pw:
-        ap.error("--pass is required or set ONVIF_PASSWORD")
-
     payload, aac_frames, audio_message = prepare_audio(a)
     if a.codec == "aac" and len(aac_frames) > MAX_AUDIO_SOURCE_FRAMES:
         ap.error(
@@ -1528,8 +1826,16 @@ def main(argv=None):
                 f"--timing-log packet count {timing_packet_count} exceeds "
                 f"{MAX_TIMING_ROWS:,} row limit"
             )
-    print(f"# Python ONVIF 백채널 송출 @ {a.host}")
-    uri, model = onvif_stream_uri(a.host, a.user, a.pw)
+    try:
+        direct_rtsp = urllib.parse.urlsplit(a.host).scheme.lower() == "rtsp"
+    except ValueError:
+        direct_rtsp = False
+    display_host = redact_rtsp_uri(a.host)
+    print(f"# Python ONVIF 백채널 송출 @ {display_host}")
+    if direct_rtsp:
+        uri, model = a.host, None
+    else:
+        uri, model = onvif_stream_uri(a.host, a.user, a.pw)
     print(f"  ✓ ONVIF OK ({model})  stream={redact_rtsp_uri(uri)}")
 
     backchannel = open_backchannel_transport(

@@ -4,8 +4,8 @@
 [한국어](https://github.com/GagaKor/rtsp-backchannel/blob/master/python/README.ko.md)
 
 Python library and CLI for discovering ONVIF cameras, resolving profile RTSP
-URIs, and playing one audio file through an ONVIF RTSP backchannel. GStreamer
-is not required.
+URIs, and playing one audio file through an ONVIF RTSP backchannel. FFmpeg is
+required only for file playback; GStreamer is not used.
 
 Other implementations:
 
@@ -14,14 +14,14 @@ Other implementations:
 
 The package starts a backchannel session, sends the complete file at real-time
 speed, and closes the session. It calls a separately installed `ffmpeg`
-executable to decode input audio. PCMA encoding and RTP/RTSP transport are
-implemented in Python. FFmpeg is not bundled or installed by this package.
+executable to decode input audio. Audio codec handling and RTP/RTSP transport
+are implemented in Python. FFmpeg is not bundled or installed by this package.
 
 ## Requirements
 
 - Python 3.11 or later
 - `ffmpeg` on `PATH` for file playback
-- A camera that exposes an ONVIF `sendonly` PCMA audio backchannel
+- A camera that exposes an ONVIF `sendonly` audio backchannel
 
 Discovery and stream URI lookup do not require FFmpeg.
 
@@ -30,7 +30,7 @@ Discovery and stream URI lookup do not require FFmpeg.
 Install a released version from PyPI:
 
 ```bash
-python3 -m pip install rtsp-backchannel
+python3 -m pip install 'rtsp-backchannel>=0.2,<0.3'
 ```
 
 To install the current `master` source instead of a registry release:
@@ -64,8 +64,8 @@ from rtsp_backchannel import play_file
 
 result = play_file(
     host="camera.local",
-    user="admin",
-    password=os.environ["ONVIF_PASSWORD"],
+    user="",
+    password="",
     file="/absolute/path/to/event.mp3",
     volume=0.05,
 )
@@ -129,17 +129,39 @@ discover_devices(
     *,
     timeout: float = 3.0,
     interfaces: list[str] | None = None,
+    cidrs: list[str] | None = None,
+    ports: list[int] | None = None,
+    concurrency: int = 64,
 ) -> list[DiscoveredDevice]
 ```
 
-Searches selected local IPv4 interfaces with WS-Discovery. Omitting
-`interfaces` uses addresses detected from hostname resolution and the default
-route. Pass every local IPv4 address explicitly when multiple NICs or VLANs
-must be covered. Each result contains `ip`, `xaddrs`, `scopes`, and optional
-`name`, `hardware`, and `endpoint_reference` fields.
+Without `cidrs`, this searches local IPv4 interfaces with WS-Discovery.
+Omitting `interfaces` uses addresses detected from hostname resolution and the
+default route. `interfaces` contains local addresses of this computer, not
+camera addresses.
 
-WS-Discovery multicast is normally not routed, so discovery must run from the
-same subnet or VLAN as the camera.
+Pass IPv4 CIDRs and individual IPv4 addresses in one array to actively search
+every selected target. Overlapping hosts are probed once:
+
+```python
+devices = discover_devices(
+    cidrs=["10.0.0.0/24", "10.128.0.10"],
+    timeout=1.0,
+    ports=[80, 8000, 443],
+    concurrency=64,
+)
+```
+
+CIDR mode sends the unauthenticated ONVIF `GetSystemDateAndTime` request to
+`/onvif/device_service`. Port `443` uses HTTPS with self-signed certificates
+accepted; other ports use HTTP. The default ports are `80`, `8000`, and `443`.
+A maximum of 4,096 unique usable IPv4 hosts can be searched per call.
+`interfaces` and `cidrs` cannot be combined.
+
+Each result contains `ip`, `xaddrs`, `scopes`, and optional `name`, `hardware`,
+and `endpoint_reference` fields. Active CIDR results have successful service
+URLs in `xaddrs`, but discovery metadata is normally empty. The networks must
+be routable and firewalls must allow the selected ONVIF ports.
 
 ### `get_stream_uris`
 
@@ -168,6 +190,7 @@ play_file(
     password: str,
     file: str,
     volume: float = 0.05,
+    codec: str = "auto",
 ) -> PlaybackResult
 ```
 
@@ -175,6 +198,33 @@ play_file(
 `encoded_bytes`, `packets_sent`, and `duration_seconds`. Invalid arguments,
 authentication failures, network failures, and unsupported camera SDP are
 reported as exceptions.
+
+Empty credentials omit ONVIF WS-Security and RTSP authentication. Non-empty
+ONVIF credentials use PasswordDigest; RTSP credentials are sent after a server
+challenge. WS-Security digest is authentication, not transport encryption.
+HTTP and HTTPS, including self-signed TLS compatibility, are supported; use a
+trusted network or VPN.
+
+The default `codec="auto"` negotiates SDP in this order: PCMA, PCMU, G726-32,
+G726-24, G726-16, G726-40, AAC. The implementation supports G711, RFC3551
+G726, and RFC 3640 MPEG4-GENERIC AAC-hbr. MP4A-LATM is explicitly unsupported.
+An explicit codec request does not fall back to another codec.
+
+ONVIF can be bypassed with a direct RTSP target:
+
+```python
+result = play_file(
+    host="rtsp://admin:p%40ss@camera.local/backchannel",
+    user="",
+    password="",
+    file="/absolute/path/to/event.mp3",
+    codec="auto",
+)
+```
+
+Embedded credentials are parsed automatically; explicit non-empty arguments
+override them. Prefer `%40` for `@` in a password. Raw `@` uses the final
+authority separator. Request URIs and logs strip credentials.
 
 ## CLI
 
@@ -198,6 +248,15 @@ rtsp-backchannel discover \
   --interface 192.0.2.20 \
   --interface 198.51.100.20
 
+# Search every host in a CIDR plus one specific IP.
+rtsp-backchannel discover \
+  --cidr 10.0.0.0/24 \
+  --cidr 10.128.0.10 \
+  --timeout-ms 1000 \
+  --port 80 \
+  --port 8000 \
+  --concurrency 64
+
 # Resolve RTSP URIs for all ONVIF Media Profiles.
 rtsp-backchannel streams \
   --host camera.local \
@@ -207,23 +266,34 @@ rtsp-backchannel streams \
 rtsp-backchannel play \
   --host camera.local \
   --user admin \
+  --pass "$ONVIF_PASSWORD" \
   --file '/absolute/path/to/event.mp3' \
-  --volume 0.05
+  --volume 0.05 \
+  --codec auto
+
+# No ONVIF or RTSP credentials.
+rtsp-backchannel play --host camera.local --file '/absolute/path/to/event.mp3'
+
+# Direct RTSP bypasses ONVIF.
+rtsp-backchannel play --host 'rtsp://admin:p%40ss@camera.local/backchannel' \
+  --file '/absolute/path/to/event.mp3'
 ```
 
-The `play` word is optional for backward compatibility. `--pass` is available
-for manual use, but `ONVIF_PASSWORD` avoids exposing the password in the
-process argument list.
+The `play` word is optional for backward compatibility. Python's CLI defaults
+`--user` and `--pass` to empty strings; pass `--pass` explicitly when the
+camera requires credentials.
 
 ## Playback Behavior
 
-- PCMA (G.711 A-law) at 8 kHz mono
+- SDP auto negotiation: PCMA, PCMU, G726-32, G726-24, G726-16, G726-40, AAC
+- Supports G711, RFC3551 G726, and RFC 3640 MPEG4-GENERIC AAC-hbr
+- MP4A-LATM is explicitly unsupported
 - TCP interleaved RTP
 - 40 ms audio packets with real-time pacing
 - RTSP keepalive during long files
 - RTSP teardown after success or failure
 
-The first ONVIF Media Profile must expose a `sendonly` PCMA audio track. Audio
+The first ONVIF Media Profile must expose a `sendonly` supported audio track. Audio
 output and decoder configuration are camera-specific; a successful RTSP
 session does not override disabled or misrouted camera audio output settings.
 

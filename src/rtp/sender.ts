@@ -9,6 +9,11 @@ export interface RtpPacketizerOptions {
   timestampStart?: number;
 }
 
+export interface RtpPacketOptions {
+  /** Override the talkspurt marker default for this packet. */
+  marker?: boolean;
+}
+
 export class RtpPacketizer {
   private seq: number;
   private timestamp: number;
@@ -24,12 +29,17 @@ export class RtpPacketizer {
   /**
    * Build one RTP packet. `samples` is the number of audio samples this payload
    * represents (e.g. 160 for a 20 ms G.711 frame at 8 kHz) and advances the
-   * RTP timestamp.
+  * RTP timestamp.
    */
-  build(payload: Buffer, samples: number): Buffer {
+  build(payload: Buffer, samples: number, packet: RtpPacketOptions = {}): Buffer {
+    if (!Number.isInteger(samples) || samples <= 0) {
+      throw new RangeError('RTP sample ticks must be a positive integer');
+    }
+
     const header = Buffer.alloc(12);
     header[0] = 0x80; // version 2, no padding/extension/CSRC
-    header[1] = (this.firstPacket ? 0x80 : 0x00) | (this.opts.payloadType & 0x7f); // marker on first
+    const marker = packet.marker ?? this.firstPacket;
+    header[1] = (marker ? 0x80 : 0x00) | (this.opts.payloadType & 0x7f);
     header.writeUInt16BE(this.seq & 0xffff, 2);
     header.writeUInt32BE(this.timestamp >>> 0, 4);
     header.writeUInt32BE(this.ssrc >>> 0, 8);

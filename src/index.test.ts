@@ -1,19 +1,59 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 
 import * as library from './index.ts';
+import type {
+  AdtsFrame,
+  AudioCodecName,
+  BackchannelOptions,
+  CodecPreference,
+  EncodedAudio,
+  EncodedAudioFrame,
+  SendCodec,
+} from './index.ts';
 
 test('exports the supported npm library surface from one entry point', () => {
   assert.equal(typeof library.playFile, 'function');
   assert.equal(typeof library.openBackchannel, 'function');
   assert.equal(typeof library.fileToG711, 'function');
+  assert.equal(typeof library.fileToRtpAudio, 'function');
+  assert.equal(typeof library.parseAdtsFrames, 'function');
+  assert.equal(typeof library.aacRfc3640Payload, 'function');
+  assert.equal(typeof library.sendPacedFrames, 'function');
   assert.equal(typeof library.pcm16ToG711, 'function');
   assert.equal(typeof library.linearToALaw, 'function');
   assert.equal(typeof library.discoverDevices, 'function');
   assert.equal(typeof library.getStreamUris, 'function');
   assert.equal(library.SAMPLE_RATE, 8000);
   assert.equal(library.PACKET_MS, 40);
+});
+
+test('exports the codec-neutral public API types', () => {
+  const name: AudioCodecName = 'pcma';
+  const preference: CodecPreference = name;
+  const codec: SendCodec = {
+    name,
+    payloadType: 8,
+    encoding: 'PCMA',
+    clockRate: 8000,
+  };
+  const frame: EncodedAudioFrame = { payload: Buffer.alloc(320), samples: 320 };
+  const adtsFrame: AdtsFrame = { ...frame, sampleRate: 8000, channels: 1 };
+  const audio: EncodedAudio = {
+    codec: name,
+    clockRate: codec.clockRate,
+    frames: [frame],
+    byteLength: frame.payload.length,
+    sampleCount: frame.samples,
+  };
+  const options: BackchannelOptions = { codec: preference };
+
+  assert.deepEqual(
+    [audio.codec, adtsFrame.sampleRate, options.codec],
+    ['pcma', 8000, 'pcma'],
+  );
 });
 
 test('declares an installable npm package with ESM types and CLI exports', () => {
@@ -71,4 +111,22 @@ test('ships separate English and Korean TypeScript documentation', () => {
   assert.match(korean, /TypeScript/);
   assert.match(korean, /README\.md/);
   assert.doesNotMatch(korean, /```(?:python|rust)/);
+  for (const readme of [english, korean]) {
+    assert.match(readme, /cidrs/);
+    assert.match(readme, /10\.0\.0\.0\/24/);
+    assert.match(readme, /10\.128\.0\.10/);
+    assert.match(readme, /--cidr/);
+  }
+});
+
+test('ships a discovery declaration without test dependency injection', () => {
+  const build = spawnSync('npm', ['run', 'build'], { encoding: 'utf8' });
+  assert.equal(build.status, 0, build.stderr || build.stdout);
+
+  const declaration = readFileSync('dist/onvif/discovery.d.ts', 'utf8');
+  assert.doesNotMatch(declaration, /DiscoveryDependencies/);
+  assert.match(
+    declaration,
+    /discoverDevices\(options\?: DiscoveryOptions\): Promise<DiscoveredDevice\[\]>/,
+  );
 });

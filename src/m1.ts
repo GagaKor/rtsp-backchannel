@@ -7,6 +7,11 @@
 import { OnvifDevice } from './onvif/deviceClient.ts';
 import { RtspClient } from './rtsp/backchannelClient.ts';
 import { parseSdp, findBackchannelAudio, pickSendCodec } from './rtsp/sdp.ts';
+import {
+  displayRtspTarget,
+  parseRtspTarget,
+  redactRtspCredentials,
+} from './backchannel.ts';
 
 function arg(name: string, def?: string): string {
   const i = process.argv.indexOf(`--${name}`);
@@ -15,18 +20,12 @@ function arg(name: string, def?: string): string {
   throw new Error(`missing --${name}`);
 }
 
-function rtspParts(uri: string): { host: string; port: number; path: string } {
-  const m = /^rtsp:\/\/(?:[^@/]+@)?([^:/]+)(?::(\d+))?(\/.*)?$/.exec(uri);
-  if (!m) throw new Error(`bad RTSP uri: ${uri}`);
-  return { host: m[1], port: Number(m[2] ?? 554), path: m[3] ?? '/' };
-}
-
 async function main(): Promise<void> {
   const host = arg('host');
   const user = arg('user', 'admin');
   const pass = arg('pass', process.env.ONVIF_PASSWORD);
 
-  console.log(`# M1 — ONVIF backchannel probe @ ${host} (${user})`);
+  console.log(`# M1 — ONVIF backchannel probe @ ${displayRtspTarget(host)} (${user})`);
 
   const dev = new OnvifDevice(host, user, pass);
   const info = await dev.connect();
@@ -42,16 +41,16 @@ async function main(): Promise<void> {
   }
 
   const streamUri = await dev.getStreamUri(profiles[0].token);
-  console.log(`  stream URI: ${streamUri}`);
+  console.log(`  stream URI: ${displayRtspTarget(streamUri)}`);
 
-  const { host: rHost, port, path } = rtspParts(streamUri);
-  const baseUri = `rtsp://${rHost}:${port}${path}`;
+  const endpoint = parseRtspTarget(streamUri, user, pass);
+  const baseUri = endpoint.uri;
 
   // Each DESCRIBE uses a fresh connection: this camera rejects a 2nd DESCRIBE
   // on a reused socket, and the real backchannel flow (M2) opens its own
   // connection with the backchannel DESCRIBE as the first request anyway.
   const describeOnce = async (backchannel: boolean) => {
-    const rtsp = new RtspClient(rHost, port, user, pass);
+    const rtsp = new RtspClient(endpoint.host, endpoint.port, endpoint.user, endpoint.pass);
     await rtsp.connect();
     try {
       if (!backchannel) {
@@ -82,7 +81,10 @@ async function main(): Promise<void> {
   if (bc.status === 200 && track) {
     const send = pickSendCodec(track);
     console.log('\n✅ M1 PASS — backchannel audio track present:');
-    console.log(`   track control=${track.control ?? '(none)'}  offered=${track.formats.join(',')}`);
+    console.log(
+      `   track control=${displayRtspTarget(track.control ?? '(none)')}  ` +
+        `offered=${track.formats.join(',')}`,
+    );
     console.log(
       `   ▶ 송출 코덱 선택: PT=${send?.payloadType} ${send?.encoding}/${send?.clockRate}` +
         ` ${send?.encoding === 'PCMU' || send?.encoding === 'PCMA' ? '(G.711 — 단순/권장)' : ''}`,
@@ -95,6 +97,7 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
-  console.error('M1 error:', err.message ?? err);
+  const message = err instanceof Error ? err.message : String(err);
+  console.error('M1 error:', redactRtspCredentials(message));
   process.exitCode = 1;
 });

@@ -1,9 +1,11 @@
+import base64
 import hashlib
 import json
 import math
 import os
 import pathlib
 import queue
+import re
 import socket
 import struct
 import subprocess
@@ -12,9 +14,10 @@ import tempfile
 import threading
 import time
 import unittest
+import datetime
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import onvif_play
 import backchannel_audio
@@ -458,13 +461,18 @@ class FakeUdpSocket:
 
 
 class ScriptedRtspSocket:
-    def __init__(self, recv_results=(), send_error=None):
+    def __init__(
+        self, recv_results=(), send_error=None, *, wait_for_send=False
+    ):
         self.recv_results = list(recv_results)
         self.send_error = send_error
+        self.wait_for_send = wait_for_send
         self.timeouts = []
         self.closed = False
         self.shutdown_called = False
         self.sent = []
+        self.delivered_responses = 0
+        self.send_condition = threading.Condition()
 
     def settimeout(self, timeout):
         self.timeouts.append(timeout)
@@ -472,18 +480,32 @@ class ScriptedRtspSocket:
     def recv(self, size):
         if not self.recv_results:
             return b""
+        if self.wait_for_send and self.recv_results[0] != b"":
+            with self.send_condition:
+                ready = self.send_condition.wait_for(
+                    lambda: len(self.sent) > self.delivered_responses,
+                    timeout=1,
+                )
+            if not ready:
+                raise socket.timeout("waiting for RTSP request")
         result = self.recv_results.pop(0)
         if isinstance(result, BaseException):
             raise result
+        if result:
+            self.delivered_responses += 1
         return result
 
     def sendall(self, payload):
         if self.send_error is not None:
             raise self.send_error
-        self.sent.append(payload)
+        with self.send_condition:
+            self.sent.append(payload)
+            self.send_condition.notify_all()
 
     def shutdown(self, how):
         self.shutdown_called = True
+        with self.send_condition:
+            self.send_condition.notify_all()
 
     def close(self):
         self.closed = True
@@ -553,6 +575,242 @@ class ConcurrentSendSocket:
 
 
 class RtspSafetyTest(unittest.TestCase):
+    @staticmethod
+    def _scripted_rtsp(responses, user="admin", password="secret"):
+        fake_socket = ScriptedRtspSocket()
+        rtsp = onvif_play.Rtsp.__new__(onvif_play.Rtsp)
+        rtsp.s = fake_socket
+        rtsp.user = user
+        rtsp.pw = password
+        rtsp.cseq = 0
+        rtsp.challenge = None
+        rtsp.reader_failure = None
+        rtsp.responses = queue.Queue()
+        for response in responses:
+            rtsp.responses.put(response)
+        rtsp.response_timeout_seconds = onvif_play.RTSP_IO_TIMEOUT_SECONDS
+        rtsp.monotonic = time.monotonic
+        rtsp.write_lock = threading.Lock()
+        rtsp.request_lock = threading.Lock()
+        return rtsp, fake_socket
+
+    @staticmethod
+    def _authorization(request_bytes):
+        return next(
+            line.split(":", 1)[1].strip()
+            for line in request_bytes.decode("latin1").split("\r\n")
+            if line.lower().startswith("authorization:")
+        )
+
+    def test_digest_qop_auth_increments_nc_and_resets_for_new_nonce(self):
+        challenge_one = (
+            'Digest realm="camera", nonce="nonce-one", qop="auth"'
+        )
+        challenge_two = (
+            'Digest realm="camera", nonce="nonce-two", qop="auth"'
+        )
+        rtsp, fake_socket = self._scripted_rtsp(
+            [
+                (401, {"cseq": "1", "www-authenticate": challenge_one}, ""),
+                (200, {"cseq": "2"}, ""),
+                (200, {"cseq": "3"}, ""),
+                (401, {"cseq": "4", "www-authenticate": challenge_two}, ""),
+                (200, {"cseq": "5"}, ""),
+            ]
+        )
+
+        with patch.object(
+            onvif_play.os,
+            "urandom",
+            side_effect=[b"\x01" * 8, b"\x02" * 8],
+        ):
+            self.assertEqual(
+                rtsp.request("OPTIONS", "rtsp://camera/one")[0], 200
+            )
+            self.assertEqual(
+                rtsp.request("OPTIONS", "rtsp://camera/two")[0], 200
+            )
+            self.assertEqual(
+                rtsp.request("OPTIONS", "rtsp://camera/three")[0], 200
+            )
+
+        authorizations = [
+            self._authorization(fake_socket.sent[index])
+            for index in (1, 2, 4)
+        ]
+        self.assertIn("qop=auth", authorizations[0])
+        self.assertIn("nc=00000001", authorizations[0])
+        self.assertIn("nc=00000002", authorizations[1])
+        self.assertIn("nc=00000001", authorizations[2])
+        self.assertIn('cnonce="0101010101010101"', authorizations[0])
+        self.assertIn('cnonce="0101010101010101"', authorizations[1])
+        self.assertIn('cnonce="0202020202020202"', authorizations[2])
+
+        ha1 = onvif_play.md5("admin:camera:secret")
+        ha2 = onvif_play.md5("OPTIONS:rtsp://camera/one")
+        expected = onvif_play.md5(
+            f"{ha1}:nonce-one:00000001:0101010101010101:auth:{ha2}"
+        )
+        self.assertIn(f'response="{expected}"', authorizations[0])
+
+    def test_digest_without_qop_retains_legacy_md5_response(self):
+        challenge = 'Digest realm="camera", nonce="legacy-nonce"'
+        rtsp, fake_socket = self._scripted_rtsp(
+            [
+                (401, {"cseq": "1", "www-authenticate": challenge}, ""),
+                (200, {"cseq": "2"}, ""),
+            ]
+        )
+
+        self.assertEqual(
+            rtsp.request("DESCRIBE", "rtsp://camera/live")[0], 200
+        )
+
+        authorization = self._authorization(fake_socket.sent[1])
+        ha1 = onvif_play.md5("admin:camera:secret")
+        ha2 = onvif_play.md5("DESCRIBE:rtsp://camera/live")
+        expected = onvif_play.md5(f"{ha1}:legacy-nonce:{ha2}")
+        self.assertIn(f'response="{expected}"', authorization)
+        self.assertNotIn("qop=", authorization)
+        self.assertNotIn("cnonce=", authorization)
+        self.assertNotIn("nc=", authorization)
+
+    def test_basic_401_retries_with_case_insensitive_basic_authorization(self):
+        rtsp, fake_socket = self._scripted_rtsp(
+            [
+                (
+                    401,
+                    {
+                        "cseq": "1",
+                        "www-authenticate": 'bAsIc realm="camera"',
+                    },
+                    "",
+                ),
+                (200, {"cseq": "2"}, ""),
+            ],
+            user="camera-user",
+            password="p@ssword",
+        )
+
+        self.assertEqual(
+            rtsp.request("DESCRIBE", "rtsp://camera/live")[0], 200
+        )
+
+        self.assertNotIn(b"Authorization:", fake_socket.sent[0])
+        expected = base64.b64encode(b"camera-user:p@ssword").decode("ascii")
+        self.assertEqual(
+            self._authorization(fake_socket.sent[1]),
+            f"Basic {expected}",
+        )
+
+    def test_digest_opaque_is_safely_quoted_with_and_without_qop(self):
+        for suffix in ('qop="auth", ', ""):
+            with self.subTest(qop=bool(suffix)):
+                challenge = (
+                    f'Digest realm="camera", nonce="nonce", {suffix}'
+                    'opaque="op\\\"aque\\\\zone"'
+                )
+                rtsp, fake_socket = self._scripted_rtsp(
+                    [
+                        (
+                            401,
+                            {"cseq": "1", "www-authenticate": challenge},
+                            "",
+                        ),
+                        (200, {"cseq": "2"}, ""),
+                    ]
+                )
+
+                with patch.object(
+                    onvif_play.os, "urandom", return_value=b"\x04" * 8
+                ):
+                    self.assertEqual(
+                        rtsp.request("OPTIONS", "rtsp://camera/live")[0],
+                        200,
+                    )
+
+                authorization = self._authorization(fake_socket.sent[1])
+                self.assertIn(
+                    'opaque="op\\\"aque\\\\zone"', authorization
+                )
+                self.assertEqual("qop=auth" in authorization, bool(suffix))
+
+    def test_digest_selects_auth_and_escapes_quoted_values(self):
+        challenge = (
+            'Digest realm="cam\\\"era\\\\zone", '
+            'nonce="n\\\"once\\\\value", qop="auth-int, auth"'
+        )
+        uri = 'rtsp://camera/live/"quoted\\track'
+        rtsp, fake_socket = self._scripted_rtsp(
+            [
+                (401, {"cseq": "1", "www-authenticate": challenge}, ""),
+                (200, {"cseq": "2"}, ""),
+            ],
+            user='cam"era\\operator',
+        )
+
+        with patch.object(onvif_play.os, "urandom", return_value=b"\x03" * 8):
+            self.assertEqual(rtsp.request("OPTIONS", uri)[0], 200)
+
+        authorization = self._authorization(fake_socket.sent[1])
+        self.assertIn('username="cam\\"era\\\\operator"', authorization)
+        self.assertIn('realm="cam\\"era\\\\zone"', authorization)
+        self.assertIn('nonce="n\\"once\\\\value"', authorization)
+        self.assertIn(
+            'uri="rtsp://camera/live/\\"quoted\\\\track"',
+            authorization,
+        )
+        self.assertIn("qop=auth", authorization)
+
+    def test_digest_rejects_unsupported_algorithm_and_qop_before_retry(self):
+        cases = (
+            (
+                'Digest realm="camera", nonce="nonce", algorithm=SHA-256',
+                "unsupported RTSP Digest algorithm: SHA-256",
+            ),
+            (
+                'Digest realm="camera", nonce="nonce", qop="auth-int"',
+                "unsupported RTSP Digest qop: auth-int",
+            ),
+            (
+                'Digest realm="camera", nonce="nonce", qop="unknown"',
+                "unsupported RTSP Digest qop: unknown",
+            ),
+        )
+        for challenge, message in cases:
+            with self.subTest(challenge=challenge):
+                rtsp, fake_socket = self._scripted_rtsp(
+                    [
+                        (
+                            401,
+                            {"cseq": "1", "www-authenticate": challenge},
+                            "",
+                        )
+                    ]
+                )
+
+                with self.assertRaisesRegex(RuntimeError, message):
+                    rtsp.request("OPTIONS", "rtsp://camera/live")
+
+                self.assertEqual(len(fake_socket.sent), 1)
+
+    def test_decoded_url_credentials_reject_header_control_characters(self):
+        cases = (
+            (
+                "rtsp://admin%0D%0AInjected@example.invalid/live",
+                "RTSP username contains control characters",
+            ),
+            (
+                "rtsp://admin:se%00cret@example.invalid/live",
+                "RTSP password contains control characters",
+            ),
+        )
+        for uri, message in cases:
+            with self.subTest(uri=uri), self.assertRaisesRegex(
+                ValueError, message
+            ):
+                onvif_play._rtsp_target(uri, "", "")
+
     def test_request_bytes_and_interleaved_media_share_one_write_lock(self):
         fake_socket = ConcurrentSendSocket()
         rtsp = onvif_play.Rtsp.__new__(onvif_play.Rtsp)
@@ -759,7 +1017,8 @@ class RtspSafetyTest(unittest.TestCase):
             recv_results=[
                 b"RTSP/1.0 200 OK\r\nCSeq: 1\r\nX-Test: yes\r\n\r\n",
                 b"",
-            ]
+            ],
+            wait_for_send=True,
         )
 
         with patch.object(
@@ -778,14 +1037,76 @@ class RtspSafetyTest(unittest.TestCase):
             finally:
                 rtsp.close()
 
+    def test_reader_eof_fails_and_wakes_pending_request(self):
+        class PendingEofSocket:
+            def __init__(self):
+                self.request_sent = threading.Event()
+                self.release_eof = threading.Event()
+                self.sent = []
+                self.shutdown_called = False
+                self.closed = False
+
+            def settimeout(self, timeout):
+                self.timeout = timeout
+
+            def sendall(self, payload):
+                self.sent.append(payload)
+                self.request_sent.set()
+
+            def recv(self, size):
+                self.release_eof.wait(timeout=1)
+                return b""
+
+            def shutdown(self, how):
+                self.shutdown_called = True
+                self.release_eof.set()
+
+            def close(self):
+                self.closed = True
+                self.release_eof.set()
+
+        fake_socket = PendingEofSocket()
+        errors = []
+        with patch.object(
+            onvif_play.socket, "create_connection", return_value=fake_socket
+        ), patch.object(onvif_play, "RTSP_IO_TIMEOUT_SECONDS", 0.1):
+            rtsp = onvif_play.Rtsp(
+                "example.invalid", 554, "fake-user", "fake-password"
+            )
+
+            def request():
+                try:
+                    rtsp.request("OPTIONS", "rtsp://example.invalid/live")
+                except BaseException as error:
+                    errors.append(error)
+
+            requester = threading.Thread(target=request)
+            requester.start()
+            self.assertTrue(fake_socket.request_sent.wait(timeout=1))
+            fake_socket.release_eof.set()
+            requester.join(timeout=1)
+            try:
+                self.assertFalse(requester.is_alive())
+                self.assertEqual(len(errors), 1)
+                self.assertIsInstance(errors[0], ConnectionError)
+                self.assertRegex(str(errors[0]), "RTSP connection closed")
+                self.assertIs(rtsp.reader_failure, errors[0])
+            finally:
+                fake_socket.release_eof.set()
+                requester.join(timeout=1)
+                rtsp.close()
+
     def test_digest_401_retry_flow_uses_bounded_response_queue(self):
-        responses = (
+        unauthorized = (
             b"RTSP/1.0 401 Unauthorized\r\n"
             b"CSeq: 1\r\n"
             b'WWW-Authenticate: Digest realm="camera", nonce="nonce"\r\n\r\n'
-            b"RTSP/1.0 200 OK\r\nCSeq: 2\r\n\r\n"
         )
-        fake_socket = ScriptedRtspSocket(recv_results=[responses, b""])
+        success = b"RTSP/1.0 200 OK\r\nCSeq: 2\r\n\r\n"
+        fake_socket = ScriptedRtspSocket(
+            recv_results=[unauthorized, success, b""],
+            wait_for_send=True,
+        )
 
         with patch.object(
             onvif_play.socket, "create_connection", return_value=fake_socket
@@ -864,9 +1185,22 @@ class RtspSafetyTest(unittest.TestCase):
         self.assertIn(b"Authorization: Digest", fake_socket.sent[1])
 
     def test_send_timeout_propagates_with_finite_socket_timeout(self):
-        fake_socket = ScriptedRtspSocket(
-            recv_results=[b""], send_error=socket.timeout("send timed out")
-        )
+        class SendTimeoutSocket(ScriptedRtspSocket):
+            def __init__(self):
+                super().__init__(
+                    send_error=socket.timeout("send timed out")
+                )
+                self.release_reader = threading.Event()
+
+            def recv(self, size):
+                self.release_reader.wait(timeout=1)
+                return b""
+
+            def shutdown(self, how):
+                self.release_reader.set()
+                super().shutdown(how)
+
+        fake_socket = SendTimeoutSocket()
 
         with patch.object(
             onvif_play.socket, "create_connection", return_value=fake_socket
@@ -1095,6 +1429,243 @@ class BackchannelTransportTest(unittest.TestCase):
     def setUp(self):
         FakeRtsp.instances.clear()
 
+    def test_legacy_onvif_stream_uri_omits_blank_wsse_and_escapes_username(self):
+        info = "<GetDeviceInformationResponse><Model>Test</Model></GetDeviceInformationResponse>"
+        capabilities = "<XAddr>http://camera/onvif/media_service</XAddr>"
+        profiles = '<Profiles token="profile-1" />'
+        stream = "<Uri>rtsp://camera/live</Uri>"
+
+        with patch.object(onvif_play, "dev_time", return_value=datetime.datetime(2026, 1, 1)), patch.object(
+            onvif_play,
+            "soap",
+            side_effect=[info, capabilities, profiles, stream],
+        ) as soap:
+            onvif_play.onvif_stream_uri("camera", "", "")
+
+        self.assertEqual(soap.call_args_list[1].args[2], "")
+        self.assertEqual(soap.call_args_list[2].args[2], "")
+        self.assertEqual(soap.call_args_list[3].args[2], "")
+
+        with patch.object(onvif_play, "dev_time", return_value=datetime.datetime(2026, 1, 1)), patch.object(
+            onvif_play,
+            "soap",
+            side_effect=[info, capabilities, profiles, stream],
+        ) as soap:
+            onvif_play.onvif_stream_uri("camera", "admin<&", "secret")
+
+        self.assertIn(
+            "<wsse:Username>admin&lt;&amp;</wsse:Username>",
+            soap.call_args_list[1].args[2],
+        )
+        self.assertIn("PasswordDigest", soap.call_args_list[1].args[2])
+
+    def test_legacy_onvif_stream_uri_refreshes_wsse_for_every_request(self):
+        info = "<GetDeviceInformationResponse><Model>Test</Model></GetDeviceInformationResponse>"
+        capabilities = "<XAddr>http://camera/onvif/media_service</XAddr>"
+        profiles = '<Profiles token="profile-1" />'
+        stream = "<Uri>rtsp://camera/live</Uri>"
+        nonce_bytes = [bytes([value]) * 16 for value in range(1, 5)]
+
+        with patch.object(
+            onvif_play,
+            "dev_time",
+            return_value=datetime.datetime(2026, 1, 1),
+        ), patch.object(
+            onvif_play.os, "urandom", side_effect=nonce_bytes
+        ) as random_bytes, patch.object(
+            onvif_play,
+            "soap",
+            side_effect=[info, capabilities, profiles, stream],
+        ) as soap:
+            onvif_play.onvif_stream_uri("camera", "admin", "secret")
+
+        headers = [call.args[2] for call in soap.call_args_list]
+        nonces = [
+            re.search(r"<wsse:Nonce>([^<]+)</wsse:Nonce>", header).group(1)
+            for header in headers
+        ]
+        digests = [
+            re.search(
+                r'<wsse:Password Type="[^"]+">([^<]+)</wsse:Password>',
+                header,
+            ).group(1)
+            for header in headers
+        ]
+        self.assertEqual(random_bytes.call_count, 4)
+        self.assertEqual(len(set(nonces)), 4)
+        self.assertEqual(len(set(digests)), 4)
+
+    def test_legacy_onvif_stream_uri_escapes_profile_token(self):
+        info = (
+            "<GetDeviceInformationResponse><Model>Test</Model>"
+            "</GetDeviceInformationResponse>"
+        )
+        capabilities = "<XAddr>http://camera/onvif/media_service</XAddr>"
+        profiles = '<Profiles token="profile&amp;unsafe&gt;" />'
+        stream = "<Uri>rtsp://camera/live</Uri>"
+
+        with patch.object(
+            onvif_play,
+            "dev_time",
+            return_value=datetime.datetime(2026, 1, 1),
+        ), patch.object(
+            onvif_play,
+            "soap",
+            side_effect=[info, capabilities, profiles, stream],
+        ) as soap:
+            onvif_play.onvif_stream_uri("camera", "", "")
+
+        stream_request = soap.call_args_list[3].args[1]
+        self.assertIn(
+            "<ProfileToken>profile&amp;unsafe&gt;</ProfileToken>",
+            stream_request,
+        )
+
+    def test_display_redaction_removes_userinfo_from_any_uri_scheme(self):
+        cases = (
+            (
+                "http://alice:secret@example.invalid:8080/onvif?token=x#y",
+                "http://example.invalid:8080/onvif",
+            ),
+            (
+                "vendor+tcp://alice:secret@[2001:db8::1]:9000/live?x#y",
+                "vendor+tcp://[2001:db8::1]:9000/live",
+            ),
+        )
+        for uri, expected in cases:
+            with self.subTest(uri=uri):
+                self.assertEqual(onvif_play.redact_rtsp_uri(uri), expected)
+
+    def test_resolves_rtsp_control_paths_and_strips_credentials_and_fragments(self):
+        self.assertEqual(
+            onvif_play.resolve_track_uri(
+                "rtsp://url-user:url-pass@camera/live#ignored", None, "/track"
+            ),
+            "rtsp://camera/track",
+        )
+        self.assertEqual(
+            onvif_play.resolve_track_uri(
+                "rtsp://camera/live", "rtsp://base-user:base-pass@camera/base/", "?track=1#ignored"
+            ),
+            "rtsp://camera/base/?track=1",
+        )
+        self.assertEqual(
+            onvif_play.resolve_track_uri(
+                "rtsp://camera/live", "rtsp://base-user:base-pass@camera/base/", "track#ignored"
+            ),
+            "rtsp://camera/base/track",
+        )
+        self.assertEqual(
+            onvif_play.resolve_track_uri(
+                "rtsp://camera/live", None, "track#ignored"
+            ),
+            "rtsp://camera/live/track",
+        )
+
+    def test_query_bearing_sdp_bases_use_uri_reference_semantics(self):
+        stream = "rtsp://camera/video/livemedia?Ch=1&Streamtype=0"
+
+        self.assertEqual(
+            onvif_play.resolve_track_uri(stream, None, "trackID=5"),
+            "rtsp://camera/video/livemedia/trackID=5",
+        )
+        self.assertEqual(
+            onvif_play.resolve_track_uri(stream, None, "?track=audio"),
+            "rtsp://camera/video/livemedia?track=audio",
+        )
+        self.assertEqual(
+            onvif_play.resolve_track_uri(
+                stream, None, "/tracks/audio?direction=send"
+            ),
+            "rtsp://camera/tracks/audio?direction=send",
+        )
+        self.assertEqual(
+            onvif_play.resolve_track_uri(
+                stream,
+                "rtsp://camera/root/session/?Ch=1&Streamtype=0",
+                "../trackID=5",
+            ),
+            "rtsp://camera/root/trackID=5",
+        )
+
+    def test_rtsp_target_rejects_port_zero_and_strips_fragment(self):
+        with self.assertRaisesRegex(ValueError, "invalid RTSP stream URI"):
+            onvif_play._rtsp_target("rtsp://camera:0/live", "", "")
+
+        target = onvif_play._rtsp_target(
+            "rtsp://operator%40site:p@ss@word@[2001:db8::10]:8554/live#secret",
+            "",
+            "",
+        )
+        self.assertEqual(target[0], "rtsp://[2001:db8::10]:8554/live")
+        self.assertEqual(target[2:], (8554, "operator@site", "p@ss@word"))
+
+    def test_udp_ipv6_is_rejected_before_rtsp_factory_side_effects(self):
+        factory = Mock(side_effect=lambda host, port, user, password: FakeRtsp(
+            host, port, user, password
+        ))
+        with self.assertRaisesRegex(ValueError, "IPv6.*UDP"):
+            onvif_play.open_backchannel_transport(
+                "rtsp://[2001:db8::10]/live",
+                transport="udp",
+                rtsp_factory=factory,
+            )
+        factory.assert_not_called()
+
+    def test_g726_encoder_uses_rtp_bit_packing_and_complete_octets(self):
+        decoded = b"\x01\x00" * 10
+        encoded = b"\xaa" * 6
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=encoded,
+            stderr=b"",
+        )
+
+        with patch.object(
+            backchannel_audio, "decode_source", return_value=decoded
+        ) as decode, patch.object(
+            backchannel_audio,
+            "apply_q11_volume_s16le",
+            return_value=decoded,
+        ) as volume, patch.object(
+            onvif_play.subprocess, "run", return_value=completed
+        ) as run:
+            result = onvif_play.file_g726(
+                "event.mp3",
+                0.05,
+                8000,
+                3,
+            )
+
+        self.assertEqual(result, encoded)
+        decode.assert_called_once_with("event.mp3", 8000)
+        volume.assert_called_once_with(decoded, 0.05)
+        command = run.call_args.args[0]
+        self.assertIn("g726le", command)
+        self.assertEqual(command[command.index("-code_size") + 1], "3")
+        self.assertEqual(command[command.index("-f", 10) + 1], "g726le")
+        self.assertEqual(run.call_args.kwargs["input"], decoded + b"\x00" * 12)
+        self.assertTrue(run.call_args.kwargs["capture_output"])
+
+    def test_aac_and_g726_ffmpeg_runs_have_bounded_timeouts(self):
+        completed = [
+            subprocess.CompletedProcess(args=[], returncode=0, stdout=b"", stderr=b""),
+            subprocess.CompletedProcess(args=[], returncode=0, stdout=b"\x00\x00", stderr=b""),
+        ]
+        with patch.object(onvif_play.subprocess, "run", side_effect=completed) as run, patch.object(
+            backchannel_audio, "decode_source", return_value=b"\x00\x00"
+        ), patch.object(
+            backchannel_audio, "apply_q11_volume_s16le", return_value=b"\x00\x00"
+        ):
+            onvif_play.file_aac("event.mp3", 0.05, 8000, 0)
+            onvif_play.file_g726("event.mp3", 0.05, 8000, 2)
+
+        self.assertEqual(
+            [call.kwargs["timeout"] for call in run.call_args_list],
+            [120, 120],
+        )
+
     def test_opens_tracks_before_play_and_honors_returned_channel(self):
         stream_uri = "rtsp://example.invalid/live"
         packet = make_rtp_packet(b"captured", sequence=7, timestamp=900)
@@ -1149,6 +1720,71 @@ class BackchannelTransportTest(unittest.TestCase):
         teardown = client.requests[6]
         for request in (describe, backchannel_setup, play, teardown):
             self.assertEqual(request[2].get("Require"), onvif_play.BACKCHANNEL)
+
+    def test_full_rtsp_target_bypasses_onvif_and_decodes_final_at_userinfo(self):
+        target = (
+            "rtsp://operator%40site:p@ss@word@[2001:db8::10]:8554/live"
+        )
+        created = []
+
+        def factory(host, port, user, password):
+            created.append((host, port, user, password))
+            return FakeRtsp(host, port, user, password)
+
+        with patch.object(onvif_play, "onvif_stream_uri") as resolver:
+            with onvif_play.open_backchannel_transport(
+                target,
+                "",
+                "",
+                rtsp_factory=factory,
+            ) as transport:
+                self.assertEqual(
+                    transport.stream_uri,
+                    "rtsp://[2001:db8::10]:8554/live",
+                )
+
+        resolver.assert_not_called()
+        self.assertEqual(
+            created,
+            [("2001:db8::10", 8554, "operator@site", "p@ss@word")],
+        )
+        client = FakeRtsp.instances[0]
+        self.assertTrue(
+            all(
+                "operator" not in uri and "p@ss" not in uri
+                for _, uri, _ in client.requests
+            )
+        )
+
+    def test_nonempty_explicit_credentials_override_url_values_independently(self):
+        created = []
+
+        def factory(host, port, user, password):
+            created.append((host, port, user, password))
+            return FakeRtsp(host, port, user, password)
+
+        with onvif_play.open_backchannel_transport(
+            "rtsp://url-user:url-pass@example.invalid/live",
+            "explicit-user",
+            "",
+            rtsp_factory=factory,
+        ):
+            pass
+        with onvif_play.open_backchannel_transport(
+            "rtsp://url-user:url-pass@example.invalid/live",
+            "",
+            "explicit-pass",
+            rtsp_factory=factory,
+        ):
+            pass
+
+        self.assertEqual(
+            created,
+            [
+                ("example.invalid", 554, "explicit-user", "url-pass"),
+                ("example.invalid", 554, "url-user", "explicit-pass"),
+            ],
+        )
 
     def test_parses_session_timeout_parameters_and_uses_half_deadline(self):
         with onvif_play.open_backchannel_transport(
@@ -3461,6 +4097,19 @@ class RtpSenderMainTest(unittest.TestCase):
 
         self.assertEqual(len(data.payload_slices), 2)
 
+    def test_adts_parser_rejects_multiple_raw_data_blocks(self):
+        frame_length = 8
+        data = bytes([
+            0xFF, 0xF1, 0x50,
+            (frame_length >> 11) & 0x03,
+            (frame_length >> 3) & 0xFF,
+            (frame_length & 0x07) << 5,
+            1,
+        ]) + b"x"
+
+        with self.assertRaisesRegex(RuntimeError, "raw_data_blocks"):
+            onvif_play.parse_adts_frames(data)
+
     def test_aac_encoded_output_limit_precedes_adts_parsing(self):
         completed = subprocess.CompletedProcess(
             args=[], returncode=0, stdout=b"123456789", stderr=b""
@@ -3729,17 +4378,16 @@ class RtpSenderMainTest(unittest.TestCase):
         self.assertEqual(arguments.rtp_identity, "sender")
         self.assertEqual(arguments.marker_mode, "first")
 
-    def test_cli_has_no_development_endpoint_or_password_defaults(self):
+    def test_cli_has_blank_password_default(self):
         with patch.dict(os.environ, {}, clear=True):
             arguments = onvif_play.build_argument_parser().parse_args([])
 
         self.assertIsNone(arguments.host)
-        self.assertIsNone(arguments.pw)
+        self.assertEqual(arguments.pw, "")
 
-    def test_cli_requires_camera_host_and_password_before_audio_processing(self):
+    def test_cli_requires_camera_host_before_audio_processing(self):
         cases = [
             (["--pass", "secret"], "--host"),
-            (["--host", "camera"], "--pass"),
         ]
         with patch.dict(os.environ, {}, clear=True):
             for arguments, missing in cases:
@@ -3810,6 +4458,41 @@ class RtpSenderMainTest(unittest.TestCase):
                 argv[limit_index + 1],
                 str(onvif_play.MAX_AUDIO_SOURCE_BYTES + 1),
             )
+
+    def test_legacy_file_audio_rejects_oversized_ffmpeg_output(self):
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=b"12345", stderr=b""
+        )
+        for codec in ("pcmu", "l16"):
+            with self.subTest(codec=codec), patch.object(
+                onvif_play, "MAX_AUDIO_SOURCE_BYTES", 4
+            ), patch.object(
+                onvif_play.subprocess, "run", return_value=completed
+            ):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    rf"{codec.upper()} encoded output exceeds 4 byte limit",
+                ):
+                    onvif_play.file_audio(
+                        "source.wav", codec, 0.25, 8000
+                    )
+
+    def test_legacy_file_audio_rejects_oversized_pcma_output(self):
+        with patch.object(
+            onvif_play, "MAX_AUDIO_SOURCE_BYTES", 4
+        ), patch.object(
+            backchannel_audio, "decode_source", return_value=b"\x00\x00"
+        ), patch.object(
+            backchannel_audio,
+            "encode_pcma_gst_compatible",
+            return_value=b"12345",
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "PCMA encoded output exceeds 4 byte limit"
+            ):
+                onvif_play.file_audio(
+                    "source.wav", "pcma", 0.25, 8000
+                )
 
     def test_pcma_input_bypasses_conversion_and_preserves_payload_after_preroll(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -3949,6 +4632,50 @@ class BackchannelRequestTest(unittest.TestCase):
 
         self.assertNotIn("fake-user", output.getvalue())
         self.assertNotIn("fake-password", output.getvalue())
+        self.assertIn("rtsp://example.invalid/live", output.getvalue())
+
+    def test_main_redacts_userinfo_from_non_rtsp_host_uri(self):
+        FakeRtsp.instances.clear()
+        argv = [
+            "onvif_play.py",
+            "--host", "http://operator:secret@example.invalid/device",
+            "--ms", "0",
+            "--preroll-ms", "0",
+            "--rtcp-interval", "0",
+        ]
+
+        output = StringIO()
+        with patch.object(sys, "argv", argv), patch.object(
+            onvif_play,
+            "onvif_stream_uri",
+            return_value=("rtsp://example.invalid/live", "test-camera"),
+        ), patch.object(
+            onvif_play, "Rtsp", FakeRtsp
+        ), redirect_stdout(output):
+            onvif_play.main()
+
+        self.assertNotIn("operator", output.getvalue())
+        self.assertNotIn("secret", output.getvalue())
+        self.assertIn(
+            "http://example.invalid/device", output.getvalue()
+        )
+
+    def test_direct_rtsp_main_path_skips_onvif_and_allows_blank_credentials(self):
+        FakeRtsp.instances.clear()
+        argv = [
+            "onvif_play.py",
+            "--host", "rtsp://operator%40site:p@ss@word@example.invalid/live#secret",
+            "--ms", "0",
+            "--preroll-ms", "0",
+            "--rtcp-interval", "0",
+        ]
+
+        with patch.object(sys, "argv", argv), patch.object(
+            onvif_play, "onvif_stream_uri", side_effect=AssertionError("ONVIF called")
+        ), patch.object(onvif_play, "Rtsp", FakeRtsp), redirect_stdout(StringIO()) as output:
+            onvif_play.main()
+
+        self.assertNotIn("p@ss@word", output.getvalue())
         self.assertIn("rtsp://example.invalid/live", output.getvalue())
 
 

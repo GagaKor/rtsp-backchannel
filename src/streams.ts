@@ -4,6 +4,7 @@
  *   ONVIF_PASSWORD='<password>' npm run streams -- --host camera.local
  */
 import { getStreamUris } from './onvif/streams.ts';
+import { displayRtspTarget, redactRtspCredentials } from './backchannel.ts';
 
 function arg(name: string, def?: string): string {
   const i = process.argv.indexOf(`--${name}`);
@@ -20,11 +21,12 @@ async function main(): Promise<void> {
   const streams = await getStreamUris({ host, user, pass });
   for (const stream of streams) {
     console.log(`[${stream.profileToken}] ${stream.profileName ?? ''}`.trim());
-    console.log(`  ${stream.uri}\n`);
+    console.log(`  ${displayRtspTarget(stream.uri)}\n`);
   }
 }
 
 main().catch((err) => {
-  console.error('streams error:', err.message ?? err);
+  const message = err instanceof Error ? err.message : String(err);
+  console.error('streams error:', redactRtspCredentials(message));
   process.exitCode = 1;
 });
