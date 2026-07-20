@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use onvif_backchannel::playback::{PlaybackConfig, PlaybackResult, play_file};
 
@@ -15,4 +15,21 @@ fn exposes_one_shot_file_playback_as_a_library_api() {
 
     assert_eq!(config.host, "camera.local");
     assert_eq!(config.volume, 0.05);
+}
+
+#[test]
+fn publishes_under_a_permissive_dual_license() {
+    assert_eq!(env!("CARGO_PKG_LICENSE"), "MIT OR Apache-2.0");
+    for filename in [
+        "LICENSE",
+        "LICENSE-MIT",
+        "LICENSE-APACHE",
+        "THIRD_PARTY_NOTICES.md",
+    ] {
+        assert!(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(filename)
+                .is_file()
+        );
+    }
 }

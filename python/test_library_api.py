@@ -122,6 +122,19 @@ class LibraryApiTests(unittest.TestCase):
         self.assertEqual(metadata["project"]["name"], "onvif-backchannel")
         self.assertEqual(metadata["project"]["version"], "0.1.0")
         self.assertEqual(metadata["project"]["requires-python"], ">=3.11")
+        self.assertEqual(metadata["project"]["license"], "MIT OR Apache-2.0")
+        self.assertEqual(metadata["project"]["readme"], "README.md")
+        self.assertEqual(
+            metadata["project"]["license-files"],
+            [
+                "LICENSE",
+                "LICENSE-MIT",
+                "LICENSE-APACHE",
+                "THIRD_PARTY_NOTICES.md",
+            ],
+        )
+        for filename in metadata["project"]["license-files"]:
+            self.assertTrue(pathlib.Path("python", filename).is_file())
         self.assertEqual(
             metadata["project"]["scripts"]["onvif-backchannel"],
             "onvif_backchannel.cli:main",

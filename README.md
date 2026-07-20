@@ -313,10 +313,8 @@ cargo clippy --manifest-path rust/Cargo.toml --all-targets -- -D warnings
 ## Registry 게시
 
 Registry 게시 작업은 각 서비스의 배포 권한과 로그인이 필요하므로 자동으로 실행하지
-않습니다. 배포자는 전체 테스트를 통과시킨 뒤 저장소 루트에서 다음 명령을 실행합니다.
-crates.io 게시 전에는 프로젝트 소유자가 라이선스를 결정하고 `rust/Cargo.toml`에
-`license` 또는 `license-file`을 반드시 추가해야 합니다. 현재는 임의의 라이선스를
-부여하지 않았으므로 Cargo 패키징은 가능하지만 crates.io 업로드는 거부됩니다.
+않습니다. 배포자는 전체 테스트와 패키지 검증을 통과시킨 뒤 저장소 루트에서 다음
+명령을 실행합니다.
 
 ```bash
 # npm
@@ -329,3 +327,15 @@ python3 -m twine upload python/dist/*
 # crates.io
 cargo publish --manifest-path rust/Cargo.toml
 ```
+
+## 라이선스
+
+이 프로젝트는 사용자가 선택할 수 있는 `MIT OR Apache-2.0` 이중 라이선스로
+배포합니다. 자세한 조건은 [LICENSE-MIT](LICENSE-MIT)와
+[LICENSE-APACHE](LICENSE-APACHE)를 확인하십시오.
+
+이 프로젝트는 FFmpeg 소스나 바이너리를 포함하거나 링크하지 않고, 실행 환경에 별도로
+설치된 `ffmpeg` 프로세스를 호출합니다. FFmpeg를 이 프로젝트와 함께 번들하거나
+재배포하는 경우에는 사용한 FFmpeg 빌드의 LGPL/GPL 및 기타 설정에 따른 조건을 별도로
+확인하고 준수해야 합니다. 자세한 내용은 [FFmpeg Legal](https://ffmpeg.org/legal.html)과
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)를 확인하십시오.

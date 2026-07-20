@@ -18,6 +18,7 @@ test('exports the supported npm library surface from one entry point', () => {
 
 test('declares an installable npm package with ESM types and CLI exports', () => {
   const manifest = JSON.parse(readFileSync('package.json', 'utf8'));
+  const lockfile = JSON.parse(readFileSync('package-lock.json', 'utf8'));
 
   assert.equal(manifest.name, 'onvif-backchannel');
   assert.notEqual(manifest.private, true);
@@ -31,7 +32,13 @@ test('declares an installable npm package with ESM types and CLI exports', () =>
     'dist/rtp',
     'dist/rtsp',
     'README.md',
+    'LICENSE',
+    'LICENSE-MIT',
+    'LICENSE-APACHE',
+    'THIRD_PARTY_NOTICES.md',
   ]);
+  assert.equal(manifest.license, 'MIT OR Apache-2.0');
+  assert.equal(lockfile.packages[''].license, manifest.license);
   assert.equal(manifest.main, './dist/index.js');
   assert.equal(manifest.types, './dist/index.d.ts');
   assert.equal(manifest.exports['.'].import, './dist/index.js');

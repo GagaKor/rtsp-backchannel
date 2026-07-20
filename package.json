@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "type": "module",
   "description": "Discover ONVIF cameras, resolve RTSP streams, and play backchannel audio without GStreamer",
-  "license": "UNLICENSED",
+  "license": "MIT OR Apache-2.0",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
@@ -24,7 +24,11 @@
     "dist/onvif",
     "dist/rtp",
     "dist/rtsp",
-    "README.md"
+    "README.md",
+    "LICENSE",
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+    "THIRD_PARTY_NOTICES.md"
   ],
   "engines": {
     "node": ">=22"
