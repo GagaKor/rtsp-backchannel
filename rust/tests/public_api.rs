@@ -22,6 +22,7 @@ fn publishes_under_a_permissive_dual_license() {
     assert_eq!(env!("CARGO_PKG_LICENSE"), "MIT OR Apache-2.0");
     assert_eq!(env!("CARGO_PKG_NAME"), "rtsp-backchannel");
     assert_eq!(env!("CARGO_PKG_RUST_VERSION"), "1.86");
+    assert_eq!(env!("CARGO_PKG_README"), "README.md");
     assert_eq!(
         env!("CARGO_PKG_REPOSITORY"),
         "https://github.com/GagaKor/rtsp-backchannel"
@@ -31,6 +32,8 @@ fn publishes_under_a_permissive_dual_license() {
         "https://github.com/GagaKor/rtsp-backchannel"
     );
     for filename in [
+        "README.md",
+        "README.ko.md",
         "LICENSE",
         "LICENSE-MIT",
         "LICENSE-APACHE",
@@ -41,5 +44,15 @@ fn publishes_under_a_permissive_dual_license() {
                 .join(filename)
                 .is_file()
         );
+    }
+
+    for filename in ["README.md", "README.ko.md"] {
+        let readme =
+            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(filename)).unwrap();
+        assert!(readme.contains("Rust"));
+        assert!(readme.contains("rust/README.md"));
+        assert!(readme.contains("rust/README.ko.md"));
+        assert!(!readme.contains("```typescript"));
+        assert!(!readme.contains("```python"));
     }
 }
