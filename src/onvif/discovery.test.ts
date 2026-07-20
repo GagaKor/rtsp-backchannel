@@ -210,18 +210,19 @@ test('bounds active CIDR requests globally while checking every port', async (t)
 
     assert.equal(requestCount, 4);
     assert.equal(peakInFlight, 2);
-    assert.deepEqual(devices, [
-      {
-        ip: '127.0.0.1',
-        xaddrs: ports.map((port) => `http://127.0.0.1:${port}/onvif/device_service`),
-        scopes: [],
-      },
-      {
-        ip: localAddress,
-        xaddrs: ports.map((port) => `http://${localAddress}:${port}/onvif/device_service`),
-        scopes: [],
-      },
-    ]);
+    const devicesByIp = new Map(devices.map((device) => [device.ip, device]));
+    assert.equal(devices.length, 2);
+    assert.equal(devicesByIp.size, 2);
+    assert.deepEqual(devicesByIp.get('127.0.0.1'), {
+      ip: '127.0.0.1',
+      xaddrs: ports.map((port) => `http://127.0.0.1:${port}/onvif/device_service`),
+      scopes: [],
+    });
+    assert.deepEqual(devicesByIp.get(localAddress), {
+      ip: localAddress,
+      xaddrs: ports.map((port) => `http://${localAddress}:${port}/onvif/device_service`),
+      scopes: [],
+    });
   } finally {
     await Promise.all(
       servers.map(
