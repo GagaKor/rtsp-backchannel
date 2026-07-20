@@ -1,18 +1,29 @@
 # RTSP Backchannel for Python
 
-Discover ONVIF cameras, resolve profile RTSP URIs, and play event audio through
-an ONVIF RTSP backchannel without GStreamer.
+[English](https://github.com/GagaKor/rtsp-backchannel/blob/master/python/README.md) |
+[한국어](https://github.com/GagaKor/rtsp-backchannel/blob/master/python/README.ko.md)
 
-The package uses a separately installed `ffmpeg` executable to decode input
-audio. PCMA encoding and RTP/RTSP transport are implemented by the package.
+Python library and CLI for discovering ONVIF cameras, resolving profile RTSP
+URIs, and playing one audio file through an ONVIF RTSP backchannel. GStreamer
+is not required.
+
+Other implementations:
+
+- [TypeScript](https://github.com/GagaKor/rtsp-backchannel/blob/master/README.md)
+- [Rust](https://github.com/GagaKor/rtsp-backchannel/blob/master/rust/README.md)
+
+The package starts a backchannel session, sends the complete file at real-time
+speed, and closes the session. It calls a separately installed `ffmpeg`
+executable to decode input audio. PCMA encoding and RTP/RTSP transport are
+implemented in Python. FFmpeg is not bundled or installed by this package.
 
 ## Requirements
 
 - Python 3.11 or later
-- `ffmpeg` on `PATH` for audio playback
+- `ffmpeg` on `PATH` for file playback
+- A camera that exposes an ONVIF `sendonly` PCMA audio backchannel
 
-Discovery and stream URI lookup do not require FFmpeg. The package does not
-bundle or install the FFmpeg executable.
+Discovery and stream URI lookup do not require FFmpeg.
 
 ## Installation
 
@@ -22,17 +33,54 @@ Install a released version from PyPI:
 python3 -m pip install rtsp-backchannel
 ```
 
-Install the latest `master` source before the first registry release:
+To install the current `master` source instead of a registry release:
 
 ```bash
 python3 -m pip install \
   "git+https://github.com/GagaKor/rtsp-backchannel.git#subdirectory=python"
 ```
 
-## Complete workflow
+Install FFmpeg separately when playback is required:
 
-The usual flow is discovery, stream lookup, then one-shot playback. If the
-camera address is already known, discovery can be skipped.
+```bash
+# macOS
+brew install ffmpeg
+
+# Ubuntu or Debian
+sudo apt-get update
+sudo apt-get install ffmpeg
+```
+
+On Windows, install a build from the
+[FFmpeg download page](https://ffmpeg.org/download.html) and add the directory
+containing `ffmpeg.exe` to `PATH`.
+
+## Quick Playback
+
+```python
+import os
+
+from rtsp_backchannel import play_file
+
+result = play_file(
+    host="camera.local",
+    user="admin",
+    password=os.environ["ONVIF_PASSWORD"],
+    file="/absolute/path/to/event.mp3",
+    volume=0.05,
+)
+
+print(result.packets_sent, result.duration_seconds)
+```
+
+`volume` must be between `0.0` and `1.0`. The tested default is `0.05`.
+
+## Complete Workflow
+
+Discovery is optional when the camera address is already known. Stream lookup
+is useful for inspecting ONVIF Media Profiles, but `play_file` currently opens
+the first profile independently and does not accept a `StreamUri` selected by
+the caller.
 
 ```python
 import os
@@ -69,15 +117,8 @@ result = play_file(
     volume=0.05,
 )
 
-print(result.packets_sent, result.duration_seconds)
+print(result.codec, result.packets_sent, result.duration_seconds)
 ```
-
-`play_file` opens the first ONVIF Media Profile, requires that profile to expose
-a `sendonly` audio backchannel, sends the file once, and closes the RTSP
-session. It resolves that profile independently and does not accept a
-`StreamUri` selected from `get_stream_uris`. The current playback profile is
-PCMA 8 kHz mono over TCP interleaved RTP with 40 ms packets. `volume` accepts
-values from `0.0` to `1.0`; the tested default is `0.05`.
 
 ## Public API
 
@@ -95,9 +136,10 @@ Searches selected local IPv4 interfaces with WS-Discovery. Omitting
 `interfaces` uses addresses detected from hostname resolution and the default
 route. Pass every local IPv4 address explicitly when multiple NICs or VLANs
 must be covered. Each result contains `ip`, `xaddrs`, `scopes`, and optional
-`name`, `hardware`, and `endpoint_reference` fields. Discovery normally needs
-to run on the same subnet or VLAN as the camera because WS-Discovery multicast
-is not routed.
+`name`, `hardware`, and `endpoint_reference` fields.
+
+WS-Discovery multicast is normally not routed, so discovery must run from the
+same subnet or VLAN as the camera.
 
 ### `get_stream_uris`
 
@@ -112,7 +154,7 @@ get_stream_uris(
 ) -> list[StreamUri]
 ```
 
-Authenticates to the ONVIF Device and Media services and returns every Media
+Authenticates with the ONVIF Device and Media services and returns every Media
 Profile's `profile_token`, optional `profile_name`, and `uri`. Credentials are
 not inserted into returned RTSP URIs.
 
@@ -134,22 +176,24 @@ play_file(
 authentication failures, network failures, and unsupported camera SDP are
 reported as exceptions.
 
-## Command line
+## CLI
 
-On Bash or zsh, read `ONVIF_PASSWORD` without echoing it or putting its value in
-shell history:
+Read the password without echoing it or placing it in shell history:
 
 ```bash
-# Set the password once for the following commands.
 printf 'Camera password: '
 read -rs ONVIF_PASSWORD
 printf '\n'
 export ONVIF_PASSWORD
+```
 
+Then use the installed command:
+
+```bash
 # Discover cameras. Output is one JSON object per line.
 rtsp-backchannel discover --timeout-ms 3000
 
-# Select interfaces explicitly when the host has multiple NICs or VLANs.
+# Search explicit interfaces on a multi-NIC or multi-VLAN host.
 rtsp-backchannel discover \
   --interface 192.0.2.20 \
   --interface 198.51.100.20
@@ -159,7 +203,7 @@ rtsp-backchannel streams \
   --host camera.local \
   --user admin
 
-# Play one file and close the session.
+# Play one file and close the RTSP session.
 rtsp-backchannel play \
   --host camera.local \
   --user admin \
@@ -167,9 +211,47 @@ rtsp-backchannel play \
   --volume 0.05
 ```
 
-See the [project README](https://github.com/GagaKor/rtsp-backchannel) for the
-TypeScript and Rust APIs, protocol details, troubleshooting, and source-based
-development commands.
+The `play` word is optional for backward compatibility. `--pass` is available
+for manual use, but `ONVIF_PASSWORD` avoids exposing the password in the
+process argument list.
+
+## Playback Behavior
+
+- PCMA (G.711 A-law) at 8 kHz mono
+- TCP interleaved RTP
+- 40 ms audio packets with real-time pacing
+- RTSP keepalive during long files
+- RTSP teardown after success or failure
+
+The first ONVIF Media Profile must expose a `sendonly` PCMA audio track. Audio
+output and decoder configuration are camera-specific; a successful RTSP
+session does not override disabled or misrouted camera audio output settings.
+
+## Development
+
+From the repository root:
+
+```bash
+PYTHONPATH=python:. python3 -m unittest discover -s python -p 'test_*.py'
+python3 -m build python
+python3 -m twine check python/dist/*
+```
+
+Release preparation and registry publishing are documented in
+[RELEASING.md](https://github.com/GagaKor/rtsp-backchannel/blob/master/RELEASING.md).
+
+## License
+
+Licensed under either
+[MIT](https://github.com/GagaKor/rtsp-backchannel/blob/master/python/LICENSE-MIT)
+or
+[Apache-2.0](https://github.com/GagaKor/rtsp-backchannel/blob/master/python/LICENSE-APACHE),
+at your option.
+
+This package does not include or link FFmpeg. If an application bundles or
+redistributes FFmpeg, review the license terms of that FFmpeg build separately.
+See [FFmpeg Legal](https://ffmpeg.org/legal.html) and
+[THIRD_PARTY_NOTICES.md](https://github.com/GagaKor/rtsp-backchannel/blob/master/python/THIRD_PARTY_NOTICES.md).
 
 ONVIF is a trademark of ONVIF, Inc. This independent project is not affiliated
 with or endorsed by ONVIF, Inc. and does not claim ONVIF Profile conformance.

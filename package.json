@@ -21,7 +21,7 @@
     }
   },
   "bin": {
-    "rtsp-backchannel": "./dist/bin.js"
+    "rtsp-backchannel": "dist/bin.js"
   },
   "files": [
     "dist/index.*",
@@ -33,6 +33,7 @@
     "dist/rtp",
     "dist/rtsp",
     "README.md",
+    "README.ko.md",
     "LICENSE",
     "LICENSE-MIT",
     "LICENSE-APACHE",

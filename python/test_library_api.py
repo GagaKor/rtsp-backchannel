@@ -125,6 +125,15 @@ class LibraryApiTests(unittest.TestCase):
         self.assertEqual(metadata["project"]["requires-python"], ">=3.11")
         self.assertEqual(metadata["project"]["license"], "MIT OR Apache-2.0")
         self.assertEqual(metadata["project"]["readme"], "README.md")
+        for filename in ["README.md", "README.ko.md"]:
+            readme = pathlib.Path("python", filename)
+            self.assertTrue(readme.is_file())
+            contents = readme.read_text(encoding="utf-8")
+            self.assertIn("Python", contents)
+            self.assertIn("python/README.md", contents)
+            self.assertIn("python/README.ko.md", contents)
+            self.assertNotIn("```typescript", contents)
+            self.assertNotIn("```rust", contents)
         self.assertEqual(
             metadata["project"]["license-files"],
             [

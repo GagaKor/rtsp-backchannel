@@ -32,6 +32,7 @@ test('declares an installable npm package with ESM types and CLI exports', () =>
     'dist/rtp',
     'dist/rtsp',
     'README.md',
+    'README.ko.md',
     'LICENSE',
     'LICENSE-MIT',
     'LICENSE-APACHE',
@@ -43,7 +44,7 @@ test('declares an installable npm package with ESM types and CLI exports', () =>
   assert.equal(manifest.types, './dist/index.d.ts');
   assert.equal(manifest.exports['.'].import, './dist/index.js');
   assert.equal(manifest.exports['.'].types, './dist/index.d.ts');
-  assert.equal(manifest.bin['rtsp-backchannel'], './dist/bin.js');
+  assert.equal(manifest.bin['rtsp-backchannel'], 'dist/bin.js');
   assert.equal(
     manifest.repository.url,
     'git+https://github.com/GagaKor/rtsp-backchannel.git',
@@ -58,4 +59,16 @@ test('declares an installable npm package with ESM types and CLI exports', () =>
   );
   assert.equal(manifest.scripts.build, 'tsc -p tsconfig.build.json');
   assert.equal(manifest.dependencies?.[manifest.name], undefined);
+});
+
+test('ships separate English and Korean TypeScript documentation', () => {
+  const english = readFileSync('README.md', 'utf8');
+  const korean = readFileSync('README.ko.md', 'utf8');
+
+  assert.match(english, /TypeScript/);
+  assert.match(english, /README\.ko\.md/);
+  assert.doesNotMatch(english, /```(?:python|rust)/);
+  assert.match(korean, /TypeScript/);
+  assert.match(korean, /README\.md/);
+  assert.doesNotMatch(korean, /```(?:python|rust)/);
 });
