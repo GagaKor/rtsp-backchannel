@@ -2,7 +2,9 @@ use base64::Engine;
 use chrono::{DateTime, Duration as ChronoDuration, TimeZone, Utc};
 use rand::RngCore;
 use reqwest::blocking::Client;
+use serde::Serialize;
 use sha1::{Digest, Sha1};
+use std::time::Duration;
 
 const DEVICE_NS: &str = "http://www.onvif.org/ver10/device/wsdl";
 const MEDIA_NS: &str = "http://www.onvif.org/ver10/media/wsdl";
@@ -75,14 +77,76 @@ pub fn parse_device_time(xml: &str) -> Result<DateTime<Utc>, String> {
     .ok_or_else(|| "ONVIF returned an invalid UTCDateTime".to_owned())
 }
 
-pub fn parse_profile_tokens(xml: &str) -> Result<Vec<String>, String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnvifProfile {
+    pub token: String,
+    pub name: Option<String>,
+    pub has_audio_encoder: bool,
+    pub has_audio_output: bool,
+    pub has_audio_source: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamUriOptions {
+    pub host: String,
+    pub user: String,
+    pub password: String,
+    pub device_urls: Vec<String>,
+    pub timeout: Duration,
+}
+
+impl StreamUriOptions {
+    pub fn new(
+        host: impl Into<String>,
+        user: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
+        Self {
+            host: host.into(),
+            user: user.into(),
+            password: password.into(),
+            device_urls: Vec::new(),
+            timeout: Duration::from_secs(8),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamUri {
+    pub profile_token: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_name: Option<String>,
+    pub uri: String,
+}
+
+pub fn parse_profiles(xml: &str) -> Result<Vec<OnvifProfile>, String> {
     let document = roxmltree::Document::parse(xml)
         .map_err(|error| format!("invalid GetProfiles XML: {error}"))?;
     Ok(document
         .descendants()
         .filter(|node| node.is_element() && node.tag_name().name() == "Profiles")
-        .filter_map(|node| node.attribute("token"))
-        .map(str::to_owned)
+        .filter_map(|node| {
+            let token = node.attribute("token")?.to_owned();
+            let has_element = |name: &str| {
+                node.descendants()
+                    .any(|child| child.is_element() && child.tag_name().name() == name)
+            };
+            Some(OnvifProfile {
+                token,
+                name: descendant_text(node, "Name").map(str::to_owned),
+                has_audio_encoder: has_element("AudioEncoderConfiguration"),
+                has_audio_output: has_element("AudioOutputConfiguration"),
+                has_audio_source: has_element("AudioSourceConfiguration"),
+            })
+        })
+        .collect())
+}
+
+pub fn parse_profile_tokens(xml: &str) -> Result<Vec<String>, String> {
+    Ok(parse_profiles(xml)?
+        .into_iter()
+        .map(|profile| profile.token)
         .collect())
 }
 
@@ -116,9 +180,28 @@ impl OnvifDevice {
         password: &str,
         device_urls: Vec<String>,
     ) -> Result<Self, String> {
+        Self::with_device_urls_and_timeout(
+            host,
+            user,
+            password,
+            device_urls,
+            Duration::from_secs(8),
+        )
+    }
+
+    pub fn with_device_urls_and_timeout(
+        host: &str,
+        user: &str,
+        password: &str,
+        device_urls: Vec<String>,
+        timeout: Duration,
+    ) -> Result<Self, String> {
+        if timeout.is_zero() {
+            return Err("ONVIF timeout must be greater than zero".to_owned());
+        }
         let client = Client::builder()
             .danger_accept_invalid_certs(true)
-            .timeout(std::time::Duration::from_secs(8))
+            .timeout(timeout)
             .build()
             .map_err(|error| format!("failed to build ONVIF HTTP client: {error}"))?;
         Ok(Self {
@@ -181,12 +264,20 @@ impl OnvifDevice {
     }
 
     pub fn profile_tokens(&self) -> Result<Vec<String>, String> {
+        Ok(self
+            .profiles()?
+            .into_iter()
+            .map(|profile| profile.token)
+            .collect())
+    }
+
+    pub fn profiles(&self) -> Result<Vec<OnvifProfile>, String> {
         let xml = self.soap(
             self.require_media_url()?,
             &format!("<GetProfiles xmlns=\"{MEDIA_NS}\"/>"),
             true,
         )?;
-        let profiles = parse_profile_tokens(&xml)?;
+        let profiles = parse_profiles(&xml)?;
         if profiles.is_empty() {
             return Err("ONVIF returned no media profiles".to_owned());
         }
@@ -245,6 +336,38 @@ impl OnvifDevice {
         }
         Ok(text)
     }
+}
+
+pub fn get_stream_uris(options: &StreamUriOptions) -> Result<Vec<StreamUri>, String> {
+    let device_urls = if options.device_urls.is_empty() {
+        vec![
+            format!("http://{}/onvif/device_service", options.host),
+            format!("https://{}/onvif/device_service", options.host),
+            format!("http://{}:8000/onvif/device_service", options.host),
+        ]
+    } else {
+        options.device_urls.clone()
+    };
+    let mut device = OnvifDevice::with_device_urls_and_timeout(
+        &options.host,
+        &options.user,
+        &options.password,
+        device_urls,
+        options.timeout,
+    )?;
+    device.connect()?;
+    device
+        .profiles()?
+        .into_iter()
+        .map(|profile| {
+            let uri = device.stream_uri(&profile.token)?;
+            Ok(StreamUri {
+                profile_token: profile.token,
+                profile_name: profile.name,
+                uri,
+            })
+        })
+        .collect()
 }
 
 fn parse_first_text(xml: &str, name: &str) -> Option<String> {

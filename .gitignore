@@ -1,5 +1,12 @@
 node_modules/
+dist/
 rust/target/
+python/build/
+python/dist/
+*.egg-info/
+__pycache__/
+*.py[cod]
+*.tgz
 *.log
 .DS_Store
 out/

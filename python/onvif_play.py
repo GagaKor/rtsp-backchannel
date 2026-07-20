@@ -3,8 +3,8 @@
 Send audio to a camera speaker via ONVIF + RTSP backchannel.
 Python equivalent of the TS PoC (m3/cli) for cross-verification.
 
-  python3 python/onvif_play.py --host 172.168.46.56 --user admin --pass CHANGEME
-  python3 python/onvif_play.py --file test.mp3 --host 172.168.46.56
+  ONVIF_PASSWORD='<password>' python3 python/onvif_play.py --host camera.local
+  ONVIF_PASSWORD='<password>' python3 python/onvif_play.py --file test.mp3 --host camera.local
 """
 import argparse, base64, datetime, hashlib, math, os, pathlib, queue, re, socket, ssl, stat, struct, subprocess, threading, time, urllib.parse, urllib.request
 
@@ -1312,9 +1312,9 @@ def preroll_sample_count(sample_rate, preroll_ms):
 
 def build_argument_parser():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--host", default="172.168.46.56")
+    ap.add_argument("--host")
     ap.add_argument("--user", default="admin")
-    ap.add_argument("--pass", dest="pw", default="CHANGEME")
+    ap.add_argument("--pass", dest="pw", default=os.environ.get("ONVIF_PASSWORD"))
     input_group = ap.add_mutually_exclusive_group()
     input_group.add_argument("--file")
     input_group.add_argument("--pcma-input", type=pathlib.Path)
@@ -1459,6 +1459,11 @@ def main(argv=None):
                 f"audio preroll requires {preroll_bytes} bytes, exceeding "
                 f"the {MAX_REPEATED_MEDIA_BYTES} byte media limit"
             )
+
+    if not a.host:
+        ap.error("--host is required")
+    if not a.pw:
+        ap.error("--pass is required or set ONVIF_PASSWORD")
 
     payload, aac_frames, audio_message = prepare_audio(a)
     if a.codec == "aac" and len(aac_frames) > MAX_AUDIO_SOURCE_FRAMES:

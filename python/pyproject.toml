@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rtsp-backchannel"
+version = "0.1.0"
+description = "Discover ONVIF cameras, resolve RTSP streams, and play backchannel audio without GStreamer"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+license-files = [
+    "LICENSE",
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+    "THIRD_PARTY_NOTICES.md",
+]
+authors = [{ name = "GagaKor" }]
+requires-python = ">=3.11"
+dependencies = []
+keywords = ["onvif", "rtsp", "audio", "rtp", "backchannel"]
+
+[project.urls]
+Homepage = "https://github.com/GagaKor/rtsp-backchannel"
+Repository = "https://github.com/GagaKor/rtsp-backchannel.git"
+Issues = "https://github.com/GagaKor/rtsp-backchannel/issues"
+
+[project.scripts]
+rtsp-backchannel = "rtsp_backchannel.cli:main"
+
+[tool.setuptools]
+py-modules = ["backchannel_audio", "backchannel_rtp", "onvif_play"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["rtsp_backchannel*"]

@@ -1,10 +1,60 @@
 {
-  "name": "onvif-backchannel-poc",
+  "name": "rtsp-backchannel",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
-  "description": "ONVIF RTSP backchannel audio uplink PoC (MACS F7) — send G.711 audio to a camera speaker",
+  "description": "Discover ONVIF cameras, resolve RTSP streams, and play backchannel audio without GStreamer",
+  "keywords": [
+    "onvif",
+    "rtsp",
+    "audio",
+    "rtp",
+    "backchannel"
+  ],
+  "author": "GagaKor",
+  "license": "MIT OR Apache-2.0",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "rtsp-backchannel": "./dist/bin.js"
+  },
+  "files": [
+    "dist/index.*",
+    "dist/bin.*",
+    "dist/cli.*",
+    "dist/backchannel.*",
+    "dist/audio",
+    "dist/onvif",
+    "dist/rtp",
+    "dist/rtsp",
+    "README.md",
+    "LICENSE",
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/GagaKor/rtsp-backchannel.git"
+  },
+  "homepage": "https://github.com/GagaKor/rtsp-backchannel#readme",
+  "bugs": {
+    "url": "https://github.com/GagaKor/rtsp-backchannel/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepare": "npm run build",
     "discover": "node --experimental-transform-types src/discover.ts",
     "audiocheck": "node --experimental-transform-types src/audiocheck.ts",
     "streams": "node --experimental-transform-types src/streams.ts",

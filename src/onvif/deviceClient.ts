@@ -19,6 +19,24 @@ const WSU_NS =
 const PWD_DIGEST =
   'http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest';
 
+function decodeXml(value: string): string {
+  return value
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'");
+}
+
+function encodeXml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
 export interface DeviceInfo {
   manufacturer?: string;
   model?: string;
@@ -28,9 +46,30 @@ export interface DeviceInfo {
 
 export interface OnvifProfile {
   token: string;
+  name?: string;
   hasAudioEncoder: boolean;
   hasAudioOutput: boolean;
   hasAudioSource: boolean;
+}
+
+export function parseProfiles(xml: string): OnvifProfile[] {
+  const profiles: OnvifProfile[] = [];
+  const pattern = /<[^>]*:?Profiles\b[^>]*token="([^"]+)"[^>]*>([\s\S]*?)<\/[^>]*:?Profiles>/g;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(xml))) {
+    const [, encodedToken, block] = match;
+    const token = decodeXml(encodedToken);
+    const encodedName = firstTag(block, 'Name');
+    const name = encodedName ? decodeXml(encodedName) : undefined;
+    profiles.push({
+      token,
+      ...(name ? { name } : {}),
+      hasAudioEncoder: block.includes('AudioEncoderConfiguration'),
+      hasAudioOutput: block.includes('AudioOutputConfiguration'),
+      hasAudioSource: block.includes('AudioSourceConfiguration'),
+    });
+  }
+  return profiles;
 }
 
 export interface OnvifOptions {
@@ -104,7 +143,7 @@ export class OnvifDevice {
       .digest('base64');
     return (
       `<wsse:Security xmlns:wsse="${WSSE_NS}" xmlns:wsu="${WSU_NS}">` +
-      `<wsse:UsernameToken><wsse:Username>${this.user}</wsse:Username>` +
+      `<wsse:UsernameToken><wsse:Username>${encodeXml(this.user)}</wsse:Username>` +
       `<wsse:Password Type="${PWD_DIGEST}">${digest}</wsse:Password>` +
       `<wsse:Nonce>${nonce.toString('base64')}</wsse:Nonce>` +
       `<wsu:Created>${created}</wsu:Created></wsse:UsernameToken></wsse:Security>`
@@ -211,20 +250,7 @@ export class OnvifDevice {
   /** Returns profiles plus their audio configuration presence. */
   async getProfiles(): Promise<OnvifProfile[]> {
     const xml = await this.soap(this.requireMediaUrl(), `<GetProfiles xmlns="${MED_NS}"/>`, true);
-    const profiles: OnvifProfile[] = [];
-    // Split per <...Profiles ... token="..."> ... </...Profiles>
-    const re = /<[^>]*:?Profiles\b[^>]*token="([^"]+)"[^>]*>([\s\S]*?)<\/[^>]*:?Profiles>/g;
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(xml))) {
-      const [, token, block] = m;
-      profiles.push({
-        token,
-        hasAudioEncoder: block.includes('AudioEncoderConfiguration'),
-        hasAudioOutput: block.includes('AudioOutputConfiguration'),
-        hasAudioSource: block.includes('AudioSourceConfiguration'),
-      });
-    }
-    return profiles;
+    return parseProfiles(xml);
   }
 
   private mediaCall(action: string): Promise<string> {
@@ -271,10 +297,10 @@ export class OnvifDevice {
       `<GetStreamUri xmlns="${MED_NS}">` +
       `<StreamSetup><Stream xmlns="${SCHEMA_NS}">RTP-Unicast</Stream>` +
       `<Transport xmlns="${SCHEMA_NS}"><Protocol>RTSP</Protocol></Transport></StreamSetup>` +
-      `<ProfileToken>${profileToken}</ProfileToken></GetStreamUri>`;
+      `<ProfileToken>${encodeXml(profileToken)}</ProfileToken></GetStreamUri>`;
     const xml = await this.soap(this.requireMediaUrl(), body, true);
     const uri = firstTag(xml, 'Uri');
     if (!uri) throw new Error('no Uri in GetStreamUri response');
-    return uri.replace(/&amp;/g, '&');
+    return decodeXml(uri);
   }
 }

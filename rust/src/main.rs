@@ -1,56 +1,79 @@
-use anyhow::{Context, Result, anyhow};
-use clap::Parser;
-use onvif_backchannel_rs::audio::{G711Variant, decode_file, encode_g711};
-use onvif_backchannel_rs::backchannel::{BackchannelSession, SAMPLE_RATE};
-use onvif_backchannel_rs::cli::Cli;
+use anyhow::Result;
+use rtsp_backchannel::audio::G711Variant;
+use rtsp_backchannel::cli::{Cli, Invocation, parse_invocation_from};
+use rtsp_backchannel::discovery::{DiscoveryOptions, discover_devices};
+use rtsp_backchannel::onvif::{StreamUriOptions, get_stream_uris};
+use rtsp_backchannel::playback::{PlaybackConfig, play_file};
+use std::time::Duration;
 
 fn main() {
-    if let Err(error) = run() {
-        eprintln!("play error: {error:#}");
+    let invocation = match parse_invocation_from(std::env::args_os()) {
+        Ok(invocation) => invocation,
+        Err(error) => error.exit(),
+    };
+    if let Err(error) = run(invocation) {
+        eprintln!("error: {error:#}");
         std::process::exit(1);
     }
 }
 
-fn run() -> Result<()> {
-    let cli = Cli::parse();
+fn run(invocation: Invocation) -> Result<()> {
+    match invocation {
+        Invocation::Play(cli) => run_playback(cli),
+        Invocation::Discover(cli) => {
+            let devices = discover_devices(&DiscoveryOptions {
+                timeout: Duration::from_millis(cli.timeout_ms),
+                interfaces: cli.interfaces,
+            });
+            for device in devices {
+                println!("{}", serde_json::to_string(&device)?);
+            }
+            Ok(())
+        }
+        Invocation::Streams(cli) => {
+            let streams = get_stream_uris(&StreamUriOptions {
+                host: cli.host,
+                user: cli.user,
+                password: cli.password,
+                device_urls: cli.device_urls,
+                timeout: Duration::from_secs(8),
+            })
+            .map_err(anyhow::Error::msg)?;
+            for stream in streams {
+                println!("{}", serde_json::to_string(&stream)?);
+            }
+            Ok(())
+        }
+    }
+}
+
+fn run_playback(cli: Cli) -> Result<()> {
     println!(
         "# play \"{}\" -> {} speaker (backchannel)",
         cli.file.display(),
         cli.host
     );
-    let samples = decode_file(&cli.file).map_err(|error| anyhow!(error))?;
-
-    let mut session = BackchannelSession::open(&cli.host, &cli.user, &cli.password)
-        .map_err(|error| anyhow!(error))
-        .context("failed to open ONVIF backchannel")?;
+    let result = play_file(&PlaybackConfig {
+        host: cli.host,
+        user: cli.user,
+        password: cli.password,
+        file: cli.file,
+        volume: cli.volume,
+    })?;
     println!(
-        "backchannel open: {}/{} pt={} ch={}",
-        variant_name(session.variant),
-        SAMPLE_RATE,
-        session.payload_type,
-        session.rtp_channel
+        "playback complete: {}/{} pt={} ch={}",
+        variant_name(result.variant),
+        result.sample_rate,
+        result.payload_type,
+        result.rtp_channel
     );
-
-    let playback = (|| -> Result<usize, String> {
-        let encoded = encode_g711(&samples, session.variant, cli.volume)?;
-        println!(
-            "transcoded: {} bytes (~{:.1}s {} 8kHz mono)",
-            encoded.len(),
-            encoded.len() as f64 / SAMPLE_RATE as f64,
-            variant_name(session.variant)
-        );
-        session.send(&encoded)
-    })();
-    let cleanup = session.close();
-    let sent = match (playback, cleanup) {
-        (Ok(sent), Ok(())) => sent,
-        (Err(error), Ok(())) => return Err(anyhow!(error)),
-        (Ok(_), Err(cleanup)) => return Err(anyhow!(cleanup)),
-        (Err(error), Err(cleanup)) => {
-            return Err(anyhow!("{error}; RTSP cleanup also failed: {cleanup}"));
-        }
-    };
-    println!("sent {sent} RTP packets");
+    println!(
+        "encoded: {} bytes (~{:.1}s {} 8kHz mono)",
+        result.encoded_bytes,
+        result.duration_seconds,
+        variant_name(result.variant)
+    );
+    println!("sent {} RTP packets", result.packets_sent);
     Ok(())
 }
 

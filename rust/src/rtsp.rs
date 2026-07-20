@@ -131,9 +131,11 @@ impl RtspClient {
         }
         self.session = Some(session.to_owned());
         for field in session_fields {
-            if let Some(value) = field.trim().strip_prefix("timeout=")
-                && let Ok(seconds) = value.parse::<u64>()
-                && seconds > 0
+            if let Some(seconds) = field
+                .trim()
+                .strip_prefix("timeout=")
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|seconds| *seconds > 0)
             {
                 self.session_timeout = Duration::from_secs(seconds);
             }
@@ -231,12 +233,12 @@ impl RtspClient {
         headers: Vec<(String, String)>,
     ) -> Result<RtspResponse, String> {
         let mut response = self.send_request(method, uri, &headers)?;
-        if response.status == 401
-            && let Some(challenge) = response.headers.get("www-authenticate")
-        {
-            self.authentication = parse_authentication(challenge);
-            if self.authentication.is_some() {
-                response = self.send_request(method, uri, &headers)?;
+        if response.status == 401 {
+            if let Some(challenge) = response.headers.get("www-authenticate") {
+                self.authentication = parse_authentication(challenge);
+                if self.authentication.is_some() {
+                    response = self.send_request(method, uri, &headers)?;
+                }
             }
         }
         Ok(response)
@@ -250,7 +252,7 @@ impl RtspClient {
     ) -> Result<RtspResponse, String> {
         self.cseq = self.cseq.wrapping_add(1);
         let mut request = format!(
-            "{method} {uri} RTSP/1.0\r\nCSeq: {}\r\nUser-Agent: onvif-backchannel-rs\r\n",
+            "{method} {uri} RTSP/1.0\r\nCSeq: {}\r\nUser-Agent: rtsp-backchannel-rs\r\n",
             self.cseq
         );
         for (name, value) in headers {

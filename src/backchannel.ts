@@ -72,6 +72,17 @@ export interface BackchannelSession {
   close(): Promise<void>;
 }
 
+export async function closeRtspSession(
+  rtsp: Pick<RtspClient, 'teardown' | 'close'>,
+  streamUri: string,
+): Promise<void> {
+  try {
+    await rtsp.teardown(streamUri);
+  } finally {
+    rtsp.close();
+  }
+}
+
 function rtspHostPort(uri: string): { host: string; port: number } {
   const m = /^rtsp:\/\/(?:[^@/]+@)?([^:/]+)(?::(\d+))?/.exec(uri);
   if (!m) throw new Error(`bad RTSP uri: ${uri}`);
@@ -157,8 +168,7 @@ export async function openBackchannel(
         );
       },
       async close(): Promise<void> {
-        await rtsp.teardown(streamUri);
-        rtsp.close();
+        await closeRtspSession(rtsp, streamUri);
       },
     };
   } catch (err) {

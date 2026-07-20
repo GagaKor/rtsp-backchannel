@@ -218,7 +218,7 @@ pub fn parse_s16le(bytes: &[u8]) -> Result<Vec<i16>, &'static str> {
     if bytes.is_empty() {
         return Err("ffmpeg decode produced no audio samples");
     }
-    if !bytes.len().is_multiple_of(2) {
+    if bytes.len() % 2 != 0 {
         return Err("ffmpeg returned an incomplete S16LE sample");
     }
     Ok(bytes
@@ -323,7 +323,7 @@ mod tests {
     #[test]
     fn rejects_non_regular_or_oversized_sources_before_ffmpeg() {
         let root = std::env::temp_dir().join(format!(
-            "onvif-backchannel-audio-test-{:016x}",
+            "rtsp-backchannel-audio-test-{:016x}",
             rand::random::<u64>()
         ));
         fs::create_dir(&root).unwrap();

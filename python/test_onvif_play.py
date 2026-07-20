@@ -2730,6 +2730,8 @@ class RtpSenderMainTest(unittest.TestCase):
                 ) as resolver, redirect_stderr(StringIO()) as stderr, \
                         self.assertRaises(SystemExit):
                     onvif_play.main([
+                        "--host", "example.invalid",
+                        "--pass", "fake-password",
                         "--pcma-input", str(pcma_input),
                         "--packet-pattern", str(manifest),
                         "--preroll-ms", "0",
@@ -2827,6 +2829,8 @@ class RtpSenderMainTest(unittest.TestCase):
                 ResolverReached
             ):
                 onvif_play.main([
+                    "--host", "example.invalid",
+                    "--pass", "fake-password",
                     "--packet-pattern", str(tcp_manifest),
                     "--transport", "tcp",
                     "--preroll-ms", "0",
@@ -2888,6 +2892,8 @@ class RtpSenderMainTest(unittest.TestCase):
                 ResolverReached
             ):
                 onvif_play.main([
+                    "--host", "example.invalid",
+                    "--pass", "fake-password",
                     "--ms", "0",
                     "--packet-ms", "20",
                     "--preroll-ms", "0",
@@ -2910,6 +2916,8 @@ class RtpSenderMainTest(unittest.TestCase):
                 stderr
             ), self.assertRaises(SystemExit):
                 onvif_play.main([
+                    "--host", "example.invalid",
+                    "--pass", "fake-password",
                     "--ms", "0",
                     "--packet-ms", "20",
                     "--preroll-ms", "0",
@@ -3407,6 +3415,8 @@ class RtpSenderMainTest(unittest.TestCase):
             StringIO()
         ) as stderr, self.assertRaises(SystemExit):
             onvif_play.main([
+                "--host", "example.invalid",
+                "--pass", "fake-password",
                 "--codec", "aac",
                 "--file", "source.wav",
             ])
@@ -3662,6 +3672,8 @@ class RtpSenderMainTest(unittest.TestCase):
         for codec, transport, packet_ms in cases:
             argv = [
                 "onvif_play.py",
+                "--host", "example.invalid",
+                "--pass", "fake-password",
                 "--codec", codec,
                 "--transport", transport,
                 "--packet-ms", packet_ms,
@@ -3716,6 +3728,31 @@ class RtpSenderMainTest(unittest.TestCase):
         self.assertEqual(arguments.encoder, "python-alaw")
         self.assertEqual(arguments.rtp_identity, "sender")
         self.assertEqual(arguments.marker_mode, "first")
+
+    def test_cli_has_no_development_endpoint_or_password_defaults(self):
+        with patch.dict(os.environ, {}, clear=True):
+            arguments = onvif_play.build_argument_parser().parse_args([])
+
+        self.assertIsNone(arguments.host)
+        self.assertIsNone(arguments.pw)
+
+    def test_cli_requires_camera_host_and_password_before_audio_processing(self):
+        cases = [
+            (["--pass", "secret"], "--host"),
+            (["--host", "camera"], "--pass"),
+        ]
+        with patch.dict(os.environ, {}, clear=True):
+            for arguments, missing in cases:
+                with self.subTest(arguments=arguments), patch.object(
+                    onvif_play,
+                    "prepare_audio",
+                    side_effect=AssertionError("audio processing should not run"),
+                ) as prepare, redirect_stderr(StringIO()) as stderr, \
+                        self.assertRaises(SystemExit):
+                    onvif_play.main(arguments)
+
+                prepare.assert_not_called()
+                self.assertIn(missing, stderr.getvalue())
 
     def test_encoder_rejects_old_gst_compatible_name(self):
         parser = onvif_play.build_argument_parser()
@@ -3828,7 +3865,14 @@ class RtpSenderMainTest(unittest.TestCase):
             )
             for arguments, message in cases:
                 with self.subTest(arguments=arguments), patch.object(
-                    sys, "argv", ["onvif_play.py", *arguments]
+                    sys,
+                    "argv",
+                    [
+                        "onvif_play.py",
+                        "--host", "example.invalid",
+                        "--pass", "fake-password",
+                        *arguments,
+                    ],
                 ), patch.object(onvif_play, "onvif_stream_uri") as resolver, \
                         redirect_stderr(StringIO()) as stderr, \
                         self.assertRaises((SystemExit, ValueError)) as raised:
@@ -3843,7 +3887,14 @@ class RtpSenderMainTest(unittest.TestCase):
             path = pathlib.Path(directory) / "captured.pcma"
             path.write_bytes(b"1234")
             with patch.object(onvif_play, "MAX_PCMA_INPUT_BYTES", 3), patch.object(
-                sys, "argv", ["onvif_play.py", "--pcma-input", str(path)]
+                sys,
+                "argv",
+                [
+                    "onvif_play.py",
+                    "--host", "example.invalid",
+                    "--pass", "fake-password",
+                    "--pcma-input", str(path),
+                ],
             ), patch.object(onvif_play, "onvif_stream_uri") as resolver, patch.object(
                 pathlib.Path, "read_bytes", side_effect=AssertionError("unbounded read")
             ), self.assertRaisesRegex(ValueError, "exceeds 3 byte limit"):
