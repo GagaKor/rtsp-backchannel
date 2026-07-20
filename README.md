@@ -33,7 +33,7 @@ brew install ffmpeg
 npm install onvif-backchannel
 
 # 현재 Git 브랜치에서 설치
-npm install "github:GagaKor/onvif-test#onvif-rtsp-two-way-audio"
+npm install "github:GagaKor/onvif-backchannel#onvif-rtsp-two-way-audio"
 ```
 
 ```typescript
@@ -58,7 +58,7 @@ python3 -m pip install onvif-backchannel
 
 # 현재 Git 브랜치의 Python 패키지 설치
 python3 -m pip install \
-  "git+https://github.com/GagaKor/onvif-test.git@onvif-rtsp-two-way-audio#subdirectory=python"
+  "git+https://github.com/GagaKor/onvif-backchannel.git@onvif-rtsp-two-way-audio#subdirectory=python"
 ```
 
 ```python
@@ -90,7 +90,7 @@ onvif-backchannel = "0.1"
 
 ```toml
 [dependencies]
-onvif-backchannel = { git = "https://github.com/GagaKor/onvif-test.git", branch = "onvif-rtsp-two-way-audio" }
+onvif-backchannel = { git = "https://github.com/GagaKor/onvif-backchannel.git", branch = "onvif-rtsp-two-way-audio" }
 ```
 
 Private GitHub 저장소에서 Cargo의 기본 Git 클라이언트가 인증 정보를 찾지 못하면 소비자

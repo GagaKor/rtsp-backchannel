@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Discover ONVIF cameras, resolve RTSP streams, and play backchannel audio"
-repository = "https://github.com/GagaKor/onvif-test"
+repository = "https://github.com/GagaKor/onvif-backchannel"
 keywords = ["onvif", "rtsp", "audio", "rtp", "backchannel"]
 categories = ["multimedia::audio", "network-programming"]
 
