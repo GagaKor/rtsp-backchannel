@@ -3,8 +3,7 @@
 ONVIF Device/Media 서비스의 일부 기능을 사용해 카메라를 검색하고, 프로필별 RTSP
 URI를 조회하고, RTSP 백채널로 음원을 재생하는 Python/TypeScript/Rust 라이브러리 및
 CLI입니다. GStreamer는 사용하지 않습니다. FFmpeg는 입력 파일을 mono 8kHz PCM으로
-디코딩할 때만 사용하고, PCMA(A-law) 인코딩과 RTP/RTSP 전송은 각 언어의 코드가
-처리합니다.
+디코딩할 때만 사용하고, G.711 인코딩과 RTP/RTSP 전송은 각 언어의 코드가 처리합니다.
 
 ## 준비
 
@@ -29,7 +28,7 @@ sudo apt-get install ffmpeg
 Windows에서는 [FFmpeg 다운로드 페이지](https://ffmpeg.org/download.html)에서 빌드를
 설치한 뒤 `ffmpeg.exe`가 있는 디렉터리를 `PATH`에 추가합니다.
 
-## 다른 프로젝트에서 라이브러리로 사용
+## 설치와 빠른 재생
 
 npm, PyPI, crates.io 패키지 이름은 모두 `rtsp-backchannel`입니다. 릴리스 버전은 각
 Registry에서 설치하고, 아직 게시되지 않은 버전이나 최신 소스는 GitHub의 `master`
@@ -50,10 +49,13 @@ npm install "github:GagaKor/rtsp-backchannel"
 ```typescript
 import { playFile } from 'rtsp-backchannel';
 
+const password = process.env.ONVIF_PASSWORD;
+if (!password) throw new Error('ONVIF_PASSWORD is required');
+
 const packetsSent = await playFile({
   host: 'camera.local',
   user: 'admin',
-  pass: process.env.ONVIF_PASSWORD ?? '',
+  pass: password,
   file: '/absolute/path/to/audio.mp3',
   volume: 0.05,
 });
@@ -93,6 +95,7 @@ print(result.packets_sent)
 
 ```toml
 [dependencies]
+anyhow = "1"
 rtsp-backchannel = "0.1"
 ```
 
@@ -100,6 +103,7 @@ rtsp-backchannel = "0.1"
 
 ```toml
 [dependencies]
+anyhow = "1"
 rtsp-backchannel = { git = "https://github.com/GagaKor/rtsp-backchannel.git", branch = "master" }
 ```
 
@@ -125,7 +129,225 @@ fn main() -> anyhow::Result<()> {
 위 Rust 예제처럼 `anyhow::Result`를 사용하려면 소비자 프로젝트에 `anyhow = "1"`도
 추가합니다.
 
-## ONVIF 장치 검색과 RTSP URI 조회
+## 라이브러리 기능 사용법
+
+세 구현의 권장 호출 순서는 같습니다.
+
+1. `discover` API로 같은 서브넷의 카메라를 찾습니다. 주소를 이미 알면 생략할 수 있습니다.
+2. `streams` API로 Media Profile별 RTSP URI를 조회합니다.
+3. `play` API로 음원 한 파일을 전송합니다. 재생이 끝나면 RTSP 세션이 종료됩니다.
+
+`streams` 결과는 프로필 확인이나 별도 RTSP 클라이언트에 사용할 수 있습니다. 현재 고수준
+`play` API는 선택한 `StreamUri`를 입력받지 않고, 카메라의 첫 번째 Media Profile URI를
+독립적으로 다시 조회합니다. 첫 프로필에 `sendonly` 오디오 백채널이 없으면 재생은
+오류로 종료됩니다.
+
+장치 검색과 URI 조회에는 FFmpeg가 필요하지 않습니다. 파일 재생에서만 실행 환경의
+`ffmpeg`를 사용합니다. 비밀번호는 환경변수나 secret manager에서 읽어 API에 별도로
+전달하고, RTSP URI에 삽입하지 않는 방식을 권장합니다.
+
+현재 고수준 재생 API는 G.711 8kHz mono, TCP interleaved RTP, 40ms 패킷 프로필을
+사용합니다. Python은 PCMA를 요구하고, TypeScript와 Rust는 PCMA를 우선하되 카메라가
+PCMU만 제공하면 PCMU를 사용합니다. `volume`은 `0.0`부터 `1.0`까지이며 검증된 권장값은
+`0.05`입니다.
+
+### TypeScript 전체 워크플로
+
+```typescript
+import {
+  discoverDevices,
+  getStreamUris,
+  playFile,
+} from 'rtsp-backchannel';
+
+const password = process.env.ONVIF_PASSWORD;
+if (!password) throw new Error('ONVIF_PASSWORD is required');
+
+const devices = await discoverDevices({ timeoutMs: 3000 });
+const camera = devices[0];
+if (!camera) throw new Error('no ONVIF device found');
+
+const streams = await getStreamUris({
+  host: camera.ip,
+  user: 'admin',
+  pass: password,
+  deviceUrls: camera.xaddrs,
+  timeoutMs: 8000,
+});
+
+for (const stream of streams) {
+  console.log(stream.profileToken, stream.profileName, stream.uri);
+}
+
+const packetsSent = await playFile({
+  host: camera.ip,
+  user: 'admin',
+  pass: password,
+  file: '/absolute/path/to/event.mp3',
+  volume: 0.05,
+});
+
+console.log({ packetsSent });
+```
+
+주요 공개 API:
+
+| API | 주요 입력 | 반환값 |
+| --- | --- | --- |
+| `discoverDevices(options?)` | `timeoutMs?`, `interfaces?: string[]` | `Promise<DiscoveredDevice[]>` |
+| `getStreamUris(options)` | `host`, `user`, `pass`, `deviceUrls?`, `timeoutMs?` | `Promise<StreamUri[]>` |
+| `playFile(options)` | `host`, `user`, `pass`, `file`, `volume` | 전송한 RTP 패킷 수 `Promise<number>` |
+
+`DiscoveredDevice`에는 `ip`, `xaddrs`, `scopes`, 선택적인 `name`, `hardware`,
+`endpointReference`가 있습니다. `StreamUri`에는 `profileToken`, 선택적인 `profileName`,
+인증정보가 삽입되지 않은 `uri`가 있습니다. 네트워크 및 프로토콜 오류는 Promise
+rejection으로 반환됩니다.
+
+세션을 직접 열어 이미 인코딩한 G.711 버퍼를 보내려면 저수준 API를 사용할 수 있습니다.
+세션은 오류가 발생해도 반드시 닫아야 합니다.
+
+```typescript
+import { fileToG711, openBackchannel } from 'rtsp-backchannel';
+
+const password = process.env.ONVIF_PASSWORD;
+if (!password) throw new Error('ONVIF_PASSWORD is required');
+
+const session = await openBackchannel('camera.local', 'admin', password);
+try {
+  const g711 = await fileToG711(
+    '/absolute/path/to/event.mp3',
+    session.variant,
+    0.05,
+  );
+  const packetsSent = await session.send(g711);
+  console.log({ packetsSent });
+} finally {
+  await session.close();
+}
+```
+
+`pcm16ToG711`, `linearToALaw`, `linearToMuLaw`, `generateTonePcm`,
+`sendPacedG711`도 공개되어 있어 PCM 생성이나 인코딩을 직접 제어할 수 있습니다.
+
+### Python 전체 워크플로
+
+```python
+import os
+
+from rtsp_backchannel import (
+    discover_devices,
+    get_stream_uris,
+    play_file,
+)
+
+password = os.environ["ONVIF_PASSWORD"]
+
+devices = discover_devices(timeout=3.0)
+if not devices:
+    raise RuntimeError("no ONVIF device found")
+camera = devices[0]
+
+streams = get_stream_uris(
+    host=camera.ip,
+    user="admin",
+    password=password,
+    device_urls=camera.xaddrs,
+    timeout=8.0,
+)
+
+for stream in streams:
+    print(stream.profile_token, stream.profile_name, stream.uri)
+
+result = play_file(
+    host=camera.ip,
+    user="admin",
+    password=password,
+    file="/absolute/path/to/event.mp3",
+    volume=0.05,
+)
+
+print(result.codec, result.packets_sent, result.duration_seconds)
+```
+
+주요 공개 API:
+
+| API | 주요 입력 | 반환값 |
+| --- | --- | --- |
+| `discover_devices(...)` | `timeout=3.0`, `interfaces=None` | `list[DiscoveredDevice]` |
+| `get_stream_uris(...)` | `host`, `user`, `password`, `device_urls=None`, `timeout=8.0` | `list[StreamUri]` |
+| `play_file(...)` | `host`, `user`, `password`, `file`, `volume=0.05` | `PlaybackResult` |
+
+`PlaybackResult`에는 `codec`, `sample_rate`, `payload_type`, `rtp_channel`,
+`encoded_bytes`, `packets_sent`, `duration_seconds`가 있습니다. 검색 결과가 없으면 빈
+리스트를 반환하고, 잘못된 인자나 네트워크·프로토콜 오류는 예외로 반환합니다. 다중
+NIC/VLAN을 빠짐없이 검색해야 하면 `interfaces`에 각 로컬 IPv4 주소를 명시합니다.
+
+### Rust 전체 워크플로
+
+예제에서 오류 전달을 단순화하려면 소비자 `Cargo.toml`에 `anyhow = "1"`을 함께
+추가합니다.
+
+```rust
+use std::path::PathBuf;
+
+use anyhow::{Error, Result, anyhow};
+use rtsp_backchannel::discovery::{DiscoveryOptions, discover_devices};
+use rtsp_backchannel::onvif::{StreamUriOptions, get_stream_uris};
+use rtsp_backchannel::playback::{PlaybackConfig, play_file};
+
+fn main() -> Result<()> {
+    let password = std::env::var("ONVIF_PASSWORD")?;
+
+    let devices = discover_devices(&DiscoveryOptions::default());
+    let camera = devices
+        .first()
+        .ok_or_else(|| anyhow!("no ONVIF device found"))?;
+
+    let mut stream_options = StreamUriOptions::new(
+        camera.ip.to_string(),
+        "admin",
+        password.clone(),
+    );
+    stream_options.device_urls.clone_from(&camera.xaddrs);
+    let streams = get_stream_uris(&stream_options).map_err(Error::msg)?;
+
+    for stream in streams {
+        println!(
+            "{} {:?} {}",
+            stream.profile_token, stream.profile_name, stream.uri
+        );
+    }
+
+    let result = play_file(&PlaybackConfig {
+        host: camera.ip.to_string(),
+        user: "admin".to_owned(),
+        password,
+        file: PathBuf::from("/absolute/path/to/event.mp3"),
+        volume: 0.05,
+    })?;
+
+    println!(
+        "{:?} {} packets {:.2}s",
+        result.variant, result.packets_sent, result.duration_seconds
+    );
+    Ok(())
+}
+```
+
+주요 공개 API:
+
+| API | 주요 입력 | 반환값 |
+| --- | --- | --- |
+| `discover_devices(&options)` | `DiscoveryOptions { timeout, interfaces }` | `Vec<DiscoveredDevice>` |
+| `get_stream_uris(&options)` | `StreamUriOptions` | `Result<Vec<StreamUri>, String>` |
+| `play_file(&config)` | `PlaybackConfig` | `anyhow::Result<PlaybackResult>` |
+
+`PlaybackResult`에는 `variant`, `sample_rate`, `payload_type`, `rtp_channel`,
+`encoded_bytes`, `packets_sent`, `duration_seconds`가 있습니다. `DiscoveryOptions::default()`는
+3초 동안 자동 선택한 로컬 IPv4 주소에서 검색합니다. 다중 NIC/VLAN에서는
+`DiscoveryOptions.interfaces`에 각 주소를 명시합니다.
+
+## CLI 사용법
 
 설치된 세 패키지는 동일한 CLI 명령을 제공합니다. `discover`는 같은 네트워크의 ONVIF
 장치를 WS-Discovery로 찾고, `streams`는 인증 후 모든 Media Profile의 RTSP URI를
@@ -140,75 +362,42 @@ rtsp-backchannel discover \
   --interface 192.0.2.20 \
   --interface 198.51.100.20
 
+# Bash/zsh에서 비밀번호를 화면과 셸 히스토리에 남기지 않고 설정
+printf 'Camera password: '
+read -rs ONVIF_PASSWORD
+printf '\n'
+export ONVIF_PASSWORD
+
 # 카메라의 모든 profile token/name/RTSP URI 조회
-ONVIF_PASSWORD='<CAMERA_PASSWORD>' rtsp-backchannel streams \
+rtsp-backchannel streams \
   --host camera.local \
   --user admin
+
+# 음원 한 파일 재생 후 세션 종료
+rtsp-backchannel \
+  --host camera.local \
+  --user admin \
+  --file '/absolute/path/to/event.mp3' \
+  --volume 0.05
 ```
 
-저장소에서 직접 실행할 때는 언어별로 다음 명령을 사용합니다.
+저장소에서 직접 실행할 때도 앞에서 설정한 `ONVIF_PASSWORD`를 사용해 언어별로 다음
+명령을 실행합니다.
 
 ```bash
 # TypeScript
 npm run play -- discover --timeout-ms 3000
-npm run play -- streams --host camera.local --user admin --pass '<CAMERA_PASSWORD>'
+npm run play -- streams --host camera.local --user admin
 
 # Python
 PYTHONPATH=python python3 -m rtsp_backchannel.cli discover --timeout-ms 3000
 PYTHONPATH=python python3 -m rtsp_backchannel.cli streams \
-  --host camera.local --user admin --pass '<CAMERA_PASSWORD>'
+  --host camera.local --user admin
 
 # Rust
 cargo run --release --manifest-path rust/Cargo.toml -- discover --timeout-ms 3000
-ONVIF_PASSWORD='<CAMERA_PASSWORD>' cargo run --release \
+cargo run --release \
   --manifest-path rust/Cargo.toml -- streams --host camera.local --user admin
-```
-
-TypeScript 라이브러리 API:
-
-```typescript
-import { discoverDevices, getStreamUris } from 'rtsp-backchannel';
-
-const devices = await discoverDevices({ timeoutMs: 3000 });
-const streams = await getStreamUris({
-  host: devices[0].ip,
-  user: 'admin',
-  pass: process.env.ONVIF_PASSWORD ?? '',
-  deviceUrls: devices[0].xaddrs,
-});
-```
-
-Python 라이브러리 API:
-
-```python
-import os
-
-from rtsp_backchannel import discover_devices, get_stream_uris
-
-devices = discover_devices(timeout=3.0)
-streams = get_stream_uris(
-    host=devices[0].ip,
-    user="admin",
-    password=os.environ["ONVIF_PASSWORD"],
-    device_urls=devices[0].xaddrs,
-)
-```
-
-Rust 라이브러리 API:
-
-```rust
-use rtsp_backchannel::discovery::{DiscoveryOptions, discover_devices};
-use rtsp_backchannel::onvif::{StreamUriOptions, get_stream_uris};
-
-let devices = discover_devices(&DiscoveryOptions::default());
-let first = devices.first().ok_or("no ONVIF device")?;
-let mut options = StreamUriOptions::new(
-    first.ip.to_string(),
-    "admin",
-    std::env::var("ONVIF_PASSWORD")?,
-);
-options.device_urls.clone_from(&first.xaddrs);
-let streams = get_stream_uris(&options)?;
 ```
 
 RTSP URI는 SOAP 응답값 그대로 반환하며 사용자명이나 비밀번호를 URI에 삽입하지 않습니다.
@@ -223,7 +412,6 @@ RTSP 클라이언트에는 URI와 인증정보를 각각 전달합니다. WS-Dis
 python3 python/onvif_play.py \
   --host camera.local \
   --user admin \
-  --pass '<CAMERA_PASSWORD>' \
   --file '/absolute/path/to/audio.mp3'
 ```
 
@@ -244,7 +432,6 @@ python3 python/onvif_play.py \
 python3 python/onvif_play.py \
   --host camera.local \
   --user admin \
-  --pass '<CAMERA_PASSWORD>' \
   --file '/absolute/path/to/audio.mp3' \
   --volume 0.05 \
   --encoder python-alaw \
@@ -267,14 +454,14 @@ python3 python/onvif_play.py \
 npm install
 ```
 
-다음 명령은 Python과 동일한 0.05 볼륨, PCMA 8kHz, TCP, 40ms 패킷,
-rebase 페이싱 프로필을 사용합니다.
+다음 명령은 Python과 동일한 0.05 볼륨, G.711 8kHz, TCP, 40ms 패킷,
+rebase 페이싱 프로필을 사용합니다. PCMA를 우선하고 카메라가 PCMU만 제공하면
+PCMU를 사용합니다.
 
 ```bash
 npm run play -- \
   --host camera.local \
   --user admin \
-  --pass '<CAMERA_PASSWORD>' \
   --file '/absolute/path/to/audio.mp3' \
   --volume 0.05
 ```
@@ -284,8 +471,9 @@ npm run play -- \
 
 ## Rust로 한 번 재생
 
-다음 명령은 다른 구현과 동일한 순수 Rust Q11/A-law 인코더, PCMA 8kHz,
-TCP, 40ms 패킷, rebase 페이싱 프로필을 사용합니다. GStreamer는 필요하지 않습니다.
+다음 명령은 순수 Rust Q11/G.711 인코더, 8kHz, TCP, 40ms 패킷, rebase 페이싱
+프로필을 사용합니다. PCMA를 우선하고 카메라가 PCMU만 제공하면 PCMU를 사용합니다.
+GStreamer는 필요하지 않습니다.
 
 ```bash
 # 실행 전 서비스 secret/env에 ONVIF_PASSWORD를 설정합니다.
