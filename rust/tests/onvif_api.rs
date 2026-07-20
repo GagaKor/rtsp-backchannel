@@ -5,9 +5,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use onvif_backchannel::cli::{Invocation, parse_invocation_from};
-use onvif_backchannel::discovery::{DiscoveryOptions, parse_probe_matches};
-use onvif_backchannel::onvif::{StreamUriOptions, get_stream_uris, parse_profiles};
+use rtsp_backchannel::cli::{Invocation, parse_invocation_from};
+use rtsp_backchannel::discovery::{DiscoveryOptions, parse_probe_matches};
+use rtsp_backchannel::onvif::{StreamUriOptions, get_stream_uris, parse_profiles};
 
 const PROBE_RESPONSE: &str = r#"<?xml version="1.0"?>
 <s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
@@ -122,7 +122,7 @@ fn returns_every_profile_uri_unchanged_and_keeps_credentials_transport_only() {
 #[test]
 fn parses_discover_and_streams_without_breaking_direct_playback_flags() {
     match parse_invocation_from([
-        "onvif-backchannel",
+        "rtsp-backchannel",
         "discover",
         "--timeout-ms",
         "1500",
@@ -141,7 +141,7 @@ fn parses_discover_and_streams_without_breaking_direct_playback_flags() {
     }
 
     match parse_invocation_from([
-        "onvif-backchannel",
+        "rtsp-backchannel",
         "streams",
         "--host",
         "camera",
@@ -163,9 +163,11 @@ fn parses_discover_and_streams_without_breaking_direct_playback_flags() {
 
     assert!(matches!(
         parse_invocation_from([
-            "onvif-backchannel",
+            "rtsp-backchannel",
             "--host",
             "camera",
+            "--pass",
+            "secret",
             "--file",
             "event.mp3",
         ])
@@ -181,7 +183,7 @@ fn binary_help_exits_successfully_for_root_and_subcommands() {
         &["discover", "--help"],
         &["streams", "--help"],
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_onvif-backchannel"))
+        let output = Command::new(env!("CARGO_BIN_EXE_rtsp-backchannel"))
             .args(arguments)
             .output()
             .unwrap();

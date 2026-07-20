@@ -29,7 +29,7 @@ SECOND_RESPONSE = b"""<?xml version="1.0"?>
 
 class OnvifLibraryTests(unittest.TestCase):
     def test_parses_namespace_independent_probe_match_metadata(self):
-        from onvif_backchannel.onvif import parse_probe_matches
+        from rtsp_backchannel.onvif import parse_probe_matches
 
         devices = parse_probe_matches(FIRST_RESPONSE, "10.128.10.141")
 
@@ -54,7 +54,7 @@ class OnvifLibraryTests(unittest.TestCase):
         self.assertEqual(devices[0].endpoint_reference, "urn:uuid:camera-1")
 
     def test_probes_interfaces_to_one_deadline_and_merges_duplicates(self):
-        from onvif_backchannel import onvif
+        from rtsp_backchannel import onvif
 
         calls = []
 
@@ -94,7 +94,7 @@ class OnvifLibraryTests(unittest.TestCase):
         )
 
     def test_parses_profile_names_and_audio_capabilities(self):
-        from onvif_backchannel.onvif import parse_profiles
+        from rtsp_backchannel.onvif import parse_profiles
 
         profiles = parse_profiles(
             """
@@ -116,8 +116,8 @@ class OnvifLibraryTests(unittest.TestCase):
         self.assertFalse(profiles[0].has_audio_source)
 
     def test_returns_all_stream_uris_unchanged_with_transport_only_credentials(self):
-        from onvif_backchannel import onvif
-        from onvif_backchannel.onvif import OnvifProfile
+        from rtsp_backchannel import onvif
+        from rtsp_backchannel.onvif import OnvifProfile
 
         created = []
 

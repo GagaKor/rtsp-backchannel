@@ -1,12 +1,14 @@
 [package]
-name = "onvif-backchannel"
+name = "rtsp-backchannel"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.86"
 description = "Discover ONVIF cameras, resolve RTSP streams, and play backchannel audio"
+authors = ["GagaKor"]
 license = "MIT OR Apache-2.0"
 readme = "../README.md"
-repository = "https://github.com/GagaKor/onvif-backchannel"
+repository = "https://github.com/GagaKor/rtsp-backchannel"
+homepage = "https://github.com/GagaKor/rtsp-backchannel"
 keywords = ["onvif", "rtsp", "audio", "rtp", "backchannel"]
 categories = ["multimedia::audio", "network-programming"]
 

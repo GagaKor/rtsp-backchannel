@@ -14,8 +14,11 @@ build.
 
 See <https://ffmpeg.org/legal.html>.
 
-## ONVIF implementation
+## ONVIF implementation and trademark
 
 The ONVIF, WS-Discovery, RTP, and RTSP support in this repository is an
 independent protocol implementation. The distributed packages do not include
 a third-party ONVIF SDK.
+
+ONVIF is a trademark of ONVIF, Inc. This project is not affiliated with or
+endorsed by ONVIF, Inc. and does not claim ONVIF Profile conformance.

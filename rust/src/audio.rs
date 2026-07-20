@@ -323,7 +323,7 @@ mod tests {
     #[test]
     fn rejects_non_regular_or_oversized_sources_before_ffmpeg() {
         let root = std::env::temp_dir().join(format!(
-            "onvif-backchannel-audio-test-{:016x}",
+            "rtsp-backchannel-audio-test-{:016x}",
             rand::random::<u64>()
         ));
         fs::create_dir(&root).unwrap();

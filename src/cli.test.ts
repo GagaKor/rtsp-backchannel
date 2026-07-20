@@ -25,7 +25,7 @@ test('runs the dedicated npm binary entry point', () => {
   );
 
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /Usage: onvif-backchannel/);
+  assert.match(result.stdout, /Usage: rtsp-backchannel/);
   assert.match(result.stdout, /--file/);
 });
 
@@ -35,12 +35,31 @@ test('parses the validated 0.05 volume default and rejects invalid gain', () => 
   const parse = (cli as unknown as { parseCliArgs?: Parser }).parseCliArgs;
   assert.ok(parse);
 
-  assert.equal(parse(['--file', 'event.mp3']).volume, 0.05);
+  const required = ['--host', 'camera', '--pass', 'secret', '--file', 'event.mp3'];
+  assert.equal(parse(required).volume, 0.05);
   for (const volume of ['nan', '-0.1', '1.1']) {
     assert.throws(
-      () => parse(['--file', 'event.mp3', '--volume', volume]),
+      () => parse([...required, '--volume', volume]),
       /volume must be finite and between 0 and 1/,
     );
+  }
+});
+
+test('requires a camera host and password instead of development defaults', () => {
+  const previous = process.env.ONVIF_PASSWORD;
+  delete process.env.ONVIF_PASSWORD;
+  try {
+    assert.throws(
+      () => cli.parseCliArgs(['--pass', 'secret', '--file', 'event.mp3']),
+      /missing --host/,
+    );
+    assert.throws(
+      () => cli.parseCliArgs(['--host', 'camera', '--file', 'event.mp3']),
+      /missing --pass/,
+    );
+  } finally {
+    if (previous === undefined) delete process.env.ONVIF_PASSWORD;
+    else process.env.ONVIF_PASSWORD = previous;
   }
 });
 
@@ -52,7 +71,10 @@ test('uses ONVIF_PASSWORD when --pass is omitted', () => {
   const previous = process.env.ONVIF_PASSWORD;
   process.env.ONVIF_PASSWORD = 'environment-secret';
   try {
-    assert.equal(parse(['--file', 'event.mp3']).pass, 'environment-secret');
+    assert.equal(
+      parse(['--host', 'camera', '--file', 'event.mp3']).pass,
+      'environment-secret',
+    );
   } finally {
     if (previous === undefined) delete process.env.ONVIF_PASSWORD;
     else process.env.ONVIF_PASSWORD = previous;

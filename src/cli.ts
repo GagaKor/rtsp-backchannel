@@ -3,7 +3,7 @@
 /**
  * M4 — play an audio file out the camera speaker via the ONVIF backchannel.
  *
- *   onvif-backchannel --host 10.128.10.141 --user admin --pass CHANGEME \
+ *   rtsp-backchannel --host camera.local --user admin --pass '<password>' \
  *     --file announce.wav --volume 0.05
  */
 import { openBackchannel, SAMPLE_RATE } from './backchannel.ts';
@@ -12,15 +12,15 @@ import { pathToFileURL } from 'node:url';
 import { discoverDevices } from './onvif/discovery.ts';
 import { getStreamUris } from './onvif/streams.ts';
 
-const HELP = `Usage: onvif-backchannel --host <camera> --user <user> --pass <password> --file <audio>
-  onvif-backchannel discover [--timeout-ms <ms>] [--interface <IPv4> ...]
-  onvif-backchannel streams --host <camera> [--user <user>] [--pass <password>]
+const HELP = `Usage: rtsp-backchannel --host <camera> --user <user> --pass <password> --file <audio>
+  rtsp-backchannel discover [--timeout-ms <ms>] [--interface <IPv4> ...]
+  rtsp-backchannel streams --host <camera> [--user <user>] [--pass <password>]
 
 Options:
   --file <path>       audio file to play once
   --host <address>    camera address
   --user <name>       ONVIF/RTSP user
-  --pass <password>   ONVIF/RTSP password (default: ONVIF_PASSWORD or CHANGEME)
+  --pass <password>   ONVIF/RTSP password (or set ONVIF_PASSWORD)
   --volume <0..1>     linear volume (default: 0.05)
 
 Playback profile: PCMA 8 kHz mono, TCP interleaved RTP, 40 ms packets.
@@ -78,9 +78,9 @@ export function parseCliArgs(argv: string[]): PlaybackOptions {
     throw new RangeError('volume must be finite and between 0 and 1');
   }
   return {
-    host: arg(argv, 'host', '172.168.46.56'),
+    host: arg(argv, 'host'),
     user: arg(argv, 'user', 'admin'),
-    pass: arg(argv, 'pass', process.env.ONVIF_PASSWORD ?? 'CHANGEME'),
+    pass: arg(argv, 'pass', process.env.ONVIF_PASSWORD),
     file: arg(argv, 'file'),
     volume,
   };
@@ -164,9 +164,9 @@ export async function main(
     const commandArgs = argv.slice(1);
     const deviceUrls = args(commandArgs, 'device-url');
     const streams = await dependencies.getStreamUris({
-      host: arg(commandArgs, 'host', '172.168.46.56'),
+      host: arg(commandArgs, 'host'),
       user: arg(commandArgs, 'user', 'admin'),
-      pass: arg(commandArgs, 'pass', process.env.ONVIF_PASSWORD ?? 'CHANGEME'),
+      pass: arg(commandArgs, 'pass', process.env.ONVIF_PASSWORD),
       ...(deviceUrls.length > 0 ? { deviceUrls } : {}),
     });
     for (const stream of streams) dependencies.log(JSON.stringify(stream));

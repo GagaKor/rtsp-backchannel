@@ -1,21 +1,23 @@
 /**
  * Verify a camera's audio support purely via ONVIF commands.
  *
- *   npm run audiocheck -- --host 172.168.46.56 --user admin --pass CHANGEME
+ *   ONVIF_PASSWORD='<password>' npm run audiocheck -- --host camera.local
  */
 import { OnvifDevice } from './onvif/deviceClient.ts';
 
-function arg(name: string, def: string): string {
+function arg(name: string, def?: string): string {
   const i = process.argv.indexOf(`--${name}`);
-  return i >= 0 && process.argv[i + 1] ? process.argv[i + 1] : def;
+  if (i >= 0 && process.argv[i + 1]) return process.argv[i + 1];
+  if (def !== undefined) return def;
+  throw new Error(`missing --${name}`);
 }
 
 const yn = (b: boolean) => (b ? '✅ 지원' : '❌ 없음');
 
 async function main(): Promise<void> {
-  const host = arg('host', '172.168.46.56');
+  const host = arg('host');
   const user = arg('user', 'admin');
-  const pass = arg('pass', 'CHANGEME');
+  const pass = arg('pass', process.env.ONVIF_PASSWORD);
 
   console.log(`# ONVIF 오디오 지원 점검 @ ${host}`);
   const dev = new OnvifDevice(host, user, pass);

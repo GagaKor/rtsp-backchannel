@@ -1,9 +1,9 @@
 use anyhow::Result;
-use onvif_backchannel::audio::G711Variant;
-use onvif_backchannel::cli::{Cli, Invocation, parse_invocation_from};
-use onvif_backchannel::discovery::{DiscoveryOptions, discover_devices};
-use onvif_backchannel::onvif::{StreamUriOptions, get_stream_uris};
-use onvif_backchannel::playback::{PlaybackConfig, play_file};
+use rtsp_backchannel::audio::G711Variant;
+use rtsp_backchannel::cli::{Cli, Invocation, parse_invocation_from};
+use rtsp_backchannel::discovery::{DiscoveryOptions, discover_devices};
+use rtsp_backchannel::onvif::{StreamUriOptions, get_stream_uris};
+use rtsp_backchannel::playback::{PlaybackConfig, play_file};
 use std::time::Duration;
 
 fn main() {

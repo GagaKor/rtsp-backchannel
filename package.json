@@ -1,8 +1,16 @@
 {
-  "name": "onvif-backchannel",
+  "name": "rtsp-backchannel",
   "version": "0.1.0",
   "type": "module",
   "description": "Discover ONVIF cameras, resolve RTSP streams, and play backchannel audio without GStreamer",
+  "keywords": [
+    "onvif",
+    "rtsp",
+    "audio",
+    "rtp",
+    "backchannel"
+  ],
+  "author": "GagaKor",
   "license": "MIT OR Apache-2.0",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -13,7 +21,7 @@
     }
   },
   "bin": {
-    "onvif-backchannel": "./dist/bin.js"
+    "rtsp-backchannel": "./dist/bin.js"
   },
   "files": [
     "dist/index.*",
@@ -35,7 +43,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/GagaKor/onvif-backchannel.git"
+    "url": "git+https://github.com/GagaKor/rtsp-backchannel.git"
+  },
+  "homepage": "https://github.com/GagaKor/rtsp-backchannel#readme",
+  "bugs": {
+    "url": "https://github.com/GagaKor/rtsp-backchannel/issues"
   },
   "publishConfig": {
     "access": "public"

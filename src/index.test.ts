@@ -20,7 +20,7 @@ test('declares an installable npm package with ESM types and CLI exports', () =>
   const manifest = JSON.parse(readFileSync('package.json', 'utf8'));
   const lockfile = JSON.parse(readFileSync('package-lock.json', 'utf8'));
 
-  assert.equal(manifest.name, 'onvif-backchannel');
+  assert.equal(manifest.name, 'rtsp-backchannel');
   assert.notEqual(manifest.private, true);
   assert.deepEqual(manifest.files, [
     'dist/index.*',
@@ -43,7 +43,19 @@ test('declares an installable npm package with ESM types and CLI exports', () =>
   assert.equal(manifest.types, './dist/index.d.ts');
   assert.equal(manifest.exports['.'].import, './dist/index.js');
   assert.equal(manifest.exports['.'].types, './dist/index.d.ts');
-  assert.equal(manifest.bin['onvif-backchannel'], './dist/bin.js');
+  assert.equal(manifest.bin['rtsp-backchannel'], './dist/bin.js');
+  assert.equal(
+    manifest.repository.url,
+    'git+https://github.com/GagaKor/rtsp-backchannel.git',
+  );
+  assert.equal(
+    manifest.homepage,
+    'https://github.com/GagaKor/rtsp-backchannel#readme',
+  );
+  assert.equal(
+    manifest.bugs.url,
+    'https://github.com/GagaKor/rtsp-backchannel/issues',
+  );
   assert.equal(manifest.scripts.build, 'tsc -p tsconfig.build.json');
   assert.equal(manifest.dependencies?.[manifest.name], undefined);
 });

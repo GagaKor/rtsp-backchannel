@@ -24,19 +24,21 @@ def _volume(value):
 
 def _parser():
     parser = argparse.ArgumentParser(
-        prog="onvif-backchannel",
+        prog="rtsp-backchannel",
         description="Play one audio file through an ONVIF RTSP backchannel",
         epilog=(
-            "Other commands: onvif-backchannel discover; "
-            "onvif-backchannel streams"
+            "Other commands: rtsp-backchannel discover; "
+            "rtsp-backchannel streams"
         ),
     )
-    parser.add_argument("--host", default="172.168.46.56")
+    parser.add_argument("--host", required=True)
     parser.add_argument("--user", default="admin")
+    password = os.environ.get("ONVIF_PASSWORD")
     parser.add_argument(
         "--pass",
         dest="password",
-        default=os.environ.get("ONVIF_PASSWORD", "CHANGEME"),
+        default=password,
+        required=password is None,
     )
     parser.add_argument("--file", required=True)
     parser.add_argument("--volume", type=_volume, default=0.05)
@@ -55,7 +57,7 @@ def _nonnegative_integer(value):
 
 def _discovery_parser():
     parser = argparse.ArgumentParser(
-        prog="onvif-backchannel discover",
+        prog="rtsp-backchannel discover",
         description="Discover ONVIF devices with WS-Discovery",
     )
     parser.add_argument("--timeout-ms", type=_nonnegative_integer, default=3000)
@@ -65,15 +67,17 @@ def _discovery_parser():
 
 def _streams_parser():
     parser = argparse.ArgumentParser(
-        prog="onvif-backchannel streams",
+        prog="rtsp-backchannel streams",
         description="Resolve every ONVIF media profile RTSP URI",
     )
-    parser.add_argument("--host", default="172.168.46.56")
+    parser.add_argument("--host", required=True)
     parser.add_argument("--user", default="admin")
+    password = os.environ.get("ONVIF_PASSWORD")
     parser.add_argument(
         "--pass",
         dest="password",
-        default=os.environ.get("ONVIF_PASSWORD", "CHANGEME"),
+        default=password,
+        required=password is None,
     )
     parser.add_argument("--device-url", action="append", dest="device_urls")
     return parser

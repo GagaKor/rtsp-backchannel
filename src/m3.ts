@@ -2,20 +2,22 @@
  * M2 + M3 — stream a G.711 test tone out the camera speaker via the
  * ONVIF backchannel.
  *
- *   npm run m3 -- --host 172.168.46.56 --user admin --pass CHANGEME --freq 1000 --ms 5000 --amp 0.9
+ *   ONVIF_PASSWORD='<password>' npm run m3 -- --host camera.local --freq 1000 --ms 5000 --amp 0.9
  */
 import { openBackchannel, SAMPLE_RATE } from './backchannel.ts';
 import { generateTonePcm, pcm16ToG711 } from './audio/g711.ts';
 
-function arg(name: string, def: string): string {
+function arg(name: string, def?: string): string {
   const i = process.argv.indexOf(`--${name}`);
-  return i >= 0 && process.argv[i + 1] ? process.argv[i + 1] : def;
+  if (i >= 0 && process.argv[i + 1]) return process.argv[i + 1];
+  if (def !== undefined) return def;
+  throw new Error(`missing --${name}`);
 }
 
 async function main(): Promise<void> {
-  const host = arg('host', '172.168.46.56');
+  const host = arg('host');
   const user = arg('user', 'admin');
-  const pass = arg('pass', 'CHANGEME');
+  const pass = arg('pass', process.env.ONVIF_PASSWORD);
   const freq = Number(arg('freq', '440'));
   const ms = Number(arg('ms', '2000'));
   const amp = Number(arg('amp', '0.5'));

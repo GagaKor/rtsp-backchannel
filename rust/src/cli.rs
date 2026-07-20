@@ -6,24 +6,19 @@ use clap::Parser;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "onvif-backchannel",
+    name = "rtsp-backchannel",
     about = "Play one audio file through an ONVIF RTSP backchannel",
-    after_help = "Commands: onvif-backchannel discover; onvif-backchannel streams\n\
+    after_help = "Commands: rtsp-backchannel discover; rtsp-backchannel streams\n\
                   Profile: PCMA 8kHz mono, TCP interleaved RTP, 40 ms packets, rebase pacing."
 )]
 pub struct Cli {
-    #[arg(long, default_value = "172.168.46.56")]
+    #[arg(long)]
     pub host: String,
 
     #[arg(long, default_value = "admin")]
     pub user: String,
 
-    #[arg(
-        long = "pass",
-        env = "ONVIF_PASSWORD",
-        hide_env_values = true,
-        default_value = "CHANGEME"
-    )]
+    #[arg(long = "pass", env = "ONVIF_PASSWORD", hide_env_values = true)]
     pub password: String,
 
     #[arg(long)]
@@ -35,7 +30,7 @@ pub struct Cli {
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "onvif-backchannel discover",
+    name = "rtsp-backchannel discover",
     about = "Discover ONVIF devices with WS-Discovery"
 )]
 pub struct DiscoveryCli {
@@ -48,22 +43,17 @@ pub struct DiscoveryCli {
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "onvif-backchannel streams",
+    name = "rtsp-backchannel streams",
     about = "Resolve every ONVIF media profile RTSP URI"
 )]
 pub struct StreamsCli {
-    #[arg(long, default_value = "172.168.46.56")]
+    #[arg(long)]
     pub host: String,
 
     #[arg(long, default_value = "admin")]
     pub user: String,
 
-    #[arg(
-        long = "pass",
-        env = "ONVIF_PASSWORD",
-        hide_env_values = true,
-        default_value = "CHANGEME"
-    )]
+    #[arg(long = "pass", env = "ONVIF_PASSWORD", hide_env_values = true)]
     pub password: String,
 
     #[arg(long = "device-url")]
@@ -86,7 +76,7 @@ where
     let program = arguments
         .first()
         .cloned()
-        .unwrap_or_else(|| OsString::from("onvif-backchannel"));
+        .unwrap_or_else(|| OsString::from("rtsp-backchannel"));
     let command = arguments.get(1).and_then(|value| value.to_str());
     let delegated = |skip: usize| {
         std::iter::once(program.clone())
@@ -120,12 +110,33 @@ mod tests {
     use super::Cli;
 
     #[test]
-    fn uses_the_validated_playback_defaults() {
-        let cli = Cli::try_parse_from(["onvif-backchannel", "--file", "event.mp3"]).unwrap();
+    fn requires_camera_host_and_password() {
+        let command = Cli::command();
+        for id in ["host", "password"] {
+            let argument = command
+                .get_arguments()
+                .find(|argument| argument.get_id() == id)
+                .unwrap();
+            assert!(argument.is_required_set());
+        }
+    }
 
-        assert_eq!(cli.host, "172.168.46.56");
+    #[test]
+    fn uses_only_non_sensitive_playback_defaults() {
+        let cli = Cli::try_parse_from([
+            "rtsp-backchannel",
+            "--host",
+            "camera",
+            "--pass",
+            "secret",
+            "--file",
+            "event.mp3",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.host, "camera");
         assert_eq!(cli.user, "admin");
-        assert_eq!(cli.password, "CHANGEME");
+        assert_eq!(cli.password, "secret");
         assert_eq!(cli.volume, 0.05);
         assert_eq!(cli.file.to_string_lossy(), "event.mp3");
     }
@@ -135,7 +146,7 @@ mod tests {
         for volume in ["NaN", "-0.1", "1.1"] {
             assert!(
                 Cli::try_parse_from([
-                    "onvif-backchannel",
+                    "rtsp-backchannel",
                     "--file",
                     "event.mp3",
                     "--volume",

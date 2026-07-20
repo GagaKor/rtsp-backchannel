@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use onvif_backchannel::playback::{PlaybackConfig, PlaybackResult, play_file};
+use rtsp_backchannel::playback::{PlaybackConfig, PlaybackResult, play_file};
 
 #[test]
 fn exposes_one_shot_file_playback_as_a_library_api() {
@@ -20,6 +20,16 @@ fn exposes_one_shot_file_playback_as_a_library_api() {
 #[test]
 fn publishes_under_a_permissive_dual_license() {
     assert_eq!(env!("CARGO_PKG_LICENSE"), "MIT OR Apache-2.0");
+    assert_eq!(env!("CARGO_PKG_NAME"), "rtsp-backchannel");
+    assert_eq!(env!("CARGO_PKG_RUST_VERSION"), "1.86");
+    assert_eq!(
+        env!("CARGO_PKG_REPOSITORY"),
+        "https://github.com/GagaKor/rtsp-backchannel"
+    );
+    assert_eq!(
+        env!("CARGO_PKG_HOMEPAGE"),
+        "https://github.com/GagaKor/rtsp-backchannel"
+    );
     for filename in [
         "LICENSE",
         "LICENSE-MIT",

@@ -1,16 +1,17 @@
 import importlib
 import io
 import json
+import os
 import pathlib
 import tomllib
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import Mock, patch
 
 
 class LibraryApiTests(unittest.TestCase):
     def test_exports_one_shot_playback_api(self):
-        library = importlib.import_module("onvif_backchannel")
+        library = importlib.import_module("rtsp_backchannel")
 
         self.assertTrue(callable(getattr(library, "play_file", None)))
         self.assertIsNotNone(getattr(library, "PlaybackResult", None))
@@ -20,8 +21,8 @@ class LibraryApiTests(unittest.TestCase):
         self.assertIsNotNone(getattr(library, "StreamUri", None))
 
     def test_plays_pcma_in_40ms_packets_and_closes_the_session(self):
-        from onvif_backchannel import PlaybackResult, play_file
-        from onvif_backchannel import playback
+        from rtsp_backchannel import PlaybackResult, play_file
+        from rtsp_backchannel import playback
 
         payload = bytes([0xD5]) * 640
 
@@ -119,7 +120,7 @@ class LibraryApiTests(unittest.TestCase):
             pathlib.Path("python/pyproject.toml").read_text(encoding="utf-8")
         )
 
-        self.assertEqual(metadata["project"]["name"], "onvif-backchannel")
+        self.assertEqual(metadata["project"]["name"], "rtsp-backchannel")
         self.assertEqual(metadata["project"]["version"], "0.1.0")
         self.assertEqual(metadata["project"]["requires-python"], ">=3.11")
         self.assertEqual(metadata["project"]["license"], "MIT OR Apache-2.0")
@@ -136,16 +137,39 @@ class LibraryApiTests(unittest.TestCase):
         for filename in metadata["project"]["license-files"]:
             self.assertTrue(pathlib.Path("python", filename).is_file())
         self.assertEqual(
-            metadata["project"]["scripts"]["onvif-backchannel"],
-            "onvif_backchannel.cli:main",
+            metadata["project"]["scripts"]["rtsp-backchannel"],
+            "rtsp_backchannel.cli:main",
+        )
+        self.assertEqual(
+            metadata["project"]["urls"]["Repository"],
+            "https://github.com/GagaKor/rtsp-backchannel.git",
         )
         self.assertEqual(
             metadata["tool"]["setuptools"]["py-modules"],
             ["backchannel_audio", "backchannel_rtp", "onvif_play"],
         )
 
+    def test_installed_cli_requires_camera_host_and_password(self):
+        cli = importlib.import_module("rtsp_backchannel.cli")
+        cases = [
+            (["--pass", "secret", "--file", "event.mp3"], "--host"),
+            (["--host", "camera", "--file", "event.mp3"], "--pass"),
+            (["streams", "--pass", "secret"], "--host"),
+            (["streams", "--host", "camera"], "--pass"),
+        ]
+
+        with patch.dict(os.environ, {}, clear=True):
+            for arguments, missing in cases:
+                with self.subTest(arguments=arguments):
+                    with (
+                        redirect_stderr(io.StringIO()) as errors,
+                        self.assertRaises(SystemExit),
+                    ):
+                        cli.main(arguments)
+                    self.assertIn(missing, errors.getvalue())
+
     def test_installed_cli_delegates_to_the_public_play_file_api(self):
-        cli = importlib.import_module("onvif_backchannel.cli")
+        cli = importlib.import_module("rtsp_backchannel.cli")
         result = Mock(packets_sent=2)
 
         with (
@@ -177,8 +201,8 @@ class LibraryApiTests(unittest.TestCase):
         self.assertEqual(output.getvalue(), "sent 2 RTP packets\n")
 
     def test_installed_cli_dispatches_discovery_as_json_lines(self):
-        cli = importlib.import_module("onvif_backchannel.cli")
-        library = importlib.import_module("onvif_backchannel.onvif")
+        cli = importlib.import_module("rtsp_backchannel.cli")
+        library = importlib.import_module("rtsp_backchannel.onvif")
         device = library.DiscoveredDevice(
             ip="10.128.10.141",
             xaddrs=["http://10.128.10.141/onvif/device_service"],
@@ -221,8 +245,8 @@ class LibraryApiTests(unittest.TestCase):
         )
 
     def test_installed_cli_dispatches_stream_lookup_as_json_lines(self):
-        cli = importlib.import_module("onvif_backchannel.cli")
-        library = importlib.import_module("onvif_backchannel.onvif")
+        cli = importlib.import_module("rtsp_backchannel.cli")
+        library = importlib.import_module("rtsp_backchannel.onvif")
         stream = library.StreamUri(
             profile_token="main",
             profile_name="Main Stream",
