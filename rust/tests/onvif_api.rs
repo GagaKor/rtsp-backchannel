@@ -1,9 +1,9 @@
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, TcpListener};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rtsp_backchannel::cli::{Invocation, parse_invocation_from};
 use rtsp_backchannel::discovery::{DiscoveryOptions, parse_probe_matches};
@@ -75,7 +75,7 @@ fn returns_every_profile_uri_unchanged_and_keeps_credentials_transport_only() {
             "<Envelope><GetDeviceInformationResponse/></Envelope>".to_owned(),
             format!("<Envelope><Capabilities><Media><XAddr>{media_url}</XAddr></Media></Capabilities></Envelope>"),
             "<Envelope><GetProfilesResponse><Profiles token=\"main\"><Name>Main Stream</Name></Profiles><Profiles token=\"sub\"><Name>Sub Stream</Name></Profiles></GetProfilesResponse></Envelope>".to_owned(),
-            "<Envelope><GetStreamUriResponse><Uri>rtsp://camera/live?channel=1&amp;stream=main</Uri></GetStreamUriResponse></Envelope>".to_owned(),
+            "<Envelope><GetStreamUriResponse><Uri>rtsp://stream-user:stream-pass@camera/live?channel=1&amp;stream=main#fragment</Uri></GetStreamUriResponse></Envelope>".to_owned(),
             "<Envelope><GetStreamUriResponse><Uri>rtsp://camera/live?channel=1&amp;stream=sub</Uri></GetStreamUriResponse></Envelope>".to_owned(),
         ];
         for response in responses {
@@ -108,6 +108,7 @@ fn returns_every_profile_uri_unchanged_and_keeps_credentials_transport_only() {
     assert_eq!(streams[0].profile_token, "main");
     assert_eq!(streams[0].profile_name.as_deref(), Some("Main Stream"));
     assert_eq!(streams[0].uri, "rtsp://camera/live?channel=1&stream=main");
+    assert!(!streams[0].uri.contains("stream-pass"));
     assert_eq!(streams[1].profile_token, "sub");
     assert!(!streams.iter().any(|stream| stream.uri.contains("p@ss")));
     assert!(
@@ -177,6 +178,115 @@ fn parses_discover_and_streams_without_breaking_direct_playback_flags() {
 }
 
 #[test]
+fn parses_explicit_cidr_discovery_options() {
+    match parse_invocation_from([
+        "rtsp-backchannel",
+        "discover",
+        "--timeout-ms",
+        "1500",
+        "--cidr",
+        "10.128.0.10",
+        "--cidr",
+        "192.168.20.0/24",
+        "--port",
+        "80",
+        "--port",
+        "8000",
+        "--concurrency",
+        "16",
+    ])
+    .unwrap()
+    {
+        Invocation::Discover(cli) => {
+            assert_eq!(cli.cidrs, ["10.128.0.10", "192.168.20.0/24"]);
+            assert_eq!(cli.ports, [80, 8000]);
+            assert_eq!(cli.concurrency, 16);
+        }
+        _ => panic!("expected discovery invocation"),
+    }
+}
+
+#[test]
+fn actively_discovers_an_onvif_device_in_an_explicit_cidr() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let server_requests = Arc::clone(&requests);
+    let server = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    server_requests
+                        .lock()
+                        .unwrap()
+                        .push(read_http_request(&mut stream));
+                    let response = concat!(
+                        "<Envelope><GetSystemDateAndTimeResponse>",
+                        "<UTCDateTime><Time><Hour>6</Hour><Minute>30</Minute>",
+                        "<Second>0</Second></Time><Date><Year>2026</Year>",
+                        "<Month>7</Month><Day>20</Day></Date></UTCDateTime>",
+                        "</GetSystemDateAndTimeResponse></Envelope>"
+                    );
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/soap+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        response.len(),
+                        response
+                    )
+                    .unwrap();
+                    return true;
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return false;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("test ONVIF server failed: {error}"),
+            }
+        }
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_rtsp-backchannel"))
+        .args([
+            "discover",
+            "--cidr",
+            "127.0.0.1",
+            "--cidr",
+            "127.0.0.1/32",
+            "--port",
+            &port.to_string(),
+            "--timeout-ms",
+            "250",
+            "--concurrency",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    let served = server.join().unwrap();
+
+    assert!(served, "CIDR discovery did not probe the selected address");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let devices = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(devices[0]["ip"], "127.0.0.1");
+    assert_eq!(
+        devices[0]["xaddrs"][0],
+        format!("http://127.0.0.1:{port}/onvif/device_service")
+    );
+    assert!(requests.lock().unwrap()[0].contains("GetSystemDateAndTime"));
+}
+
+#[test]
 fn binary_help_exits_successfully_for_root_and_subcommands() {
     for arguments in [
         &["--help"][..],
@@ -195,6 +305,29 @@ fn binary_help_exits_successfully_for_root_and_subcommands() {
         );
         assert!(String::from_utf8_lossy(&output.stdout).contains("Usage:"));
     }
+}
+
+#[test]
+fn uppercase_direct_rtsp_credentials_are_never_logged() {
+    let output = Command::new(env!("CARGO_BIN_EXE_rtsp-backchannel"))
+        .args([
+            "--host",
+            "RTSP://log-user:log-pass@127.0.0.1:0/live#secret",
+            "--file",
+            "missing.mp3",
+        ])
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(!output.status.success());
+    assert!(!combined.contains("log-user"));
+    assert!(!combined.contains("log-pass"));
+    assert!(!combined.contains("#secret"));
 }
 
 fn read_http_request(stream: &mut impl Read) -> String {

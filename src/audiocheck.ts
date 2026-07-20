@@ -4,6 +4,7 @@
  *   ONVIF_PASSWORD='<password>' npm run audiocheck -- --host camera.local
  */
 import { OnvifDevice } from './onvif/deviceClient.ts';
+import { displayRtspTarget, redactRtspCredentials } from './backchannel.ts';
 
 function arg(name: string, def?: string): string {
   const i = process.argv.indexOf(`--${name}`);
@@ -19,7 +20,7 @@ async function main(): Promise<void> {
   const user = arg('user', 'admin');
   const pass = arg('pass', process.env.ONVIF_PASSWORD);
 
-  console.log(`# ONVIF 오디오 지원 점검 @ ${host}`);
+  console.log(`# ONVIF 오디오 지원 점검 @ ${displayRtspTarget(host)}`);
   const dev = new OnvifDevice(host, user, pass);
   const info = await dev.connect();
   console.log(`  장치: ${info.manufacturer ?? '?'} ${info.model ?? '?'} (fw ${info.firmware ?? '?'})\n`);
@@ -67,6 +68,7 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
-  console.error('audiocheck error:', err.message ?? err);
+  const message = err instanceof Error ? err.message : String(err);
+  console.error('audiocheck error:', redactRtspCredentials(message));
   process.exitCode = 1;
 });

@@ -33,6 +33,33 @@ const defaultDependencies: StreamLookupDependencies = {
   createDevice: (host, user, pass, options) => new OnvifDevice(host, user, pass, options),
 };
 
+function stripRtspUserInfo(uri: string): string {
+  const scheme = /^rtsps?:\/\//i.exec(uri);
+  if (!scheme) return uri;
+
+  const authorityStart = scheme[0].length;
+  const suffixOffset = uri.slice(authorityStart).search(/[/?#]/);
+  const authorityEnd = suffixOffset < 0 ? uri.length : authorityStart + suffixOffset;
+  const authority = uri.slice(authorityStart, authorityEnd);
+  const userInfoEnd = authority.lastIndexOf('@');
+  if (userInfoEnd < 0) return uri;
+
+  const endpoint = authority.slice(userInfoEnd + 1);
+  if (!endpoint) return uri;
+  const sanitized =
+    `${uri.slice(0, authorityStart)}${endpoint}${uri.slice(authorityEnd)}`;
+
+  try {
+    const parsed = new URL(sanitized);
+    const protocol = parsed.protocol.toLowerCase();
+    if ((protocol !== 'rtsp:' && protocol !== 'rtsps:') || !parsed.hostname) return uri;
+  } catch {
+    return uri;
+  }
+
+  return sanitized;
+}
+
 export async function getStreamUris(
   options: StreamUriOptions,
   dependencies: StreamLookupDependencies = defaultDependencies,
@@ -47,7 +74,7 @@ export async function getStreamUris(
     profiles.map(async (profile) => ({
       profileToken: profile.token,
       ...(profile.name ? { profileName: profile.name } : {}),
-      uri: await device.getStreamUri(profile.token),
+      uri: stripRtspUserInfo(await device.getStreamUri(profile.token)),
     })),
   );
 }

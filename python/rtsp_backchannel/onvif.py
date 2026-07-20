@@ -17,13 +17,19 @@ import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit, urlunsplit
 from xml.etree import ElementTree
 from xml.sax.saxutils import escape
 
 
 _MULTICAST_ADDRESS = "239.255.255.250"
 _MULTICAST_PORT = 3702
+_DEFAULT_CIDR_PORTS = (80, 8000, 443)
+_DEFAULT_CIDR_CONCURRENCY = 64
+_MAX_CIDR_HOSTS = 4096
+_MAX_DISCOVERY_RESPONSE_BYTES = 1024 * 1024
+_MAX_SOAP_RESPONSE_BYTES = 1024 * 1024
+_DISCOVERY_READ_CHUNK_BYTES = 64 * 1024
 _DEVICE_NS = "http://www.onvif.org/ver10/device/wsdl"
 _MEDIA_NS = "http://www.onvif.org/ver10/media/wsdl"
 _SCHEMA_NS = "http://www.onvif.org/ver10/schema"
@@ -40,6 +46,11 @@ _PASSWORD_DIGEST = (
     "oasis-200401-wss-username-token-profile-1.0#PasswordDigest"
 )
 _TLS_CONTEXT = ssl._create_unverified_context()
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, file, code, message, headers, new_url):
+        return None
 
 
 @dataclass
@@ -77,6 +88,28 @@ def _first_text(element: ElementTree.Element, name: str) -> str | None:
         if _local_name(candidate.tag) == name and candidate.text is not None:
             return candidate.text.strip()
     return None
+
+
+def _sanitize_stream_uri(uri: str) -> str:
+    try:
+        parsed = urlsplit(uri)
+        hostname = parsed.hostname
+        port = parsed.port
+    except (TypeError, ValueError) as error:
+        raise RuntimeError("invalid ONVIF stream URI") from error
+    if parsed.scheme.lower() == "rtsp" and not hostname:
+        raise RuntimeError("invalid ONVIF stream URI")
+    if parsed.netloc and hostname:
+        if port == 0:
+            raise RuntimeError("invalid ONVIF stream URI")
+        if ":" in hostname:
+            hostname = f"[{hostname}]"
+        netloc = hostname
+        if port is not None:
+            netloc += f":{port}"
+    else:
+        netloc = parsed.netloc
+    return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, ""))
 
 
 def _scope_value(scopes: list[str], key: str) -> str | None:
@@ -220,10 +253,252 @@ def _merge_device(target: DiscoveredDevice, incoming: DiscoveredDevice) -> None:
     )
 
 
-def discover_devices(
-    *, timeout: float = 3.0, interfaces: list[str] | None = None
+def _cidr_hosts(cidrs: list[str]) -> list[str]:
+    addresses: set[ipaddress.IPv4Address] = set()
+    for cidr in cidrs:
+        try:
+            network = ipaddress.ip_network(cidr.strip(), strict=False)
+        except ValueError as error:
+            raise ValueError(f"invalid IPv4 CIDR: {cidr}") from error
+        if not isinstance(network, ipaddress.IPv4Network):
+            raise ValueError(f"invalid IPv4 CIDR: {cidr}")
+        host_count = (
+            network.num_addresses - 2
+            if network.prefixlen <= 30
+            else network.num_addresses
+        )
+        if host_count > _MAX_CIDR_HOSTS:
+            raise ValueError(
+                f"CIDR discovery is limited to {_MAX_CIDR_HOSTS} IPv4 hosts"
+            )
+        addresses.update(network.hosts())
+        if len(addresses) > _MAX_CIDR_HOSTS:
+            raise ValueError(
+                f"CIDR discovery is limited to {_MAX_CIDR_HOSTS} IPv4 hosts"
+            )
+    return [str(address) for address in sorted(addresses)]
+
+
+def _validated_ports(ports: list[int] | None) -> list[int]:
+    values = list(dict.fromkeys(_DEFAULT_CIDR_PORTS if ports is None else ports))
+    if not values or any(
+        isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535
+        for port in values
+    ):
+        raise ValueError("ports must contain integers between 1 and 65535")
+    return values
+
+
+def _device_service_url(ip: str, port: int) -> str:
+    secure = port == 443
+    default_port = 443 if secure else 80
+    authority = ip if port == default_port else f"{ip}:{port}"
+    return (
+        f"{'https' if secure else 'http'}://{authority}"
+        "/onvif/device_service"
+    )
+
+
+def _discovery_opener():
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        urllib.request.HTTPSHandler(context=_TLS_CONTEXT),
+        _NoRedirectHandler(),
+    )
+
+
+def _set_response_timeout(response, timeout: float) -> None:
+    try:
+        response.fp.raw._sock.settimeout(timeout)
+    except (AttributeError, OSError):
+        pass
+
+
+def _read_response_chunk(response, size: int) -> bytes:
+    read_one = getattr(response, "read1", None)
+    if callable(read_one):
+        return read_one(size)
+    return response.read(size)
+
+
+def _bounded_response_body(
+    response,
+    deadline: float,
+    *,
+    max_bytes: int | None = None,
+    context: str = "ONVIF discovery",
+) -> bytes:
+    if max_bytes is None:
+        max_bytes = _MAX_DISCOVERY_RESPONSE_BYTES
+    content_length_context = (
+        "discovery" if context == "ONVIF discovery" else context
+    )
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        raw_lengths = []
+    elif hasattr(headers, "get_all"):
+        raw_lengths = headers.get_all("Content-Length", [])
+    else:
+        raw_lengths = [
+            value
+            for key, value in headers.items()
+            if str(key).lower() == "content-length"
+        ]
+    if any(not isinstance(value, str) for value in raw_lengths):
+        raise RuntimeError(
+            f"invalid {content_length_context} response Content-Length"
+        )
+    lengths = [
+        value.strip()
+        for raw_value in raw_lengths
+        for value in raw_value.split(",")
+    ]
+    if lengths:
+        if any(not value.isdecimal() for value in lengths):
+            raise RuntimeError(
+                f"invalid {content_length_context} response Content-Length"
+            )
+        parsed_lengths = {int(value) for value in lengths}
+        if len(parsed_lengths) != 1:
+            raise RuntimeError(
+                f"conflicting {content_length_context} response Content-Length"
+            )
+        if parsed_lengths.pop() > max_bytes:
+            raise RuntimeError(f"{context} response is too large")
+
+    chunks = []
+    total = 0
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"{context} deadline exceeded")
+        _set_response_timeout(response, remaining)
+        try:
+            chunk = _read_response_chunk(
+                response,
+                min(
+                    _DISCOVERY_READ_CHUNK_BYTES,
+                    max_bytes + 1 - total,
+                )
+            )
+        except TimeoutError as error:
+            raise TimeoutError(f"{context} deadline exceeded") from error
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"{context} deadline exceeded")
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > max_bytes:
+            raise RuntimeError(f"{context} response is too large")
+
+
+def _probe_device_service(url: str, deadline: float) -> None:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("ONVIF discovery deadline exceeded")
+    envelope = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">'
+        f'<s:Header></s:Header><s:Body><GetSystemDateAndTime xmlns="{_DEVICE_NS}"/>'
+        "</s:Body></s:Envelope>"
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=envelope,
+        headers={"Content-Type": "application/soap+xml; charset=utf-8"},
+    )
+    try:
+        response = _discovery_opener().open(request, timeout=remaining)
+    except urllib.error.HTTPError as error:
+        error.close()
+        raise RuntimeError(
+            f"ONVIF discovery returned HTTP {error.code}"
+        ) from error
+    with response:
+        status = response.getcode()
+        if not 200 <= status < 300:
+            raise RuntimeError(f"ONVIF discovery returned HTTP {status}")
+        root = ElementTree.fromstring(_bounded_response_body(response, deadline))
+    if not any(
+        _local_name(candidate.tag) == "UTCDateTime" for candidate in root.iter()
+    ):
+        raise RuntimeError("no UTCDateTime in ONVIF discovery response")
+
+
+def _probe_cidr_host(
+    ip: str, ports: list[int], deadline: float
+) -> DiscoveredDevice | None:
+    xaddrs = []
+    for port in ports:
+        if time.monotonic() >= deadline:
+            break
+        url = _device_service_url(ip, port)
+        try:
+            _probe_device_service(url, deadline)
+            xaddrs.append(url)
+        except Exception:
+            continue
+    if not xaddrs:
+        return None
+    return DiscoveredDevice(ip=ip, xaddrs=xaddrs, scopes=[])
+
+
+def _discover_cidrs(
+    *,
+    cidrs: list[str],
+    ports: list[int] | None,
+    timeout: float,
+    concurrency: int,
 ) -> list[DiscoveredDevice]:
-    """Discover ONVIF cameras over every selected IPv4 interface."""
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError(
+            "timeout must be finite and greater than 0 for CIDR discovery"
+        )
+    if (
+        isinstance(concurrency, bool)
+        or not isinstance(concurrency, int)
+        or not 1 <= concurrency <= 256
+    ):
+        raise ValueError("concurrency must be an integer between 1 and 256")
+    hosts = _cidr_hosts(cidrs)
+    selected_ports = _validated_ports(ports)
+    if not hosts:
+        return []
+    deadline = time.monotonic() + timeout
+    with ThreadPoolExecutor(
+        max_workers=min(concurrency, len(hosts))
+    ) as executor:
+        devices = executor.map(
+            lambda host: _probe_cidr_host(host, selected_ports, deadline), hosts
+        )
+        return [device for device in devices if device is not None]
+
+
+def discover_devices(
+    *,
+    timeout: float = 3.0,
+    interfaces: list[str] | None = None,
+    cidrs: list[str] | None = None,
+    ports: list[int] | None = None,
+    concurrency: int = _DEFAULT_CIDR_CONCURRENCY,
+) -> list[DiscoveredDevice]:
+    """Discover local ONVIF devices or actively scan selected targets.
+
+    Without ``cidrs``, WS-Discovery runs on detected or selected local
+    interfaces. Each ``cidrs`` entry may be an IPv4 CIDR or one IPv4 address;
+    all entries are merged and overlapping hosts are probed once.
+    """
+
+    if cidrs:
+        if interfaces:
+            raise ValueError("interfaces cannot be combined with cidrs")
+        return _discover_cidrs(
+            cidrs=cidrs,
+            ports=ports,
+            timeout=timeout,
+            concurrency=concurrency,
+        )
 
     if not math.isfinite(timeout) or timeout < 0:
         raise ValueError("timeout must be finite and 0 or greater")
@@ -288,6 +563,9 @@ def parse_profiles(xml: bytes | str) -> list[OnvifProfile]:
 
 
 def _soap_request(url: str, body: str, header: str, timeout: float) -> str:
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("timeout must be finite and greater than 0")
+    deadline = time.monotonic() + timeout
     envelope = (
         '<?xml version="1.0" encoding="UTF-8"?>'
         '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">'
@@ -299,14 +577,34 @@ def _soap_request(url: str, body: str, header: str, timeout: float) -> str:
         data=envelope.encode("utf-8"),
         headers={"Content-Type": "application/soap+xml; charset=utf-8"},
     )
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("ONVIF SOAP deadline exceeded")
     try:
         response = urllib.request.urlopen(
-            request, timeout=timeout, context=_TLS_CONTEXT
+            request, timeout=remaining, context=_TLS_CONTEXT
         )
-        with response:
-            return response.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as error:
-        return error.read().decode("utf-8", "replace")
+        with error:
+            return _bounded_response_body(
+                error,
+                deadline,
+                max_bytes=_MAX_SOAP_RESPONSE_BYTES,
+                context="ONVIF SOAP",
+            ).decode("utf-8", "replace")
+    except urllib.error.URLError as error:
+        if isinstance(error.reason, TimeoutError):
+            raise TimeoutError("ONVIF SOAP deadline exceeded") from error
+        raise
+    except TimeoutError as error:
+        raise TimeoutError("ONVIF SOAP deadline exceeded") from error
+    with response:
+        return _bounded_response_body(
+            response,
+            deadline,
+            max_bytes=_MAX_SOAP_RESPONSE_BYTES,
+            context="ONVIF SOAP",
+        ).decode("utf-8", "replace")
 
 
 def _wsse_header(user: str, password: str, when: datetime.datetime) -> str:
@@ -333,8 +631,8 @@ class OnvifDevice:
     def __init__(
         self,
         host: str,
-        user: str,
-        password: str,
+        user: str = "",
+        password: str = "",
         *,
         device_urls: list[str] | None = None,
         timeout: float = 8.0,
@@ -359,7 +657,7 @@ class OnvifDevice:
 
     def _call(self, url: str, body: str, *, authenticated: bool = True) -> str:
         header = ""
-        if authenticated:
+        if authenticated and (self.user or self.password):
             now = datetime.datetime.now(datetime.timezone.utc) + self.clock_offset
             header = _wsse_header(self.user, self.password, now)
         return _soap_request(url, body, header, self.timeout)
@@ -424,7 +722,7 @@ class OnvifDevice:
                 return
             except Exception as error:
                 last_error = error
-        raise RuntimeError(f"ONVIF connect failed for {self.host}") from last_error
+        raise RuntimeError("ONVIF connect failed") from last_error
 
     def _media_service_url(self, device_url: str) -> str:
         xml = self._call(
@@ -466,15 +764,15 @@ class OnvifDevice:
         root = ElementTree.fromstring(xml)
         for candidate in root.iter():
             if _local_name(candidate.tag) == "Uri" and candidate.text:
-                return candidate.text
+                return _sanitize_stream_uri(candidate.text)
         raise RuntimeError(f"no stream URI for profile {profile_token}")
 
 
 def get_stream_uris(
     *,
     host: str,
-    user: str,
-    password: str,
+    user: str = "",
+    password: str = "",
     device_urls: list[str] | None = None,
     timeout: float = 8.0,
 ) -> list[StreamUri]:
@@ -494,7 +792,7 @@ def get_stream_uris(
         StreamUri(
             profile_token=profile.token,
             profile_name=profile.name,
-            uri=device.get_stream_uri(profile.token),
+            uri=_sanitize_stream_uri(device.get_stream_uri(profile.token)),
         )
         for profile in device.get_profiles()
     ]

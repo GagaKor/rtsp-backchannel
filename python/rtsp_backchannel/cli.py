@@ -3,7 +3,6 @@
 import argparse
 import json
 import math
-import os
 import sys
 
 from .onvif import discover_devices, get_stream_uris
@@ -32,16 +31,28 @@ def _parser():
         ),
     )
     parser.add_argument("--host", required=True)
-    parser.add_argument("--user", default="admin")
-    password = os.environ.get("ONVIF_PASSWORD")
+    parser.add_argument("--user", default="")
     parser.add_argument(
         "--pass",
         dest="password",
-        default=password,
-        required=password is None,
+        default="",
     )
     parser.add_argument("--file", required=True)
     parser.add_argument("--volume", type=_volume, default=0.05)
+    parser.add_argument(
+        "--codec",
+        choices=(
+            "auto",
+            "pcma",
+            "pcmu",
+            "g726-16",
+            "g726-24",
+            "g726-32",
+            "g726-40",
+            "aac",
+        ),
+        default="auto",
+    )
     return parser
 
 
@@ -55,13 +66,62 @@ def _nonnegative_integer(value):
     return parsed
 
 
+def _positive_integer(value):
+    parsed = _nonnegative_integer(value)
+    if parsed == 0:
+        raise argparse.ArgumentTypeError("must be greater than 0")
+    return parsed
+
+
+def _port(value):
+    parsed = _positive_integer(value)
+    if parsed > 65535:
+        raise argparse.ArgumentTypeError("must be between 1 and 65535")
+    return parsed
+
+
+def _concurrency(value):
+    parsed = _positive_integer(value)
+    if parsed > 256:
+        raise argparse.ArgumentTypeError("must be between 1 and 256")
+    return parsed
+
+
 def _discovery_parser():
     parser = argparse.ArgumentParser(
         prog="rtsp-backchannel discover",
-        description="Discover ONVIF devices with WS-Discovery",
+        description="Discover local or explicitly selected ONVIF devices",
     )
-    parser.add_argument("--timeout-ms", type=_nonnegative_integer, default=3000)
-    parser.add_argument("--interface", action="append", dest="interfaces")
+    parser.add_argument(
+        "--timeout-ms",
+        type=_nonnegative_integer,
+        default=3000,
+        help="discovery timeout in milliseconds (default: 3000)",
+    )
+    parser.add_argument(
+        "--interface",
+        action="append",
+        dest="interfaces",
+        help="local PC IPv4 address for WS-Discovery (repeatable)",
+    )
+    parser.add_argument(
+        "--cidr",
+        action="append",
+        dest="cidrs",
+        help="target IPv4 address or CIDR (repeatable)",
+    )
+    parser.add_argument(
+        "--port",
+        action="append",
+        dest="ports",
+        type=_port,
+        help="ONVIF Device Service port (repeatable)",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=_concurrency,
+        help="concurrent CIDR hosts (default: 64)",
+    )
     return parser
 
 
@@ -71,13 +131,11 @@ def _streams_parser():
         description="Resolve every ONVIF media profile RTSP URI",
     )
     parser.add_argument("--host", required=True)
-    parser.add_argument("--user", default="admin")
-    password = os.environ.get("ONVIF_PASSWORD")
+    parser.add_argument("--user", default="")
     parser.add_argument(
         "--pass",
         dest="password",
-        default=password,
-        required=password is None,
+        default="",
     )
     parser.add_argument("--device-url", action="append", dest="device_urls")
     return parser
@@ -110,10 +168,17 @@ def main(argv=None):
     arguments = list(sys.argv[1:] if argv is None else argv)
     if arguments[:1] == ["discover"]:
         args = _discovery_parser().parse_args(arguments[1:])
-        devices = discover_devices(
+        discovery_options = dict(
             timeout=args.timeout_ms / 1000.0,
             interfaces=args.interfaces,
         )
+        if args.cidrs:
+            discovery_options["cidrs"] = args.cidrs
+        if args.ports:
+            discovery_options["ports"] = args.ports
+        if args.concurrency is not None:
+            discovery_options["concurrency"] = args.concurrency
+        devices = discover_devices(**discovery_options)
         for device in devices:
             print(json.dumps(_device_json(device), ensure_ascii=False))
         return
@@ -138,6 +203,7 @@ def main(argv=None):
         password=args.password,
         file=args.file,
         volume=args.volume,
+        codec=args.codec,
     )
     print(f"sent {result.packets_sent} RTP packets")
 

@@ -4,11 +4,15 @@ use rand::RngCore;
 use reqwest::blocking::Client;
 use serde::Serialize;
 use sha1::{Digest, Sha1};
+use std::io::Read;
 use std::time::Duration;
+
+use crate::rtsp::{has_rtsp_scheme, sanitize_rtsp_uri};
 
 const DEVICE_NS: &str = "http://www.onvif.org/ver10/device/wsdl";
 const MEDIA_NS: &str = "http://www.onvif.org/ver10/media/wsdl";
 const SCHEMA_NS: &str = "http://www.onvif.org/ver10/schema";
+const MAX_ONVIF_RESPONSE_BYTES: usize = 1024 * 1024;
 
 const WSSE_NS: &str =
     "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd";
@@ -201,6 +205,8 @@ impl OnvifDevice {
         }
         let client = Client::builder()
             .danger_accept_invalid_certs(true)
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(timeout)
             .build()
             .map_err(|error| format!("failed to build ONVIF HTTP client: {error}"))?;
@@ -258,7 +264,7 @@ impl OnvifDevice {
         }
         Err(format!(
             "ONVIF connect failed for {}: {}",
-            self.host,
+            safe_host(&self.host),
             last_error.unwrap_or_else(|| "no device service candidates".to_owned())
         ))
     }
@@ -303,7 +309,23 @@ impl OnvifDevice {
     }
 
     fn soap(&self, url: &str, body: &str, authenticated: bool) -> Result<String, String> {
-        let security = if authenticated {
+        let (status, text) = self.soap_response(url, body, authenticated)?;
+        if status.is_server_error() && !text.contains("Envelope") {
+            return Err(format!(
+                "ONVIF request to {} returned HTTP {status}",
+                safe_url(url)
+            ));
+        }
+        Ok(text)
+    }
+
+    fn soap_response(
+        &self,
+        url: &str,
+        body: &str,
+        authenticated: bool,
+    ) -> Result<(reqwest::StatusCode, String), String> {
+        let security = if authenticated && !(self.user.is_empty() && self.password.is_empty()) {
             let mut nonce = [0u8; 16];
             rand::rngs::OsRng.fill_bytes(&mut nonce);
             wsse_header(
@@ -326,16 +348,54 @@ impl OnvifDevice {
             .header("Content-Type", "application/soap+xml; charset=utf-8")
             .body(envelope)
             .send()
-            .map_err(|error| format!("ONVIF request to {url} failed: {error}"))?;
+            .map_err(|error| format!("ONVIF request to {} failed: {error}", safe_url(url)))?;
         let status = response.status();
-        let text = response
-            .text()
-            .map_err(|error| format!("failed to read ONVIF response from {url}: {error}"))?;
-        if status.is_server_error() && !text.contains("Envelope") {
-            return Err(format!("ONVIF request to {url} returned HTTP {status}"));
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_ONVIF_RESPONSE_BYTES as u64)
+        {
+            return Err(format!(
+                "ONVIF response body from {} exceeds {MAX_ONVIF_RESPONSE_BYTES} byte limit",
+                safe_url(url)
+            ));
         }
-        Ok(text)
+        let mut bytes = Vec::new();
+        response
+            .take((MAX_ONVIF_RESPONSE_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|error| {
+                format!(
+                    "failed to read ONVIF response from {}: {error}",
+                    safe_url(url)
+                )
+            })?;
+        if bytes.len() > MAX_ONVIF_RESPONSE_BYTES {
+            return Err(format!(
+                "ONVIF response body from {} exceeds {MAX_ONVIF_RESPONSE_BYTES} byte limit",
+                safe_url(url)
+            ));
+        }
+        let text = String::from_utf8(bytes)
+            .map_err(|_| format!("ONVIF response from {} is not UTF-8", safe_url(url)))?;
+        Ok((status, text))
     }
+}
+
+pub(crate) fn probe_device_service(url: &str, timeout: Duration) -> Result<(), String> {
+    let device =
+        OnvifDevice::with_device_urls_and_timeout("", "", "", vec![url.to_owned()], timeout)?;
+    let (status, xml) = device.soap_response(
+        url,
+        &format!("<GetSystemDateAndTime xmlns=\"{DEVICE_NS}\"/>"),
+        false,
+    )?;
+    if !status.is_success() {
+        return Err(format!(
+            "ONVIF discovery request to {} returned HTTP {status}",
+            safe_url(url)
+        ));
+    }
+    parse_device_time(&xml).map(|_| ())
 }
 
 pub fn get_stream_uris(options: &StreamUriOptions) -> Result<Vec<StreamUri>, String> {
@@ -360,7 +420,7 @@ pub fn get_stream_uris(options: &StreamUriOptions) -> Result<Vec<StreamUri>, Str
         .profiles()?
         .into_iter()
         .map(|profile| {
-            let uri = device.stream_uri(&profile.token)?;
+            let uri = sanitize_rtsp_uri(&device.stream_uri(&profile.token)?)?;
             Ok(StreamUri {
                 profile_token: profile.token,
                 profile_name: profile.name,
@@ -368,6 +428,25 @@ pub fn get_stream_uris(options: &StreamUriOptions) -> Result<Vec<StreamUri>, Str
             })
         })
         .collect()
+}
+
+fn safe_url(url: &str) -> String {
+    if let Ok(mut parsed) = url::Url::parse(url) {
+        let _ = parsed.set_username("");
+        let _ = parsed.set_password(None);
+        parsed.set_fragment(None);
+        parsed.to_string()
+    } else {
+        "<invalid-url>".to_owned()
+    }
+}
+
+fn safe_host(host: &str) -> String {
+    if has_rtsp_scheme(host) {
+        safe_url(host)
+    } else {
+        host.to_owned()
+    }
 }
 
 fn parse_first_text(xml: &str, name: &str) -> Option<String> {
@@ -381,14 +460,16 @@ fn parse_first_text(xml: &str, name: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Read, Write};
+    use std::io::{ErrorKind, Read, Write};
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
     use std::thread;
 
     use chrono::{TimeZone, Utc};
 
-    use super::{OnvifDevice, parse_device_time, parse_profile_tokens, wsse_header};
+    use super::{
+        OnvifDevice, parse_device_time, parse_profile_tokens, probe_device_service, wsse_header,
+    };
 
     #[test]
     fn builds_a_deterministic_wsse_password_digest() {
@@ -468,6 +549,164 @@ mod tests {
             assert!(!request.contains(">pass<"));
         }
         assert!(requests[4].contains("<ProfileToken>main</ProfileToken>"));
+    }
+
+    #[test]
+    fn omits_ws_security_when_both_credentials_are_empty() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let device_url = format!("http://127.0.0.1:{port}/onvif/device_service");
+        let media_url = format!("http://127.0.0.1:{port}/onvif/media_service");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server_requests = Arc::clone(&requests);
+        let server = thread::spawn(move || {
+            let responses = [
+                "<Envelope><UTCDateTime><Time><Hour>13</Hour><Minute>14</Minute><Second>15</Second></Time><Date><Year>2026</Year><Month>7</Month><Day>16</Day></Date></UTCDateTime></Envelope>".to_owned(),
+                "<Envelope><GetDeviceInformationResponse/></Envelope>".to_owned(),
+                format!("<Envelope><Capabilities><Media><XAddr>{media_url}</XAddr></Media></Capabilities></Envelope>"),
+            ];
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                server_requests
+                    .lock()
+                    .unwrap()
+                    .push(read_http_request(&mut stream));
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response.len(),
+                    response
+                )
+                .unwrap();
+            }
+        });
+
+        let mut device = OnvifDevice::with_device_urls("camera", "", "", vec![device_url]).unwrap();
+        device.connect().unwrap();
+        server.join().unwrap();
+
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|request| !request.contains("wsse:Security"))
+        );
+    }
+
+    #[test]
+    fn rejects_an_onvif_response_body_that_exceeds_the_limit_without_content_length() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let device_url = format!("http://127.0.0.1:{port}/onvif/device_service");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_http_request(&mut stream);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            let oversized = vec![b'x'; 1024 * 1024 + 1];
+            let _ = stream.write_all(&oversized);
+        });
+        let device =
+            OnvifDevice::with_device_urls("127.0.0.1", "", "", vec![device_url.clone()]).unwrap();
+
+        let error = device
+            .soap(&device_url, "<GetSystemDateAndTime/>", false)
+            .unwrap_err();
+        server.join().unwrap();
+
+        assert!(error.contains("response body"));
+        assert!(error.contains("limit"));
+    }
+
+    #[test]
+    fn device_service_probe_requires_a_success_http_status() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_http_request(&mut stream);
+            let body = concat!(
+                "<Envelope><UTCDateTime><Time><Hour>1</Hour>",
+                "<Minute>2</Minute><Second>3</Second></Time><Date>",
+                "<Year>2026</Year><Month>7</Month><Day>20</Day>",
+                "</Date></UTCDateTime></Envelope>"
+            );
+            write!(
+                stream,
+                "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+
+        let error = probe_device_service(
+            &format!("http://127.0.0.1:{port}/onvif/device_service"),
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap_err();
+        server.join().unwrap();
+
+        assert!(error.contains("404"));
+    }
+
+    #[test]
+    fn device_service_probe_does_not_follow_http_redirects() {
+        let redirect_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let redirect_port = redirect_listener.local_addr().unwrap().port();
+        let target_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        target_listener.set_nonblocking(true).unwrap();
+        let target_port = target_listener.local_addr().unwrap().port();
+
+        let redirect_server = thread::spawn(move || {
+            let (mut stream, _) = redirect_listener.accept().unwrap();
+            let _ = read_http_request(&mut stream);
+            write!(
+                stream,
+                "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{target_port}/redirected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+        });
+        let target_server = thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+            while std::time::Instant::now() < deadline {
+                match target_listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut request = [0u8; 4096];
+                        let _ = stream.read(&mut request).unwrap();
+                        let body = concat!(
+                            "<Envelope><UTCDateTime><Time><Hour>1</Hour>",
+                            "<Minute>2</Minute><Second>3</Second></Time><Date>",
+                            "<Year>2026</Year><Month>7</Month><Day>20</Day>",
+                            "</Date></UTCDateTime></Envelope>"
+                        );
+                        write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .unwrap();
+                        return true;
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("redirect target failed: {error}"),
+                }
+            }
+            false
+        });
+
+        let result = probe_device_service(
+            &format!("http://127.0.0.1:{redirect_port}/onvif/device_service"),
+            std::time::Duration::from_secs(1),
+        );
+        redirect_server.join().unwrap();
+        let target_contacted = target_server.join().unwrap();
+
+        assert!(result.is_err());
+        assert!(!target_contacted);
     }
 
     fn read_http_request(stream: &mut impl Read) -> String {

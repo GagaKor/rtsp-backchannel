@@ -8,7 +8,8 @@
     "outDir": "dist",
     "rewriteRelativeImportExtensions": true,
     "rootDir": "src",
-    "sourceMap": true
+    "sourceMap": true,
+    "stripInternal": true
   },
   "exclude": [
     "src/**/*.test.ts"

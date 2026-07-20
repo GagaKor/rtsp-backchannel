@@ -4,8 +4,8 @@
 [한국어](https://github.com/GagaKor/rtsp-backchannel/blob/master/rust/README.ko.md)
 
 Rust library and CLI for discovering ONVIF cameras, resolving profile RTSP
-URIs, and playing one audio file through an ONVIF RTSP backchannel. GStreamer
-is not required.
+URIs, and playing one audio file through an ONVIF RTSP backchannel. FFmpeg is
+required only for file playback; GStreamer is not used.
 
 Other implementations:
 
@@ -14,14 +14,14 @@ Other implementations:
 
 The crate starts a backchannel session, sends the complete file at real-time
 speed, and closes the session. It calls a separately installed `ffmpeg`
-executable to decode input audio. G.711 encoding and RTP/RTSP transport are
-implemented in Rust. FFmpeg is not bundled or installed by this crate.
+executable to decode input audio. Audio codec handling and RTP/RTSP transport
+are implemented in Rust. FFmpeg is not bundled or installed by this crate.
 
 ## Requirements
 
 - Rust 1.86 or later
 - `ffmpeg` on `PATH` for file playback
-- A camera that exposes an ONVIF `sendonly` G.711 audio backchannel
+- A camera that exposes an ONVIF `sendonly` audio backchannel
 
 Discovery and stream URI lookup do not require FFmpeg.
 
@@ -33,7 +33,7 @@ Add the released crate to `Cargo.toml`. The example application also uses
 ```toml
 [dependencies]
 anyhow = "1"
-rtsp-backchannel = "0.1"
+rtsp-backchannel = "0.2"
 ```
 
 To use the current `master` source instead of a registry release:
@@ -69,8 +69,8 @@ use rtsp_backchannel::playback::{PlaybackConfig, play_file};
 fn main() -> anyhow::Result<()> {
     let result = play_file(&PlaybackConfig {
         host: "camera.local".to_owned(),
-        user: "admin".to_owned(),
-        password: std::env::var("ONVIF_PASSWORD")?,
+        user: "".to_owned(),
+        password: "".to_owned(),
         file: PathBuf::from("/absolute/path/to/event.mp3"),
         volume: 0.05,
     })?;
@@ -130,7 +130,7 @@ fn main() -> Result<()> {
 
     println!(
         "{:?} {} packets {:.2}s",
-        result.variant, result.packets_sent, result.duration_seconds
+        result.codec, result.packets_sent, result.duration_seconds
     );
     Ok(())
 }
@@ -141,16 +141,48 @@ fn main() -> Result<()> {
 | API | Main options | Result |
 | --- | --- | --- |
 | `discover_devices(&options)` | `DiscoveryOptions { timeout, interfaces }` | `Vec<DiscoveredDevice>` |
+| `discover_devices_in_cidrs(&options)` | `CidrDiscoveryOptions` | `Result<Vec<DiscoveredDevice>, String>` |
 | `get_stream_uris(&options)` | `StreamUriOptions` | `Result<Vec<StreamUri>, String>` |
 | `play_file(&config)` | `PlaybackConfig` | `anyhow::Result<PlaybackResult>` |
 
-`DiscoveredDevice` contains `ip`, `xaddrs`, `scopes`, and optional `name`,
-`hardware`, and `endpoint_reference` fields. `DiscoveryOptions::default()`
-searches for three seconds using an automatically selected local IPv4 address.
-Set `interfaces` explicitly when multiple NICs or VLANs must be covered.
+### Device Discovery
 
-WS-Discovery multicast is normally not routed, so discovery must run from the
-same subnet or VLAN as the camera.
+`discover_devices(&DiscoveryOptions::default())` uses WS-Discovery multicast
+from an automatically selected local IPv4 address. Set `interfaces` to local
+addresses of this computer when specific NICs or VLANs must be searched.
+
+Use the additive CIDR API to search multiple routed networks and individual
+addresses without changing the existing `DiscoveryOptions` contract:
+
+```rust
+use std::time::Duration;
+
+use rtsp_backchannel::discovery::{
+    CidrDiscoveryOptions, discover_devices_in_cidrs,
+};
+
+let mut options = CidrDiscoveryOptions::new([
+    "10.0.0.0/24",
+    "10.128.0.10",
+]);
+options.timeout = Duration::from_secs(1);
+options.ports = vec![80, 8000, 443];
+options.concurrency = 64;
+let devices = discover_devices_in_cidrs(&options)?;
+# Ok::<(), String>(())
+```
+
+Every entry in `cidrs` is searched, individual IPs are treated as `/32`, and
+overlapping hosts are probed once. CIDR mode sends the unauthenticated ONVIF
+`GetSystemDateAndTime` request to `/onvif/device_service`. Port `443` uses
+HTTPS with self-signed certificates accepted; other ports use HTTP. The
+defaults are ports `80`, `8000`, and `443`, a one-second timeout, and
+concurrency `64`. A maximum of 4,096 unique usable IPv4 hosts can be searched.
+
+`DiscoveredDevice` contains `ip`, `xaddrs`, `scopes`, and optional `name`,
+`hardware`, and `endpoint_reference` fields. Active CIDR results contain the
+successful service URLs in `xaddrs`, but discovery metadata is normally empty.
+The networks must be routable and firewalls must allow the ONVIF ports.
 
 `StreamUriOptions::new(host, user, password)` uses an eight-second timeout and
 the standard ONVIF Device service URL candidates. Set `device_urls` from a
@@ -158,8 +190,41 @@ discovery result when the camera advertises a specific endpoint. Each
 `StreamUri` contains `profile_token`, optional `profile_name`, and a `uri`
 without embedded credentials.
 
-`PlaybackResult` contains `variant`, `sample_rate`, `payload_type`,
-`rtp_channel`, `encoded_bytes`, `packets_sent`, and `duration_seconds`.
+`PlaybackResult` contains `codec`, an optional G.711-only `variant`, `sample_rate`,
+`channels`, `payload_type`, `rtp_channel`, `encoded_bytes`, `packets_sent`, and
+`duration_seconds`.
+
+Empty credentials omit ONVIF WS-Security and RTSP authentication. Non-empty
+ONVIF credentials use PasswordDigest; RTSP credentials are sent after a server
+challenge. WS-Security digest authenticates but does not encrypt transport.
+HTTP and HTTPS, including self-signed TLS compatibility, are supported; use a
+trusted network or VPN.
+
+The default `CodecPreference::Auto` negotiates SDP in this order: PCMA, PCMU,
+G726-32, G726-24, G726-16, G726-40, AAC. G711, RFC3551 G726, and RFC 3640
+MPEG4-GENERIC AAC-hbr are supported; MP4A-LATM is explicitly unsupported.
+Use `play_file_with_codec(&config, CodecPreference::Aac)` to request one
+codec. Explicit selection does not fall back.
+
+Direct RTSP bypasses ONVIF:
+
+```rust
+use std::path::PathBuf;
+use rtsp_backchannel::audio::CodecPreference;
+use rtsp_backchannel::playback::{PlaybackConfig, play_file_with_codec};
+
+let result = play_file_with_codec(&PlaybackConfig {
+    host: "rtsp://admin:p%40ss@camera.local/backchannel".to_owned(),
+    user: "".to_owned(),
+    password: "".to_owned(),
+    file: PathBuf::from("/absolute/path/to/event.mp3"),
+    volume: 0.05,
+}, CodecPreference::Auto)?;
+```
+
+Embedded credentials are parsed automatically; explicit non-empty fields
+override them. Prefer `%40` for `@` in a password. Raw `@` uses the final
+authority separator. Request URIs and logs strip credentials.
 
 ## CLI
 
@@ -189,6 +254,15 @@ rtsp-backchannel discover \
   --interface 192.0.2.20 \
   --interface 198.51.100.20
 
+# Search every host in a CIDR plus one specific IP.
+rtsp-backchannel discover \
+  --cidr 10.0.0.0/24 \
+  --cidr 10.128.0.10 \
+  --timeout-ms 1000 \
+  --port 80 \
+  --port 8000 \
+  --concurrency 64
+
 # Resolve RTSP URIs for all ONVIF Media Profiles.
 rtsp-backchannel streams \
   --host camera.local \
@@ -198,8 +272,17 @@ rtsp-backchannel streams \
 rtsp-backchannel play \
   --host camera.local \
   --user admin \
+  --pass "$ONVIF_PASSWORD" \
   --file '/absolute/path/to/event.mp3' \
-  --volume 0.05
+  --volume 0.05 \
+  --codec auto
+
+# No ONVIF or RTSP credentials.
+rtsp-backchannel play --host camera.local --file '/absolute/path/to/event.mp3'
+
+# Direct RTSP bypasses ONVIF.
+rtsp-backchannel play --host 'rtsp://admin:p%40ss@camera.local/backchannel' \
+  --file '/absolute/path/to/event.mp3'
 ```
 
 The `play` word is optional for backward compatibility. `--pass` is available
@@ -208,15 +291,16 @@ process argument list.
 
 ## Playback Behavior
 
-- G.711 at 8 kHz mono
-- PCMA preferred, with PCMU fallback when only PCMU is offered
+- SDP auto negotiation: PCMA, PCMU, G726-32, G726-24, G726-16, G726-40, AAC
+- Supports G711, RFC3551 G726, and RFC 3640 MPEG4-GENERIC AAC-hbr
+- MP4A-LATM is explicitly unsupported
 - TCP interleaved RTP
 - 40 ms audio packets with real-time pacing
 - RTSP keepalive during long files
 - RTSP teardown after success or failure
 
-The first ONVIF Media Profile must expose a `sendonly` audio track offering
-PCMA or PCMU. Audio output and decoder configuration are camera-specific; a
+The first ONVIF Media Profile must expose a `sendonly` audio track offering a
+supported codec. Audio output and decoder configuration are camera-specific; a
 successful RTSP session does not override disabled or misrouted camera audio
 output settings.
 

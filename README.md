@@ -5,7 +5,7 @@
 
 TypeScript library and CLI for discovering ONVIF cameras, resolving profile
 RTSP URIs, and playing one audio file through an ONVIF RTSP backchannel.
-GStreamer is not required.
+FFmpeg is required only for file playback; GStreamer is not used.
 
 Other implementations:
 
@@ -14,8 +14,8 @@ Other implementations:
 
 The package starts a backchannel session, sends the complete file at real-time
 speed, and closes the session. It calls a separately installed `ffmpeg`
-executable to decode input audio. G.711 encoding and RTP/RTSP transport are
-implemented in TypeScript. FFmpeg is not bundled or installed by this package.
+executable to decode input audio. Audio codec handling and RTP/RTSP transport
+are implemented in TypeScript. FFmpeg is not bundled or installed by this package.
 
 ## Requirements
 
@@ -29,6 +29,12 @@ Discovery and stream URI lookup do not require FFmpeg.
 
 ```bash
 npm install rtsp-backchannel
+```
+
+The current release line is `0.2`:
+
+```bash
+npm install rtsp-backchannel@^0.2
 ```
 
 To install the current `master` source instead of a registry release:
@@ -57,13 +63,10 @@ containing `ffmpeg.exe` to `PATH`.
 ```typescript
 import { playFile } from 'rtsp-backchannel';
 
-const password = process.env.ONVIF_PASSWORD;
-if (!password) throw new Error('ONVIF_PASSWORD is required');
-
 const packetsSent = await playFile({
   host: 'camera.local',
-  user: 'admin',
-  pass: password,
+  user: '',
+  pass: '',
   file: '/absolute/path/to/event.mp3',
   volume: 0.05,
 });
@@ -121,52 +124,114 @@ console.log({ packetsSent });
 
 | API | Main options | Result |
 | --- | --- | --- |
-| `discoverDevices(options?)` | `timeoutMs?`, `interfaces?: string[]` | `Promise<DiscoveredDevice[]>` |
+| `discoverDevices(options?)` | `timeoutMs?`, `interfaces?`, `cidrs?`, `ports?`, `concurrency?` | `Promise<DiscoveredDevice[]>` |
 | `getStreamUris(options)` | `host`, `user`, `pass`, `deviceUrls?`, `timeoutMs?` | `Promise<StreamUri[]>` |
-| `playFile(options)` | `host`, `user`, `pass`, `file`, `volume` | RTP packet count as `Promise<number>` |
+| `playFile(options)` | `host`, `user`, `pass`, `file`, `volume`, `codec` | RTP packet count as `Promise<number>` |
 
 `DiscoveredDevice` contains `ip`, `xaddrs`, `scopes`, and optional `name`,
 `hardware`, and `endpointReference` fields. `StreamUri` contains
 `profileToken`, optional `profileName`, and a `uri` without embedded
 credentials.
 
-`discoverDevices` uses WS-Discovery multicast. It normally must run from an
-IPv4 interface on the same subnet or VLAN as the camera. Pass every local IPv4
-address in `interfaces` when a host has multiple NICs or VLANs that must be
-searched.
+### Device Discovery
+
+Calling `discoverDevices()` without `cidrs` uses WS-Discovery multicast from
+the machine's detected local IPv4 interfaces. This is the default for cameras
+on the same subnet or VLAN. `interfaces` is an advanced override containing
+local addresses of this computer, not camera addresses.
+
+To search routed networks or specific addresses, pass an array whose entries
+are either IPv4 CIDRs or individual IPv4 addresses. Every entry is searched and
+overlapping hosts are probed once:
+
+```typescript
+const devices = await discoverDevices({
+  cidrs: ['10.0.0.0/24', '10.128.0.10'],
+  timeoutMs: 1000,
+  ports: [80, 8000, 443],
+  concurrency: 64,
+});
+```
+
+CIDR mode sends the unauthenticated ONVIF `GetSystemDateAndTime` request to
+`/onvif/device_service`. Port `443` uses HTTPS and accepts self-signed camera
+certificates; other ports use HTTP. The default ports are `80`, `8000`, and
+`443`, and the default concurrency is `64`. A maximum of 4,096 unique usable
+IPv4 hosts can be searched per call. `interfaces` and `cidrs` cannot be used
+together.
+
+Active CIDR results contain the successful service URLs in `xaddrs`; `scopes`,
+`name`, and `hardware` are unavailable unless the device also answers multicast
+discovery. The target networks must be routable and their ONVIF ports must be
+allowed by host and network firewalls. If the camera IP is already known,
+discovery can be skipped and the address passed directly to `getStreamUris`.
 
 `getStreamUris` authenticates with the ONVIF Device and Media services and
 returns the RTSP URI for every Media Profile. Network, authentication, and
 protocol errors reject the returned promise.
 
+Credentials are optional. Empty `user` and `pass` omit WS-Security for ONVIF and
+RTSP authentication; with non-empty ONVIF credentials the library uses
+PasswordDigest, while RTSP authentication is sent only after a server
+challenge. WS-Security digest authenticates the request but does not encrypt
+transport. HTTP and HTTPS cameras, including self-signed TLS endpoints, are
+supported for compatibility; use a trusted network or VPN.
+
 ### Low-Level Backchannel API
 
-Use `openBackchannel` when the session lifecycle or encoded G.711 buffer must
-be controlled directly. Always close the session, including after an error.
+Use `openBackchannel` when the session lifecycle or encoded RTP frames must be
+controlled directly. Always close the session, including after an error.
 
 ```typescript
-import { fileToG711, openBackchannel } from 'rtsp-backchannel';
+import { fileToRtpAudio, openBackchannel } from 'rtsp-backchannel';
 
 const password = process.env.ONVIF_PASSWORD;
 if (!password) throw new Error('ONVIF_PASSWORD is required');
 
 const session = await openBackchannel('camera.local', 'admin', password);
 try {
-  const g711 = await fileToG711(
-    '/absolute/path/to/event.mp3',
-    session.variant,
-    0.05,
+  const encoded = await session.withKeepAlive(
+    () => fileToRtpAudio(
+      '/absolute/path/to/event.mp3',
+      session.codec,
+      0.05,
+    ),
   );
-  const packetsSent = await session.send(g711);
+  const packetsSent = await session.send(encoded);
   console.log({ packetsSent });
 } finally {
   await session.close();
 }
 ```
 
+`withKeepAlive` prevents a short RTSP session from expiring while FFmpeg reads
+and encodes the file. `session.send` continues keepalive handling during paced
+RTP transmission.
+
 The package also exports `pcm16ToG711`, `linearToALaw`, `linearToMuLaw`,
 `generateTonePcm`, and `sendPacedG711` for applications that generate PCM or
 control encoding and pacing themselves.
+
+`session.variant` is `G711Variant | undefined`; it is `undefined` when SDP
+selects G.726 or AAC. Use `fileToRtpAudio`/`sendPacedFrames` for codec-neutral
+playback instead of assuming a G.711 variant.
+
+To bypass ONVIF entirely, pass a direct RTSP target. Embedded credentials are
+parsed automatically, and explicit non-empty `user`/`pass` override them:
+
+```typescript
+const packetsSent = await playFile({
+  host: 'rtsp://admin:p%40ss@camera.local:554/backchannel',
+  user: '',
+  pass: '',
+  file: '/absolute/path/to/event.mp3',
+  codec: 'auto',
+});
+```
+
+Prefer `%40` for a password containing `@`. A raw `@` is interpreted using the
+final `@` in the authority. Request URIs and displayed errors strip embedded
+credentials.
 
 ## CLI
 
@@ -190,6 +255,15 @@ rtsp-backchannel discover \
   --interface 192.0.2.20 \
   --interface 198.51.100.20
 
+# Search every host in a CIDR plus one specific IP.
+rtsp-backchannel discover \
+  --cidr 10.0.0.0/24 \
+  --cidr 10.128.0.10 \
+  --timeout-ms 1000 \
+  --port 80 \
+  --port 8000 \
+  --concurrency 64
+
 # Resolve RTSP URIs for all ONVIF Media Profiles.
 rtsp-backchannel streams \
   --host camera.local \
@@ -199,8 +273,18 @@ rtsp-backchannel streams \
 rtsp-backchannel play \
   --host camera.local \
   --user admin \
+  --pass "$ONVIF_PASSWORD" \
   --file '/absolute/path/to/event.mp3' \
-  --volume 0.05
+  --volume 0.05 \
+  --codec auto
+
+# No ONVIF or RTSP credentials.
+rtsp-backchannel play --host camera.local --file '/absolute/path/to/event.mp3'
+
+# Direct RTSP bypasses ONVIF.
+rtsp-backchannel play \
+  --host 'rtsp://admin:p%40ss@camera.local/backchannel' \
+  --file '/absolute/path/to/event.mp3'
 ```
 
 The `play` word is optional for backward compatibility. `--pass` is available
@@ -209,15 +293,19 @@ process argument list.
 
 ## Playback Behavior
 
-- G.711 at 8 kHz mono
-- PCMA preferred, with PCMU fallback when only PCMU is offered
+- SDP auto negotiation, in this order: PCMA, PCMU, G726-32, G726-24,
+  G726-16, G726-40, AAC
+- Supports G711, RFC3551 G726, and RFC 3640 MPEG4-GENERIC AAC-hbr
+- MP4A-LATM is explicitly unsupported
+- Use `codec`/`--codec` to request one supported codec; explicit selection does
+  not fall back to another codec
 - TCP interleaved RTP
 - 40 ms audio packets with real-time pacing
 - RTSP keepalive during long files
 - RTSP teardown after success or failure
 
-The first ONVIF Media Profile must expose a `sendonly` audio track offering
-PCMA or PCMU. Audio output and decoder configuration are camera-specific; a
+The first ONVIF Media Profile must expose a `sendonly` audio track offering a
+supported codec. Audio output and decoder configuration are camera-specific; a
 successful RTSP session does not override disabled or misrouted camera audio
 output settings.
 

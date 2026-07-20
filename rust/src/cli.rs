@@ -4,21 +4,28 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
+use crate::audio::CodecPreference;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "rtsp-backchannel",
-    about = "Play one audio file through an ONVIF RTSP backchannel",
+    about = "Play one audio file through an ONVIF or direct RTSP backchannel",
     after_help = "Commands: rtsp-backchannel discover; rtsp-backchannel streams\n\
-                  Profile: PCMA 8kHz mono, TCP interleaved RTP, 40 ms packets, rebase pacing."
+                  Codec: auto|pcma|pcmu|g726-16|g726-24|g726-32|g726-40|aac; TCP interleaved RTP, real-time pacing."
 )]
 pub struct Cli {
     #[arg(long)]
     pub host: String,
 
-    #[arg(long, default_value = "admin")]
+    #[arg(long, default_value = "")]
     pub user: String,
 
-    #[arg(long = "pass", env = "ONVIF_PASSWORD", hide_env_values = true)]
+    #[arg(
+        long = "pass",
+        env = "ONVIF_PASSWORD",
+        hide_env_values = true,
+        default_value = ""
+    )]
     pub password: String,
 
     #[arg(long)]
@@ -26,6 +33,9 @@ pub struct Cli {
 
     #[arg(long, default_value = "0.05", value_parser = parse_volume)]
     pub volume: f64,
+
+    #[arg(long, default_value = "auto")]
+    pub codec: CodecPreference,
 }
 
 #[derive(Debug, Parser)]
@@ -38,7 +48,20 @@ pub struct DiscoveryCli {
     pub timeout_ms: u64,
 
     #[arg(long = "interface")]
+    /// Local PC IPv4 address for WS-Discovery. Repeat to select multiple NICs.
     pub interfaces: Vec<Ipv4Addr>,
+
+    #[arg(long = "cidr")]
+    /// Target IPv4 address or CIDR. Repeat to search every selected target.
+    pub cidrs: Vec<String>,
+
+    #[arg(long = "port")]
+    /// ONVIF Device Service port used for active discovery.
+    pub ports: Vec<u16>,
+
+    #[arg(long, default_value_t = 64)]
+    /// Number of CIDR hosts scanned concurrently.
+    pub concurrency: usize,
 }
 
 #[derive(Debug, Parser)]
@@ -50,10 +73,15 @@ pub struct StreamsCli {
     #[arg(long)]
     pub host: String,
 
-    #[arg(long, default_value = "admin")]
+    #[arg(long, default_value = "")]
     pub user: String,
 
-    #[arg(long = "pass", env = "ONVIF_PASSWORD", hide_env_values = true)]
+    #[arg(
+        long = "pass",
+        env = "ONVIF_PASSWORD",
+        hide_env_values = true,
+        default_value = ""
+    )]
     pub password: String,
 
     #[arg(long = "device-url")]
@@ -107,26 +135,58 @@ mod tests {
 
     use clap::{CommandFactory, Parser};
 
-    use super::Cli;
+    use super::{Cli, StreamsCli};
 
     #[test]
-    fn requires_camera_host_and_password() {
+    fn requires_only_camera_target_and_file_for_playback() {
         let command = Cli::command();
-        for id in ["host", "password"] {
+        for id in ["host", "file"] {
             let argument = command
                 .get_arguments()
                 .find(|argument| argument.get_id() == id)
                 .unwrap();
             assert!(argument.is_required_set());
         }
+        for id in ["user", "password"] {
+            let argument = command
+                .get_arguments()
+                .find(|argument| argument.get_id() == id)
+                .unwrap();
+            assert!(!argument.is_required_set());
+        }
     }
 
     #[test]
-    fn uses_only_non_sensitive_playback_defaults() {
+    fn defaults_playback_credentials_to_empty() {
         let cli = Cli::try_parse_from([
             "rtsp-backchannel",
             "--host",
             "camera",
+            "--file",
+            "event.mp3",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.user, "");
+        assert_eq!(cli.password, "");
+    }
+
+    #[test]
+    fn defaults_stream_credentials_to_empty() {
+        let cli = StreamsCli::try_parse_from(["rtsp-backchannel", "--host", "camera"]).unwrap();
+
+        assert_eq!(cli.user, "");
+        assert_eq!(cli.password, "");
+    }
+
+    #[test]
+    fn accepts_explicit_playback_credentials() {
+        let cli = Cli::try_parse_from([
+            "rtsp-backchannel",
+            "--host",
+            "camera",
+            "--user",
+            "admin",
             "--pass",
             "secret",
             "--file",
@@ -139,6 +199,31 @@ mod tests {
         assert_eq!(cli.password, "secret");
         assert_eq!(cli.volume, 0.05);
         assert_eq!(cli.file.to_string_lossy(), "event.mp3");
+    }
+
+    #[test]
+    fn parses_codec_preference_with_auto_as_the_default() {
+        let default_cli = Cli::try_parse_from([
+            "rtsp-backchannel",
+            "--host",
+            "camera",
+            "--file",
+            "event.mp3",
+        ])
+        .unwrap();
+        assert_eq!(default_cli.codec, crate::audio::CodecPreference::Auto);
+
+        let cli = Cli::try_parse_from([
+            "rtsp-backchannel",
+            "--host",
+            "camera",
+            "--file",
+            "event.mp3",
+            "--codec",
+            "g726-32",
+        ])
+        .unwrap();
+        assert_eq!(cli.codec, crate::audio::CodecPreference::G72632);
     }
 
     #[test]

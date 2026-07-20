@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 use std::thread;
@@ -7,8 +7,13 @@ use std::time::{Duration, Instant};
 use rand::RngCore;
 use serde::Serialize;
 
+use crate::onvif::probe_device_service;
+
 const MULTICAST_ADDRESS: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);
 const MULTICAST_PORT: u16 = 3702;
+const DEFAULT_CIDR_PORTS: [u16; 3] = [80, 8000, 443];
+const DEFAULT_CIDR_CONCURRENCY: usize = 64;
+const MAX_CIDR_HOSTS: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -35,6 +40,36 @@ impl Default for DiscoveryOptions {
         Self {
             timeout: Duration::from_secs(3),
             interfaces: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Options for actively probing IPv4 networks and individual addresses.
+pub struct CidrDiscoveryOptions {
+    /// IPv4 CIDRs or individual IPv4 addresses. All entries are searched.
+    pub cidrs: Vec<String>,
+    /// ONVIF Device Service ports. Port 443 uses HTTPS; other ports use HTTP.
+    pub ports: Vec<u16>,
+    /// Timeout applied to each ONVIF probe request.
+    pub timeout: Duration,
+    /// Number of hosts scanned concurrently. Valid values are 1 through 256.
+    pub concurrency: usize,
+}
+
+impl CidrDiscoveryOptions {
+    /// Creates options with ports 80, 8000, and 443, a one-second timeout,
+    /// and concurrency 64.
+    pub fn new<I, S>(cidrs: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            cidrs: cidrs.into_iter().map(Into::into).collect(),
+            ports: DEFAULT_CIDR_PORTS.to_vec(),
+            timeout: Duration::from_secs(1),
+            concurrency: DEFAULT_CIDR_CONCURRENCY,
         }
     }
 }
@@ -293,13 +328,136 @@ pub fn discover_devices(options: &DiscoveryOptions) -> Vec<DiscoveredDevice> {
     discover_with_probe(options, &probe_interface)
 }
 
+fn discovery_hosts(cidrs: &[String]) -> Result<Vec<Ipv4Addr>, String> {
+    let mut hosts = BTreeSet::new();
+    for raw_target in cidrs {
+        let target = raw_target.trim();
+        let (address, prefix) = match target.split_once('/') {
+            Some((address, prefix)) => (address, prefix),
+            None => (target, "32"),
+        };
+        let address = address
+            .parse::<Ipv4Addr>()
+            .map_err(|_| format!("invalid IPv4 address or CIDR: {raw_target}"))?;
+        let prefix = prefix
+            .parse::<u8>()
+            .ok()
+            .filter(|prefix| *prefix <= 32)
+            .ok_or_else(|| format!("invalid IPv4 address or CIDR: {raw_target}"))?;
+        let size = 1_u64 << (32 - u32::from(prefix));
+        let network = (u64::from(u32::from(address)) / size) * size;
+        let first = if prefix <= 30 { network + 1 } else { network };
+        let last = if prefix <= 30 {
+            network + size - 2
+        } else {
+            network + size - 1
+        };
+        let host_count = last.saturating_sub(first) + 1;
+        if host_count > MAX_CIDR_HOSTS as u64 {
+            return Err(format!(
+                "CIDR discovery is limited to {MAX_CIDR_HOSTS} IPv4 hosts"
+            ));
+        }
+        for value in first..=last {
+            hosts.insert(Ipv4Addr::from(value as u32));
+            if hosts.len() > MAX_CIDR_HOSTS {
+                return Err(format!(
+                    "CIDR discovery is limited to {MAX_CIDR_HOSTS} IPv4 hosts"
+                ));
+            }
+        }
+    }
+    Ok(hosts.into_iter().collect())
+}
+
+fn device_service_url(ip: Ipv4Addr, port: u16) -> String {
+    let secure = port == 443;
+    let default_port = if secure { 443 } else { 80 };
+    let authority = if port == default_port {
+        ip.to_string()
+    } else {
+        format!("{ip}:{port}")
+    };
+    format!(
+        "{}://{authority}/onvif/device_service",
+        if secure { "https" } else { "http" }
+    )
+}
+
+fn probe_cidr_host(ip: Ipv4Addr, ports: &[u16], timeout: Duration) -> Option<DiscoveredDevice> {
+    let xaddrs = ports
+        .iter()
+        .map(|port| device_service_url(ip, *port))
+        .filter(|url| probe_device_service(url, timeout).is_ok())
+        .collect::<Vec<_>>();
+    (!xaddrs.is_empty()).then_some(DiscoveredDevice {
+        ip,
+        xaddrs,
+        scopes: Vec::new(),
+        name: None,
+        hardware: None,
+        endpoint_reference: None,
+    })
+}
+
+/// Actively probes every unique host represented by `options.cidrs`.
+pub fn discover_devices_in_cidrs(
+    options: &CidrDiscoveryOptions,
+) -> Result<Vec<DiscoveredDevice>, String> {
+    if options.timeout.is_zero() {
+        return Err("timeout must be greater than 0 for CIDR discovery".to_owned());
+    }
+    if !(1..=256).contains(&options.concurrency) {
+        return Err("concurrency must be between 1 and 256".to_owned());
+    }
+    if options.ports.is_empty() || options.ports.contains(&0) {
+        return Err("ports must contain values between 1 and 65535".to_owned());
+    }
+    let hosts = discovery_hosts(&options.cidrs)?;
+    if hosts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut ports = options.ports.clone();
+    let mut seen_ports = BTreeSet::new();
+    ports.retain(|port| seen_ports.insert(*port));
+    let worker_count = options.concurrency.min(hosts.len());
+    let chunk_size = hosts.len().div_ceil(worker_count);
+    let timeout = options.timeout;
+    let devices = thread::scope(|scope| {
+        let handles = hosts
+            .chunks(chunk_size)
+            .map(|chunk| {
+                let ports = &ports;
+                scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .filter_map(|host| probe_cidr_host(*host, ports, timeout))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .filter_map(|handle| handle.join().ok())
+            .flatten()
+            .collect::<Vec<_>>()
+    });
+    let mut devices = devices;
+    devices.sort_by_key(|device| device.ip);
+    Ok(devices)
+}
+
 #[cfg(test)]
 mod tests {
-    use std::net::Ipv4Addr;
-    use std::sync::Mutex;
+    use std::io::{ErrorKind, Read, Write};
+    use std::net::{Ipv4Addr, TcpListener};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
     use std::time::{Duration, Instant};
 
-    use super::{DiscoveryOptions, discover_with_probe};
+    use super::{
+        CidrDiscoveryOptions, DiscoveryOptions, discover_devices_in_cidrs, discover_with_probe,
+    };
 
     const FIRST_RESPONSE: &[u8] = br#"<?xml version="1.0"?>
 <s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
@@ -361,5 +519,109 @@ mod tests {
                 .scopes
                 .contains(&"onvif://www.onvif.org/location/Entrance".to_owned())
         );
+    }
+
+    #[test]
+    fn expands_every_selected_ip_and_cidr_and_removes_overlaps() {
+        let hosts = super::discovery_hosts(&[
+            "10.0.0.0/30".to_owned(),
+            "10.128.0.10".to_owned(),
+            "10.0.0.1".to_owned(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            hosts,
+            [
+                Ipv4Addr::new(10, 0, 0, 1),
+                Ipv4Addr::new(10, 0, 0, 2),
+                Ipv4Addr::new(10, 128, 0, 10),
+            ]
+        );
+    }
+
+    #[test]
+    fn deduplicates_non_adjacent_ports_before_probing() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let live_port = listener.local_addr().unwrap().port();
+        let closed_port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let requests = Arc::new(Mutex::new(0usize));
+        let server_requests = Arc::clone(&requests);
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_millis(500);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut request = [0u8; 4096];
+                        let _ = stream.read(&mut request).unwrap();
+                        *server_requests.lock().unwrap() += 1;
+                        let body = concat!(
+                            "<Envelope><UTCDateTime><Time><Hour>1</Hour>",
+                            "<Minute>2</Minute><Second>3</Second></Time><Date>",
+                            "<Year>2026</Year><Month>7</Month><Day>20</Day>",
+                            "</Date></UTCDateTime></Envelope>"
+                        );
+                        write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .unwrap();
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("test HTTP server failed: {error}"),
+                }
+            }
+        });
+        let mut options = CidrDiscoveryOptions::new(["127.0.0.1"]);
+        options.ports = vec![live_port, closed_port, live_port];
+        options.timeout = Duration::from_millis(100);
+        options.concurrency = 1;
+
+        let devices = discover_devices_in_cidrs(&options).unwrap();
+        server.join().unwrap();
+
+        assert_eq!(*requests.lock().unwrap(), 1);
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].xaddrs.len(), 1);
+    }
+
+    #[test]
+    fn cidr_discovery_rejects_valid_onvif_xml_from_non_success_http_status() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request).unwrap();
+            let body = concat!(
+                "<Envelope><UTCDateTime><Time><Hour>1</Hour>",
+                "<Minute>2</Minute><Second>3</Second></Time><Date>",
+                "<Year>2026</Year><Month>7</Month><Day>20</Day>",
+                "</Date></UTCDateTime></Envelope>"
+            );
+            write!(
+                stream,
+                "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let mut options = CidrDiscoveryOptions::new(["127.0.0.1"]);
+        options.ports = vec![port];
+        options.timeout = Duration::from_secs(1);
+        options.concurrency = 1;
+
+        let devices = discover_devices_in_cidrs(&options).unwrap();
+        server.join().unwrap();
+
+        assert!(devices.is_empty());
     }
 }

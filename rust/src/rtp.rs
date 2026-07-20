@@ -22,9 +22,14 @@ impl RtpPacketizer {
     }
 
     pub fn build(&mut self, payload: &[u8], samples: u32) -> Vec<u8> {
+        self.build_with_marker(payload, samples, false)
+    }
+
+    pub fn build_with_marker(&mut self, payload: &[u8], samples: u32, marker: bool) -> Vec<u8> {
+        let marker = marker || self.first_packet;
         let mut packet = Vec::with_capacity(12 + payload.len());
         packet.push(0x80);
-        packet.push((if self.first_packet { 0x80 } else { 0 }) | (self.payload_type & 0x7f));
+        packet.push((if marker { 0x80 } else { 0 }) | (self.payload_type & 0x7f));
         packet.extend_from_slice(&self.sequence.to_be_bytes());
         packet.extend_from_slice(&self.timestamp.to_be_bytes());
         packet.extend_from_slice(&self.ssrc.to_be_bytes());
@@ -102,6 +107,17 @@ mod tests {
             0x77889aea
         );
         assert_eq!(interleave(6, &first)[..4], [0x24, 6, 0x01, 0x4c]);
+    }
+
+    #[test]
+    fn marks_the_first_talkspurt_packet_and_honors_explicit_au_markers() {
+        let mut packetizer = RtpPacketizer::with_identity(96, 1, 2, 3);
+        let first = packetizer.build_with_marker(&[1], 1024, false);
+        let second = packetizer.build_with_marker(&[2], 1024, false);
+        let complete_au = packetizer.build_with_marker(&[3], 1024, true);
+        assert_eq!(first[1], 0xe0);
+        assert_eq!(second[1], 0x60);
+        assert_eq!(complete_au[1], 0xe0);
     }
 
     #[test]

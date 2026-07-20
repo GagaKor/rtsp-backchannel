@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
-use rtsp_backchannel::playback::{PlaybackConfig, PlaybackResult, play_file};
+use rtsp_backchannel::audio::{CodecPreference, G711Variant};
+use rtsp_backchannel::playback::{PlaybackConfig, PlaybackResult, play_file, play_file_with_codec};
 
 #[test]
 fn exposes_one_shot_file_playback_as_a_library_api() {
@@ -12,6 +13,9 @@ fn exposes_one_shot_file_playback_as_a_library_api() {
         volume: 0.05,
     };
     let _play: fn(&PlaybackConfig) -> anyhow::Result<PlaybackResult> = play_file;
+    let _play_with_codec: fn(&PlaybackConfig, CodecPreference) -> anyhow::Result<PlaybackResult> =
+        play_file_with_codec;
+    let _variant_type: fn(&PlaybackResult) -> Option<G711Variant> = |result| result.variant;
 
     assert_eq!(config.host, "camera.local");
     assert_eq!(config.volume, 0.05);
@@ -54,5 +58,9 @@ fn publishes_under_a_permissive_dual_license() {
         assert!(readme.contains("rust/README.ko.md"));
         assert!(!readme.contains("```typescript"));
         assert!(!readme.contains("```python"));
+        assert!(readme.contains("cidrs"));
+        assert!(readme.contains("10.0.0.0/24"));
+        assert!(readme.contains("10.128.0.10"));
+        assert!(readme.contains("--cidr"));
     }
 }

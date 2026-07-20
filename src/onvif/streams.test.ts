@@ -25,7 +25,7 @@ test('parses profile names and audio capabilities', () => {
   );
 });
 
-test('returns every profile URI unchanged and keeps credentials transport-only', async () => {
+test('returns every profile URI without embedded RTSP credentials', async () => {
   const calls: unknown[] = [];
   const dependencies: StreamLookupDependencies = {
     createDevice: (host, user, pass, options) => {
@@ -38,8 +38,8 @@ test('returns every profile URI unchanged and keeps credentials transport-only',
         ],
         getStreamUri: async (token) =>
           token === 'main'
-            ? 'rtsp://camera/live?channel=1&stream=main'
-            : 'rtsp://camera/live?channel=1&stream=sub',
+            ? 'RTSP://admin:p@ss@[2001:db8::10]:8554/live?channel=1&stream=main'
+            : 'rTsPs://viewer:s%40fe@camera.example:322/live?channel=1&stream=sub',
       };
     },
   };
@@ -62,8 +62,42 @@ test('returns every profile URI unchanged and keeps credentials transport-only',
     options: { deviceUrls: ['http://camera/onvif/device_service'], timeoutMs: 1_500 },
   }]);
   assert.deepEqual(streams, [
-    { profileToken: 'main', profileName: 'Main Stream', uri: 'rtsp://camera/live?channel=1&stream=main' },
-    { profileToken: 'sub', profileName: 'Sub Stream', uri: 'rtsp://camera/live?channel=1&stream=sub' },
+    {
+      profileToken: 'main',
+      profileName: 'Main Stream',
+      uri: 'RTSP://[2001:db8::10]:8554/live?channel=1&stream=main',
+    },
+    {
+      profileToken: 'sub',
+      profileName: 'Sub Stream',
+      uri: 'rTsPs://camera.example:322/live?channel=1&stream=sub',
+    },
   ]);
-  assert.ok(streams.every((stream) => !stream.uri.includes('p@ss')));
+});
+
+test('leaves credential-free, non-RTSP, and malformed stream URIs unchanged', async () => {
+  const uris = [
+    'rtsp://[2001:db8::20]:554/live@archive?token=a@b',
+    'https://user:pass@example.com/video',
+    'rtsp://user:pass@[2001:db8::30/live',
+  ];
+  const dependencies: StreamLookupDependencies = {
+    createDevice: () => ({
+      connect: async () => {},
+      getProfiles: async () => uris.map((_, index) => ({
+        token: String(index),
+        hasAudioEncoder: false,
+        hasAudioOutput: false,
+        hasAudioSource: false,
+      })),
+      getStreamUri: async (token) => uris[Number(token)],
+    }),
+  };
+
+  const streams = await getStreamUris(
+    { host: 'camera', user: '', pass: '' },
+    dependencies,
+  );
+
+  assert.deepEqual(streams.map((stream) => stream.uri), uris);
 });
