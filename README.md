@@ -332,7 +332,8 @@ cargo publish --manifest-path rust/Cargo.toml
 
 이 프로젝트는 사용자가 선택할 수 있는 `MIT OR Apache-2.0` 이중 라이선스로
 배포합니다. 자세한 조건은 [LICENSE-MIT](LICENSE-MIT)와
-[LICENSE-APACHE](LICENSE-APACHE)를 확인하십시오.
+[LICENSE-APACHE](LICENSE-APACHE)를 확인하십시오. 외부 기여도 동일한 이중
+라이선스로 제공되며 자세한 규칙은 [CONTRIBUTING.md](CONTRIBUTING.md)에 있습니다.
 
 이 프로젝트는 FFmpeg 소스나 바이너리를 포함하거나 링크하지 않고, 실행 환경에 별도로
 설치된 `ffmpeg` 프로세스를 호출합니다. FFmpeg를 이 프로젝트와 함께 번들하거나
