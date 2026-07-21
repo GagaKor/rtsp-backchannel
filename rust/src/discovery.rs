@@ -4,7 +4,6 @@ use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rand::RngCore;
 use serde::Serialize;
 
 use crate::onvif::probe_device_service;
@@ -161,7 +160,7 @@ pub fn parse_probe_matches(
 
 fn message_id() -> String {
     let mut bytes = [0_u8; 16];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    rand::fill(&mut bytes[..]);
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     format!(

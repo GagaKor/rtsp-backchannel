@@ -1,6 +1,5 @@
 use base64::Engine;
 use chrono::{DateTime, Duration as ChronoDuration, TimeZone, Utc};
-use rand::RngCore;
 use reqwest::blocking::Client;
 use serde::Serialize;
 use sha1::{Digest, Sha1};
@@ -327,7 +326,7 @@ impl OnvifDevice {
     ) -> Result<(reqwest::StatusCode, String), String> {
         let security = if authenticated && !(self.user.is_empty() && self.password.is_empty()) {
             let mut nonce = [0u8; 16];
-            rand::rngs::OsRng.fill_bytes(&mut nonce);
+            rand::fill(&mut nonce[..]);
             wsse_header(
                 &self.user,
                 &self.password,
