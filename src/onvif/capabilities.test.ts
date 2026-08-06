@@ -19,6 +19,7 @@ import {
 } from './capabilities.ts';
 
 const SOAP_NS = 'http://www.w3.org/2003/05/soap-envelope';
+const SOAP11_NS = 'http://schemas.xmlsoap.org/soap/envelope/';
 const DEV_NS = 'http://www.onvif.org/ver10/device/wsdl';
 const SCHEMA_NS = 'http://www.onvif.org/ver10/schema';
 const MEDIA1_NS = 'http://www.onvif.org/ver10/media/wsdl';
@@ -47,6 +48,13 @@ function soap(body: string): string {
     + ` xmlns:tev="${EVENTS_NS}" xmlns:wstop="${WSTOP_NS}"`
     + ` xmlns:tns="${TOPICS_NS}" xmlns:vendor="urn:vendor">`
     + `<s:Body>${body}</s:Body></s:Envelope>`
+  );
+}
+
+function soap11(body: string): string {
+  return (
+    `<env:Envelope xmlns:env="${SOAP11_NS}" xmlns:ter="http://www.onvif.org/ver10/error">`
+    + `<env:Body>${body}</env:Body></env:Envelope>`
   );
 }
 
@@ -107,6 +115,32 @@ test('associates only direct Service children and selects highest versions deter
     xaddr: 'http://camera/media-a',
     version: { major: 2, minor: 10 },
   });
+});
+
+test('accepts signed xs:int service versions but omits negative and out-of-range values', () => {
+  const parsed = parseServicesResponse(soap(`
+    <tds:GetServicesResponse>
+      <tds:Service><tds:Namespace>urn:plus</tds:Namespace><tds:XAddr>http://camera/plus</tds:XAddr>
+        <tds:Version><tt:Major>+1</tt:Major><tt:Minor>+2</tt:Minor></tds:Version>
+      </tds:Service>
+      <tds:Service><tds:Namespace>urn:negative</tds:Namespace><tds:XAddr>http://camera/negative</tds:XAddr>
+        <tds:Version><tt:Major>-1</tt:Major><tt:Minor>0</tt:Minor></tds:Version>
+      </tds:Service>
+      <tds:Service><tds:Namespace>urn:overflow</tds:Namespace><tds:XAddr>http://camera/overflow</tds:XAddr>
+        <tds:Version><tt:Major>2147483648</tt:Major><tt:Minor>0</tt:Minor></tds:Version>
+      </tds:Service>
+      <tds:Service><tds:Namespace>urn:underflow</tds:Namespace><tds:XAddr>http://camera/underflow</tds:XAddr>
+        <tds:Version><tt:Major>-2147483649</tt:Major><tt:Minor>0</tt:Minor></tds:Version>
+      </tds:Service>
+    </tds:GetServicesResponse>
+  `));
+
+  assert.deepEqual(parsed.services, [
+    { namespace: 'urn:negative', xaddr: 'http://camera/negative' },
+    { namespace: 'urn:overflow', xaddr: 'http://camera/overflow' },
+    { namespace: 'urn:plus', xaddr: 'http://camera/plus', version: { major: 1, minor: 2 } },
+    { namespace: 'urn:underflow', xaddr: 'http://camera/underflow' },
+  ]);
 });
 
 test('takes embedded Event capabilities from the selected highest-version service', () => {
@@ -292,6 +326,14 @@ test('parses strict PTZ service booleans and omits invalid values', () => {
   `)), {});
 });
 
+test('rejects uppercase and mixed-case XML Schema boolean lexical forms', () => {
+  assert.deepEqual(parsePtzServiceCapabilitiesResponse(soap(`
+    <tptz:GetServiceCapabilitiesResponse>
+      <tptz:Capabilities EFlip="TRUE" Reverse="False" MoveStatus="TrUe"/>
+    </tptz:GetServiceCapabilitiesResponse>
+  `)), {});
+});
+
 test('keeps PTZ movement spaces distinct across multiple nodes and zoom-only nodes', () => {
   const parsed = parsePtzNodesResponse(soap(`
     <tptz:GetNodesResponse>
@@ -351,6 +393,51 @@ test('keeps PTZ movement spaces distinct across multiple nodes and zoom-only nod
   assert.equal(zoomOnly.zoomSupported, true);
 });
 
+test('rejects a PTZNode without its required token', () => {
+  assert.throws(
+    () => parsePtzNodesResponse(soap(`
+      <tptz:GetNodesResponse><tptz:PTZNode><tt:SupportedPTZSpaces>
+        <tt:AbsolutePanTiltPositionSpace/>
+      </tt:SupportedPTZSpaces></tptz:PTZNode></tptz:GetNodesResponse>
+    `)),
+    /invalid PTZ GetNodes response/,
+  );
+});
+
+test('rejects a PTZNode without its required SupportedPTZSpaces', () => {
+  assert.throws(
+    () => parsePtzNodesResponse(soap(`
+      <tptz:GetNodesResponse><tptz:PTZNode token="missing-spaces"/></tptz:GetNodesResponse>
+    `)),
+    /invalid PTZ GetNodes response/,
+  );
+});
+
+test('applies xs:int lexical and range rules before nonnegative PTZ preset semantics', () => {
+  const parsed = parsePtzNodesResponse(soap(`
+    <tptz:GetNodesResponse>
+      <tptz:PTZNode token="plus"><tt:SupportedPTZSpaces/>
+        <tt:MaximumNumberOfPresets>+1</tt:MaximumNumberOfPresets></tptz:PTZNode>
+      <tptz:PTZNode token="negative"><tt:SupportedPTZSpaces/>
+        <tt:MaximumNumberOfPresets>-1</tt:MaximumNumberOfPresets></tptz:PTZNode>
+      <tptz:PTZNode token="boundary"><tt:SupportedPTZSpaces/>
+        <tt:MaximumNumberOfPresets>2147483647</tt:MaximumNumberOfPresets></tptz:PTZNode>
+      <tptz:PTZNode token="overflow"><tt:SupportedPTZSpaces/>
+        <tt:MaximumNumberOfPresets>2147483648</tt:MaximumNumberOfPresets></tptz:PTZNode>
+      <tptz:PTZNode token="underflow"><tt:SupportedPTZSpaces/>
+        <tt:MaximumNumberOfPresets>-2147483649</tt:MaximumNumberOfPresets></tptz:PTZNode>
+    </tptz:GetNodesResponse>
+  `));
+
+  assert.deepEqual(parsed.nodes.map((node) => [node.token, node.maximumPresets]), [
+    ['boundary', 2147483647],
+    ['negative', undefined],
+    ['overflow', undefined],
+    ['plus', 1],
+    ['underflow', undefined],
+  ]);
+});
+
 test('parses modern Event attributes strictly and merges them over legacy fields', () => {
   const modern = parseEventServiceCapabilitiesResponse(soap(`
     <tev:GetServiceCapabilitiesResponse><tev:Capabilities
@@ -386,6 +473,23 @@ test('parses modern Event attributes strictly and merges them over legacy fields
   `)), {});
 });
 
+test('accepts signed xs:int counts and omits negative or out-of-range values', () => {
+  assert.deepEqual(parseEventServiceCapabilitiesResponse(soap(`
+    <tev:GetServiceCapabilitiesResponse><tev:Capabilities
+      MaxNotificationProducers="+1" MaxPullPoints="-1" MaxEventBrokers="2147483648"/>
+    </tev:GetServiceCapabilitiesResponse>
+  `)), {
+    maxNotificationProducers: 1,
+  });
+  assert.deepEqual(parseEventServiceCapabilitiesResponse(soap(`
+    <tev:GetServiceCapabilitiesResponse><tev:Capabilities
+      MaxNotificationProducers="-2147483649" MaxPullPoints="2147483647"/>
+    </tev:GetServiceCapabilitiesResponse>
+  `)), {
+    maxPullPoints: 2147483647,
+  });
+});
+
 test('extracts only marked arbitrary-depth WS-Topics nodes with local-name paths', () => {
   assert.deepEqual(parseEventPropertiesResponse(soap(`
     <tev:GetEventPropertiesResponse><wstop:TopicSet>
@@ -403,6 +507,27 @@ test('extracts only marked arbitrary-depth WS-Topics nodes with local-name paths
   ]);
   assert.throws(
     () => parseEventPropertiesResponse(soap('<tev:GetEventPropertiesResponse/>')),
+    /invalid Events GetEventProperties response/,
+  );
+});
+
+test('uses only the directly associated TopicSet and ignores nested decoys', () => {
+  assert.deepEqual(parseEventPropertiesResponse(soap(`
+    <tev:GetEventPropertiesResponse>
+      <vendor:Wrapper><wstop:TopicSet>
+        <vendor:Decoy wstop:topic="true"/>
+      </wstop:TopicSet></vendor:Wrapper>
+      <wstop:TopicSet><tns:Real wstop:topic="true"/></wstop:TopicSet>
+    </tev:GetEventPropertiesResponse>
+  `)), [
+    { namespace: TOPICS_NS, path: 'Real' },
+  ]);
+  assert.throws(
+    () => parseEventPropertiesResponse(soap(`
+      <tev:GetEventPropertiesResponse><vendor:Wrapper>
+        <wstop:TopicSet><vendor:Decoy wstop:topic="true"/></wstop:TopicSet>
+      </vendor:Wrapper></tev:GetEventPropertiesResponse>
+    `)),
     /invalid Events GetEventProperties response/,
   );
 });
@@ -476,6 +601,32 @@ function service(namespace: string, xaddr: string, major = 1, minor = 0): string
 
 function response(xml: string, statusCode = 200): { statusCode: number; xml: string } {
   return { statusCode, xml: soap(xml) };
+}
+
+async function assertCanonicalAuthFailure(
+  authFailure: { statusCode: number; xml: string },
+  canonicalToken: string,
+): Promise<void> {
+  const calls: RecordedCapabilityCall[] = [];
+  const dependencies = fakeCapabilityDependencies(calls, async (body) => {
+    if (body === GET_SCOPES) return response('<tds:GetScopesResponse/>');
+    if (body === GET_SERVICES) return authFailure;
+    throw new Error('fallback must not run');
+  });
+
+  await assert.rejects(
+    getCameraCapabilitiesWithDependencies({ host: 'camera' }, dependencies),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal(error.message, `SOAP Fault: ${canonicalToken}`);
+      assert.doesNotMatch(
+        error.message,
+        /viewer|url-secret|payload-secret|ActionNotSupported|faultstring|Reason|Detail/i,
+      );
+      return true;
+    },
+  );
+  assert.deepEqual(calls.map(({ body }) => body), [GET_SCOPES, GET_SERVICES]);
 }
 
 test('orchestrates exact authenticated bodies and routes advertised services deterministically', async () => {
@@ -574,6 +725,43 @@ test('orchestrates exact authenticated bodies and routes advertised services det
   assert.deepEqual(report.warnings, []);
 });
 
+test('keeps PTZ movement unknown when an advertised service returns an invalid node', async () => {
+  const calls: RecordedCapabilityCall[] = [];
+  const dependencies = fakeCapabilityDependencies(calls, async (body, endpoint) => {
+    if (body === GET_SCOPES) return response('<tds:GetScopesResponse/>');
+    if (body === GET_SERVICES) {
+      return response(`<tds:GetServicesResponse>${service(MEDIA1_NS, 'http://camera/media1')}`
+        + service(PTZ_NS, 'http://camera/ptz')
+        + '</tds:GetServicesResponse>');
+    }
+    if (body === MEDIA1_GET_PROFILES && endpoint === 'http://camera/media1') {
+      return response('<trt:GetProfilesResponse/>');
+    }
+    if (body === PTZ_GET_CAPABILITIES && endpoint === 'http://camera/ptz') {
+      return response(
+        '<tptz:GetServiceCapabilitiesResponse><tptz:Capabilities/></tptz:GetServiceCapabilitiesResponse>',
+      );
+    }
+    if (body === PTZ_GET_NODES && endpoint === 'http://camera/ptz') {
+      return response(
+        '<tptz:GetNodesResponse><tptz:PTZNode token="invalid-node"/></tptz:GetNodesResponse>',
+      );
+    }
+    throw new Error(`unexpected fake operation: ${body} at ${endpoint}`);
+  });
+
+  const report = await getCameraCapabilitiesWithDependencies(
+    { host: 'camera' },
+    dependencies,
+  );
+
+  assert.equal(report.ptz.detected, true);
+  assert.equal(report.ptz.panTiltSupported, null);
+  assert.equal(report.ptz.zoomSupported, null);
+  assert.deepEqual(report.ptz.nodes, []);
+  assert.deepEqual(report.warnings.map(({ operation }) => operation), ['PTZ GetNodes']);
+});
+
 test('keeps Media2 unknown after falling back to legacy GetCapabilities All', async () => {
   const getServicesFailures = [
     response(`<s:Fault><s:Code><s:Value>s:Sender</s:Value><s:Subcode>`
@@ -649,6 +837,28 @@ test('establishes Media2 absence after a successful GetServices response', async
     GET_SERVICES,
     MEDIA1_GET_PROFILES,
   ]);
+});
+
+test('treats a SOAP 1.1 Client fault with a NotAuthorized faultstring as fatal', async () => {
+  await assertCanonicalAuthFailure({
+    statusCode: 500,
+    xml: soap11(
+      '<env:Fault><faultcode>env:Client</faultcode>'
+      + '<faultstring>ter:NotAuthorized viewer url-secret payload-secret</faultstring>'
+      + '<detail><Value>ter:ActionNotSupported</Value></detail></env:Fault>',
+    ),
+  }, 'NotAuthorized');
+});
+
+test('canonicalizes known SOAP 1.2 authentication reasons with generic fault codes', async () => {
+  for (const token of ['InvalidSecurity', 'FailedAuthentication', 'Unauthorized']) {
+    await assertCanonicalAuthFailure(response(
+      '<s:Fault><s:Code><s:Value>s:Sender</s:Value></s:Code>'
+      + `<s:Reason><s:Text>ter:${token} viewer url-secret payload-secret</s:Text></s:Reason>`
+      + '<s:Detail><vendor:Value>ter:ActionNotSupported</vendor:Value></s:Detail></s:Fault>',
+      500,
+    ), token);
+  }
 });
 
 test('does not hide HTTP or SOAP authentication failures behind service fallback', async () => {

@@ -40,6 +40,23 @@ function encodeXml(value: string): string {
     .replace(/'/g, '&apos;');
 }
 
+function parseServiceUrl(value: string): URL {
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error('invalid ONVIF service URL');
+  }
+  if (
+    (parsed.protocol !== 'http:' && parsed.protocol !== 'https:')
+    || parsed.username !== ''
+    || parsed.password !== ''
+  ) {
+    throw new Error('invalid ONVIF service URL');
+  }
+  return parsed;
+}
+
 export interface DeviceInfo {
   manufacturer?: string;
   model?: string;
@@ -160,13 +177,17 @@ export class OnvifDevice {
     );
   }
 
-  private soapResponse(url: string, body: string, withAuth: boolean): Promise<OnvifRawResponse> {
+  private async soapResponse(
+    url: string,
+    body: string,
+    withAuth: boolean,
+  ): Promise<OnvifRawResponse> {
+    const u = parseServiceUrl(url);
     const header = withAuth ? this.securityHeader() : '';
     const envelope =
       `<?xml version="1.0" encoding="UTF-8"?>` +
       `<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">` +
       `<s:Header>${header}</s:Header><s:Body>${body}</s:Body></s:Envelope>`;
-    const u = new URL(url);
     const lib = u.protocol === 'https:' ? https : http;
     const timeoutMs = this.opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {

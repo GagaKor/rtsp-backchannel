@@ -153,26 +153,9 @@ function compareText(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
-function directChild(node: XmlElement, local: string): XmlElement | undefined {
-  return node.children.find((child) => child.local === local);
-}
-
-function descendants(node: XmlElement): XmlElement[] {
-  const found: XmlElement[] = [];
-  const pending = [...node.children].reverse();
-  while (pending.length > 0) {
-    const candidate = pending.pop()!;
-    found.push(candidate);
-    for (let index = candidate.children.length - 1; index >= 0; index--) {
-      pending.push(candidate.children[index]);
-    }
-  }
-  return found;
-}
-
 function strictBoolean(value: string | undefined): boolean | undefined {
   if (value === undefined) return undefined;
-  switch (value.trim().toLowerCase()) {
+  switch (value.trim()) {
     case 'true':
     case '1':
       return true;
@@ -184,10 +167,45 @@ function strictBoolean(value: string | undefined): boolean | undefined {
   }
 }
 
-function strictNonNegativeInteger(value: string | undefined): number | undefined {
-  if (value === undefined || !/^\d+$/.test(value.trim())) return undefined;
+function strictInteger(value: string | undefined): number | undefined {
+  if (value === undefined || !/^[+-]?\d+$/.test(value.trim())) return undefined;
   const parsed = Number(value.trim());
-  return Number.isSafeInteger(parsed) ? parsed : undefined;
+  if (parsed < -2_147_483_648 || parsed > 2_147_483_647) return undefined;
+  return parsed === 0 ? 0 : parsed;
+}
+
+function strictNonNegativeInteger(value: string | undefined): number | undefined {
+  const parsed = strictInteger(value);
+  return parsed !== undefined && parsed >= 0 ? parsed : undefined;
+}
+
+const AUTHENTICATION_FAULT_TOKENS = [
+  'NotAuthorized',
+  'InvalidSecurity',
+  'FailedAuthentication',
+  'Unauthorized',
+] as const;
+
+function canonicalAuthenticationFault(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  return AUTHENTICATION_FAULT_TOKENS.find((token) =>
+    new RegExp(`(?:^|[^A-Za-z0-9_.-])${token}(?:$|[^A-Za-z0-9_.-])`, 'i').test(value));
+}
+
+function faultReasonAuthenticationCode(
+  fault: XmlElement,
+  soapNamespace: string,
+): string | undefined {
+  if (soapNamespace === SOAP_11_NS) {
+    return canonicalAuthenticationFault(textOf(firstChild(fault, '', 'faultstring')));
+  }
+  const reason = firstChild(fault, soapNamespace, 'Reason');
+  if (!reason) return undefined;
+  for (const text of childElements(reason, soapNamespace, 'Text')) {
+    const token = canonicalAuthenticationFault(textOf(text));
+    if (token) return token;
+  }
+  return undefined;
 }
 
 function operationResponse(
@@ -205,14 +223,16 @@ function operationResponse(
   if (!body) throw new OnvifResponseError('invalid', `invalid ${operation} response`);
   const fault = firstChild(body, soapNamespace, 'Fault');
   if (fault) {
-    let rawCode = textOf(directChild(fault, 'faultcode'));
+    let rawCode = textOf(firstChild(fault, '', 'faultcode'));
     let code = firstChild(fault, soapNamespace, 'Code');
     while (code) {
       rawCode = textOf(firstChild(code, soapNamespace, 'Value')) ?? rawCode;
       code = firstChild(code, soapNamespace, 'Subcode');
     }
     const candidate = rawCode?.split(':').at(-1) ?? '';
-    const shortCode = /^[A-Za-z0-9_.-]{1,80}$/.test(candidate) ? candidate : 'Fault';
+    const shortCode = canonicalAuthenticationFault(rawCode)
+      ?? faultReasonAuthenticationCode(fault, soapNamespace)
+      ?? (/^[A-Za-z0-9_.-]{1,80}$/.test(candidate) ? candidate : 'Fault');
     throw new OnvifResponseError('fault', `SOAP Fault: ${shortCode}`, shortCode);
   }
   const response = firstChild(body, namespace, responseName);
@@ -543,8 +563,10 @@ export function parsePtzNodesResponse(xml: string): ParsedPtzNodes {
   const nodes: PtzNode[] = [];
   for (const node of childElements(response, PTZ_NS, 'PTZNode')) {
     const token = attribute(node, '', 'token');
-    if (!token) continue;
     const supported = firstChild(node, SCHEMA_NS, 'SupportedPTZSpaces');
+    if (!token || !supported) {
+      throw new OnvifResponseError('invalid', 'invalid PTZ GetNodes response');
+    }
     const spaces: PtzSpaces = {
       absolutePanTilt: false,
       absoluteZoom: false,
@@ -553,10 +575,8 @@ export function parsePtzNodesResponse(xml: string): ParsedPtzNodes {
       continuousPanTilt: false,
       continuousZoom: false,
     };
-    if (supported) {
-      for (const [elementName, property] of PTZ_SPACE_FIELDS) {
-        spaces[property] = Boolean(firstChild(supported, SCHEMA_NS, elementName));
-      }
+    for (const [elementName, property] of PTZ_SPACE_FIELDS) {
+      spaces[property] = Boolean(firstChild(supported, SCHEMA_NS, elementName));
     }
     const maximumPresets = strictNonNegativeInteger(
       textOf(firstChild(node, SCHEMA_NS, 'MaximumNumberOfPresets')),
@@ -624,9 +644,7 @@ export function parseEventPropertiesResponse(xml: string): EventTopic[] {
     'GetEventPropertiesResponse',
     'Events GetEventProperties',
   );
-  const topicSet = descendants(response).find(
-    (node) => node.uri === WSTOP_NS && node.local === 'TopicSet',
-  );
+  const topicSet = firstChild(response, WSTOP_NS, 'TopicSet');
   if (!topicSet) {
     throw new OnvifResponseError('invalid', 'invalid Events GetEventProperties response');
   }

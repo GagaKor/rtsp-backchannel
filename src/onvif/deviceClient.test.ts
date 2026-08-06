@@ -235,3 +235,47 @@ test('keeps the three-call connect sequence and exposes selected and explicit re
     );
   }
 });
+
+test('rejects unsafe service URLs without transmitting a request or exposing URL contents', async () => {
+  let requestCount = 0;
+  const server = http.createServer((_request, response) => {
+    requestCount++;
+    response.setHeader('Content-Type', 'application/soap+xml');
+    response.end(
+      '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body>'
+      + '<GetDeviceInformationResponse><Manufacturer>Unexpected Camera</Manufacturer>'
+      + '</GetDeviceInformationResponse></s:Body></s:Envelope>',
+    );
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+  const device = new OnvifDevice('camera', 'viewer', 'camera-secret');
+  const endpoints = [
+    `ftp://127.0.0.1:${address.port}/must-not-reach`,
+    `http://viewer:url-secret@127.0.0.1:${address.port}/must-not-reach`,
+    '/relative/onvif/device_service',
+  ];
+
+  try {
+    const outcomes: string[] = [];
+    for (const endpoint of endpoints) {
+      try {
+        await device.getDeviceInformation(endpoint);
+        outcomes.push('resolved');
+      } catch (error) {
+        outcomes.push(error instanceof Error ? error.message : String(error));
+      }
+    }
+
+    assert.deepEqual({ requestCount, outcomes }, {
+      requestCount: 0,
+      outcomes: endpoints.map(() => 'invalid ONVIF service URL'),
+    });
+    assert.doesNotMatch(JSON.stringify(outcomes), /viewer|camera-secret|url-secret|must-not-reach/i);
+  } finally {
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
+});
