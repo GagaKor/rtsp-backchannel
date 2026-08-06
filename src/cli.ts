@@ -311,7 +311,7 @@ export async function main(
   argv = process.argv.slice(2),
   dependencies: CommandDependencies = commandDependencies,
 ): Promise<void> {
-  if (argv.includes('--help') || argv.includes('-h')) {
+  if (argv[0] !== 'capabilities' && (argv.includes('--help') || argv.includes('-h'))) {
     process.stdout.write(HELP);
     return;
   }
@@ -348,6 +348,10 @@ export async function main(
   if (argv[0] === 'capabilities') {
     const commandArgs = argv.slice(1);
     const parsed = parseCapabilityArguments(commandArgs);
+    if (commandArgs.includes('--help') || commandArgs.includes('-h')) {
+      process.stdout.write(HELP);
+      return;
+    }
     const hosts = parsed.host;
     const users = parsed.user;
     const passwords = parsed.pass;

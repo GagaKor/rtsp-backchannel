@@ -50,6 +50,44 @@ test('documents the capabilities command in global and command help without expo
   }
 });
 
+test('rejects a capability terminator before honoring a trailing help flag', () => {
+  const result = spawnSync(
+    process.execPath,
+    [
+      '--experimental-transform-types',
+      'src/cli.ts',
+      'capabilities',
+      '--',
+      '--help',
+    ],
+    { encoding: 'utf8' },
+  );
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /capabilities does not accept an argument terminator/);
+  assert.doesNotMatch(result.stdout, /Usage: rtsp-backchannel/);
+});
+
+test('rejects a missing capability password before honoring help as its value', () => {
+  const result = spawnSync(
+    process.execPath,
+    [
+      '--experimental-transform-types',
+      'src/cli.ts',
+      'capabilities',
+      '--host',
+      'camera.local',
+      '--pass',
+      '--help',
+    ],
+    { encoding: 'utf8' },
+  );
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /missing value for --pass/);
+  assert.doesNotMatch(result.stdout, /Usage: rtsp-backchannel/);
+});
+
 test('runs the dedicated npm binary entry point', () => {
   const result = spawnSync(
     process.execPath,
