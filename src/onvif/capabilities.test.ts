@@ -574,7 +574,7 @@ test('orchestrates exact authenticated bodies and routes advertised services det
   assert.deepEqual(report.warnings, []);
 });
 
-test('falls back from ActionNotSupported and invalid GetServices responses to GetCapabilities All', async () => {
+test('keeps Media2 unknown after falling back to legacy GetCapabilities All', async () => {
   const getServicesFailures = [
     response(`<s:Fault><s:Code><s:Value>s:Sender</s:Value><s:Subcode>`
       + '<s:Value xmlns:ter="http://www.onvif.org/ver10/error">ter:ActionNotSupported</s:Value>'
@@ -615,9 +615,40 @@ test('falls back from ActionNotSupported and invalid GetServices responses to Ge
     assert.equal(report.ptz.panTiltSupported, null);
     assert.equal(report.ptz.zoomSupported, null);
     assert.equal(report.events.detected, false);
-    assert.equal(report.media2.detected, false);
+    assert.equal(report.media2.detected, null);
     assert.equal(report.media2.h265Supported, null);
   }
+});
+
+test('establishes Media2 absence after a successful GetServices response', async () => {
+  const calls: RecordedCapabilityCall[] = [];
+  const dependencies = fakeCapabilityDependencies(calls, async (body, endpoint) => {
+    if (body === GET_SCOPES) return response('<tds:GetScopesResponse/>');
+    if (body === GET_SERVICES) {
+      return response(`<tds:GetServicesResponse>${service(
+        MEDIA1_NS,
+        'http://camera/media1',
+      )}</tds:GetServicesResponse>`);
+    }
+    if (body === MEDIA1_GET_PROFILES && endpoint === 'http://camera/media1') {
+      return response('<trt:GetProfilesResponse/>');
+    }
+    throw new Error(`unexpected fake operation: ${body} at ${endpoint}`);
+  });
+
+  const report = await getCameraCapabilitiesWithDependencies(
+    { host: 'camera' },
+    dependencies,
+  );
+
+  assert.equal(report.serviceDiscovery, 'getServices');
+  assert.equal(report.media2.detected, false);
+  assert.equal(report.media2.h265Supported, null);
+  assert.deepEqual(calls.map(({ body }) => body), [
+    GET_SCOPES,
+    GET_SERVICES,
+    MEDIA1_GET_PROFILES,
+  ]);
 });
 
 test('does not hide HTTP or SOAP authentication failures behind service fallback', async () => {

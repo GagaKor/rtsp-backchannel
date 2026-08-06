@@ -920,7 +920,7 @@ export async function getCameraCapabilitiesWithDependencies(
   );
 
   const media2Service = selectService(services, MEDIA2_NS);
-  const media2Detected = discoveryAvailable ? Boolean(media2Service) : null;
+  const media2Detected = serviceDiscovery === 'getServices' ? Boolean(media2Service) : null;
   let encodings: string[] = [];
   let h265Supported: boolean | null = null;
   if (media2Service) {
