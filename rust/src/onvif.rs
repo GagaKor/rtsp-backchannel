@@ -299,7 +299,14 @@ impl OnvifDevice {
         })
     }
 
-    pub fn connect(&mut self) -> Result<DeviceInfo, String> {
+    pub fn connect(&mut self) -> Result<(), String> {
+        self.connect_with_device_info().map(|_| ())
+    }
+
+    fn connect_with_device_info(&mut self) -> Result<DeviceInfo, String> {
+        self.device_url = None;
+        self.media_url = None;
+        self.clock_offset = ChronoDuration::zero();
         for device_url in self.device_urls.clone() {
             let result = (|| {
                 let time_xml = self.soap(
@@ -326,6 +333,7 @@ impl OnvifDevice {
                 )?;
                 let media_url = parse_media_xaddr(&capabilities)?
                     .unwrap_or_else(|| device_url.replace("device_service", "media_service"));
+                validate_service_url_against_device(&device_url, &media_url)?;
                 Ok::<(DeviceInfo, String), String>((device_information, media_url))
             })();
             if let Ok((device_information, media_url)) = result {
@@ -399,7 +407,11 @@ impl OnvifDevice {
         body: &str,
         authenticated: bool,
     ) -> Result<(reqwest::StatusCode, String), String> {
-        validate_service_url(url)?;
+        if let Some(device_url) = self.device_url.as_deref() {
+            validate_service_url_against_device(device_url, url)?;
+        } else {
+            validate_service_url(url)?;
+        }
         let security = if authenticated && !(self.user.is_empty() && self.password.is_empty()) {
             let mut nonce = [0u8; 16];
             rand::fill(&mut nonce[..]);
@@ -517,6 +529,10 @@ fn safe_url(url: &str) -> String {
 }
 
 fn validate_service_url(url: &str) -> Result<(), String> {
+    validated_service_url(url).map(|_| ())
+}
+
+fn validated_service_url(url: &str) -> Result<url::Url, String> {
     if url
         .chars()
         .any(|character| character.is_control() || character.is_whitespace())
@@ -530,6 +546,31 @@ fn validate_service_url(url: &str) -> Result<(), String> {
         || parsed.password().is_some()
         || parsed.fragment().is_some()
         || parsed.port() == Some(0)
+    {
+        return Err("invalid ONVIF service URL".to_owned());
+    }
+    Ok(parsed)
+}
+
+fn canonical_service_host(url: &url::Url) -> Option<String> {
+    match url.host()? {
+        url::Host::Domain(domain) => Some(format!(
+            "domain:{}",
+            domain
+                .strip_suffix('.')
+                .unwrap_or(domain)
+                .to_ascii_lowercase()
+        )),
+        url::Host::Ipv4(address) => Some(format!("ipv4:{address}")),
+        url::Host::Ipv6(address) => Some(format!("ipv6:{address}")),
+    }
+}
+
+fn validate_service_url_against_device(device_url: &str, service_url: &str) -> Result<(), String> {
+    let device = validated_service_url(device_url)?;
+    let service = validated_service_url(service_url)?;
+    if device.scheme() != service.scheme()
+        || canonical_service_host(&device) != canonical_service_host(&service)
     {
         return Err("invalid ONVIF service URL".to_owned());
     }
@@ -805,6 +846,39 @@ mod tests {
     }
 
     #[test]
+    fn connect_rejects_a_connected_media_xaddr_outside_the_device_origin() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let device_url = format!("http://127.0.0.1:{port}/onvif/device_service");
+        let untrusted_media_url = format!("https://127.0.0.1:{port}/onvif/media_service");
+        let server = thread::spawn(move || {
+            let responses = [
+                "<Envelope><UTCDateTime><Time><Hour>13</Hour><Minute>14</Minute><Second>15</Second></Time><Date><Year>2026</Year><Month>7</Month><Day>16</Day></Date></UTCDateTime></Envelope>".to_owned(),
+                "<Envelope><GetDeviceInformationResponse><Model>camera</Model></GetDeviceInformationResponse></Envelope>".to_owned(),
+                format!("<Envelope><Capabilities><Media><XAddr>{untrusted_media_url}</XAddr></Media></Capabilities></Envelope>"),
+            ];
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _ = read_http_request(&mut stream);
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response.len(),
+                    response
+                )
+                .unwrap();
+            }
+        });
+        let mut device =
+            OnvifDevice::with_device_urls("camera", "admin", "pass", vec![device_url]).unwrap();
+
+        let error = device.connect().unwrap_err();
+        server.join().unwrap();
+
+        assert_eq!(error, "ONVIF connect failed");
+    }
+
+    #[test]
     fn omits_ws_security_when_both_credentials_are_empty() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -921,6 +995,40 @@ mod tests {
         );
         assert!(!error.contains("path-secret"));
         assert!(!error.contains("query-secret"));
+    }
+
+    #[test]
+    fn service_origin_binding_canonicalizes_hosts_and_ignores_ports_and_paths() {
+        for (device_url, service_url) in [
+            (
+                "https://Camera.Example./onvif/device_service",
+                "https://camera.example:8443/vendor/media?opaque=value",
+            ),
+            ("http://127.0.0.1:80/device", "http://127.0.0.1:9000/media"),
+            ("http://127.1/device", "http://127.0.0.1:9000/media"),
+            ("http://[0:0:0:0:0:0:0:1]/device", "http://[::1]:9000/media"),
+        ] {
+            super::validate_service_url_against_device(device_url, service_url).unwrap();
+        }
+
+        for (device_url, service_url) in [
+            (
+                "https://camera.example/device",
+                "http://camera.example/media",
+            ),
+            (
+                "https://camera.example/device",
+                "https://other.example/media",
+            ),
+            ("https://camera.example/device", "https://127.0.0.1/media"),
+            ("http://127.0.0.1/device", "http://127.0.0.2/media"),
+            ("http://[::1]/device", "http://[::2]/media"),
+        ] {
+            assert_eq!(
+                super::validate_service_url_against_device(device_url, service_url).unwrap_err(),
+                "invalid ONVIF service URL"
+            );
+        }
     }
 
     #[test]

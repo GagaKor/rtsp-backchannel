@@ -1,5 +1,5 @@
 use serde::Serialize;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::time::Duration;
 
@@ -15,8 +15,11 @@ const SOAP11_NS: &str = "http://schemas.xmlsoap.org/soap/envelope/";
 const SOAP12_NS: &str = "http://www.w3.org/2003/05/soap-envelope";
 const WSTOP_NS: &str = "http://docs.oasis-open.org/wsn/t-1";
 const PROFILE_SCOPE_PREFIX: &str = "onvif://www.onvif.org/Profile/";
-const MAX_XML_ELEMENT_DEPTH: usize = 12_100;
-const XML_PARSER_STACK_BYTES: usize = 256 * 1024 * 1024;
+const MAX_XML_ELEMENT_DEPTH: usize = 64;
+const MAX_EVENT_TOPICS: usize = 1_024;
+const MAX_EVENT_TOPIC_PATH_BYTES: usize = 4_096;
+const MAX_EVENT_TOPIC_NAMESPACE_BYTES: usize = 2_048;
+const MAX_EVENT_TOPIC_RETAINED_BYTES: usize = 256 * 1_024;
 
 const GET_SCOPES: &str = "<GetScopes xmlns=\"http://www.onvif.org/ver10/device/wsdl\"/>";
 const GET_SERVICES: &str = concat!(
@@ -262,11 +265,11 @@ impl ResponseError {
         }
     }
 
-    fn fault(code: String) -> Self {
+    fn fault(code: &'static str) -> Self {
         Self {
             kind: ResponseErrorKind::Fault,
             message: format!("SOAP Fault: {code}"),
-            fault_code: Some(code),
+            fault_code: Some(code.to_owned()),
         }
     }
 }
@@ -365,12 +368,13 @@ fn xml_element_depth(xml: &str) -> Option<usize> {
             .rev()
             .find(|byte| !matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
             == Some(&b'/');
+        let element_depth = depth.checked_add(1)?;
+        maximum = maximum.max(element_depth);
+        if maximum > MAX_XML_ELEMENT_DEPTH {
+            return None;
+        }
         if !self_closing {
-            depth = depth.checked_add(1)?;
-            maximum = maximum.max(depth);
-            if maximum > MAX_XML_ELEMENT_DEPTH {
-                return None;
-            }
+            depth = element_depth;
         }
         index = end + 1;
     }
@@ -381,23 +385,8 @@ pub(super) fn parse_document(xml: &str) -> Result<roxmltree::Document<'_>, Respo
     if has_forbidden_declaration(xml) {
         return Err(ResponseError::invalid("invalid XML document"));
     }
-    let depth =
-        xml_element_depth(xml).ok_or_else(|| ResponseError::invalid("invalid XML document"))?;
-    if depth <= 64 {
-        return roxmltree::Document::parse(xml)
-            .map_err(|_| ResponseError::invalid("invalid XML document"));
-    }
-    std::thread::scope(|scope| {
-        let parser = std::thread::Builder::new()
-            .name("onvif-xml-parser".to_owned())
-            .stack_size(XML_PARSER_STACK_BYTES)
-            .spawn_scoped(scope, || roxmltree::Document::parse(xml))
-            .map_err(|_| ResponseError::invalid("invalid XML document"))?;
-        parser
-            .join()
-            .map_err(|_| ResponseError::invalid("invalid XML document"))?
-            .map_err(|_| ResponseError::invalid("invalid XML document"))
-    })
+    xml_element_depth(xml).ok_or_else(|| ResponseError::invalid("invalid XML document"))?;
+    roxmltree::Document::parse(xml).map_err(|_| ResponseError::invalid("invalid XML document"))
 }
 
 fn is_element(node: roxmltree::Node<'_, '_>, namespace: &str, local: &str) -> bool {
@@ -527,32 +516,46 @@ fn canonical_authentication_fault(value: &str) -> Option<&'static str> {
     None
 }
 
-fn safe_fault_code(value: Option<&str>) -> Option<String> {
+fn canonical_protocol_fault_code(
+    value: Option<&str>,
+    soap_namespace: &str,
+) -> Option<&'static str> {
     let normalized = xml_scalar(value)?;
     let local = normalized.rsplit(':').next()?;
-    (local.len() <= 80
-        && !local.is_empty()
-        && local
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-')))
-    .then(|| local.to_owned())
+    let canonical =
+        |expected: &'static str| local.eq_ignore_ascii_case(expected).then_some(expected);
+    canonical("ActionNotSupported").or_else(|| match soap_namespace {
+        SOAP11_NS => ["VersionMismatch", "MustUnderstand", "Client", "Server"]
+            .into_iter()
+            .find_map(canonical),
+        SOAP12_NS => [
+            "VersionMismatch",
+            "MustUnderstand",
+            "DataEncodingUnknown",
+            "Sender",
+            "Receiver",
+        ]
+        .into_iter()
+        .find_map(canonical),
+        _ => None,
+    })
 }
 
 fn fault_error(fault: roxmltree::Node<'_, '_>, soap_namespace: &str) -> ResponseError {
     let mut values = Vec::new();
-    let mut fallback = None;
+    let deepest_code;
     if soap_namespace == SOAP12_NS {
         let mut code = child(fault, soap_namespace, "Code");
+        let mut deepest = None;
         while let Some(current) = code {
             let value = child(current, soap_namespace, "Value").and_then(|node| node.text());
+            deepest = value.map(str::to_owned);
             if let Some(value) = value {
                 values.push(value.to_owned());
             }
-            if let Some(safe) = safe_fault_code(value) {
-                fallback = Some(safe);
-            }
             code = child(current, soap_namespace, "Subcode");
         }
+        deepest_code = deepest;
         if let Some(reason) = child(fault, soap_namespace, "Reason") {
             values.extend(
                 children(reason, soap_namespace, "Text")
@@ -563,13 +566,12 @@ fn fault_error(fault: roxmltree::Node<'_, '_>, soap_namespace: &str) -> Response
         let code = child(fault, "", "faultcode").and_then(|node| node.text());
         let reason = child(fault, "", "faultstring").and_then(|node| node.text());
         values.extend([code, reason].into_iter().flatten().map(str::to_owned));
-        fallback = safe_fault_code(code);
+        deepest_code = code.map(str::to_owned);
     }
     let combined = values.join(" ");
     let code = canonical_authentication_fault(&combined)
-        .map(str::to_owned)
-        .or(fallback)
-        .unwrap_or_else(|| "Fault".to_owned());
+        .or_else(|| canonical_protocol_fault_code(deepest_code.as_deref(), soap_namespace))
+        .unwrap_or("Fault");
     ResponseError::fault(code)
 }
 
@@ -1100,7 +1102,10 @@ fn parse_event_properties_response(xml: &str) -> Result<Vec<EventTopic>, Respons
     )?;
     let topic_set = child(response, WSTOP_NS, "TopicSet")
         .ok_or_else(|| ResponseError::invalid("invalid Events GetEventProperties response"))?;
-    let mut topics = BTreeSet::new();
+    let invalid_response = || ResponseError::invalid("invalid Events GetEventProperties response");
+    let mut topics: BTreeMap<String, BTreeSet<Option<String>>> = BTreeMap::new();
+    let mut retained_topic_count = 0usize;
+    let mut retained_topic_bytes = 0usize;
     let mut path = String::new();
     let mut stack: Vec<_> = topic_set
         .children()
@@ -1119,10 +1124,37 @@ fn parse_event_properties_response(xml: &str) -> Result<Vec<EventTopic>, Respons
         }
         path.push_str(element.tag_name().name());
         if strict_bool(element.attribute((WSTOP_NS, "topic"))) == Some(true) {
-            topics.insert((
-                path.clone(),
-                element.tag_name().namespace().map(str::to_owned),
-            ));
+            if path.len() > MAX_EVENT_TOPIC_PATH_BYTES {
+                return Err(invalid_response());
+            }
+            let namespace = element.tag_name().namespace();
+            let namespace_bytes = namespace.map_or(0, str::len);
+            if namespace_bytes > MAX_EVENT_TOPIC_NAMESPACE_BYTES {
+                return Err(invalid_response());
+            }
+            let duplicate = topics.get(path.as_str()).is_some_and(|namespaces| {
+                namespaces
+                    .iter()
+                    .any(|retained| retained.as_deref() == namespace)
+            });
+            if !duplicate {
+                if retained_topic_count >= MAX_EVENT_TOPICS {
+                    return Err(invalid_response());
+                }
+                let topic_bytes = path
+                    .len()
+                    .checked_add(namespace_bytes)
+                    .ok_or_else(invalid_response)?;
+                retained_topic_bytes = retained_topic_bytes
+                    .checked_add(topic_bytes)
+                    .filter(|total| *total <= MAX_EVENT_TOPIC_RETAINED_BYTES)
+                    .ok_or_else(invalid_response)?;
+                retained_topic_count += 1;
+                topics
+                    .entry(path.clone())
+                    .or_default()
+                    .insert(namespace.map(str::to_owned));
+            }
         }
         stack.push((element, Some(previous_length)));
         stack.extend(
@@ -1133,10 +1165,16 @@ fn parse_event_properties_response(xml: &str) -> Result<Vec<EventTopic>, Respons
                 .map(|node| (node, None)),
         );
     }
-    Ok(topics
-        .into_iter()
-        .map(|(path, namespace)| EventTopic { namespace, path })
-        .collect())
+    let mut retained = Vec::with_capacity(retained_topic_count);
+    for (path, namespaces) in topics {
+        for namespace in namespaces {
+            retained.push(EventTopic {
+                namespace,
+                path: path.clone(),
+            });
+        }
+    }
+    Ok(retained)
 }
 
 fn parse_media2_options_response(xml: &str) -> Result<Vec<String>, ResponseError> {
@@ -1288,7 +1326,7 @@ pub fn get_camera_capabilities(
         device_urls,
         options.timeout,
     )?;
-    let device_information = device.connect()?;
+    let device_information = device.connect_with_device_info()?;
     let device_endpoint = device.require_device_url()?.to_owned();
     let connected_media_endpoint = device.require_media_url()?.to_owned();
     let mut warnings = Vec::new();
@@ -1891,18 +1929,147 @@ mod tests {
     }
 
     #[test]
-    fn event_topic_walk_is_iterative_at_large_depth() {
-        let depth = 12_000;
-        let xml = soap(&format!(
+    fn event_topic_walk_is_iterative_within_the_xml_depth_limit() {
+        const MAX_DEPTH: usize = 64;
+        const SOAP_AND_OPERATION_DEPTH: usize = 4;
+        let topic_depth = MAX_DEPTH - SOAP_AND_OPERATION_DEPTH;
+        let within_limit = soap(&format!(
             "<tev:GetEventPropertiesResponse><wstop:TopicSet>{}<vendor:Leaf wstop:topic=\"true\"/>{}</wstop:TopicSet></tev:GetEventPropertiesResponse>",
-            "<tns:L>".repeat(depth),
-            "</tns:L>".repeat(depth)
+            "<tns:L>".repeat(topic_depth - 1),
+            "</tns:L>".repeat(topic_depth - 1)
         ));
-        let topics = parse_event_properties_response(&xml).unwrap();
-
+        let topics = parse_event_properties_response(&within_limit).unwrap();
         assert_eq!(topics.len(), 1);
         assert_eq!(topics[0].namespace.as_deref(), Some("urn:vendor"));
-        assert_eq!(topics[0].path.split('/').count(), depth + 1);
+        assert_eq!(topics[0].path.split('/').count(), topic_depth);
+
+        let beyond_limit = soap(&format!(
+            "<tev:GetEventPropertiesResponse><wstop:TopicSet>{}<vendor:Leaf wstop:topic=\"true\"/>{}</wstop:TopicSet></tev:GetEventPropertiesResponse>",
+            "<tns:L>".repeat(topic_depth),
+            "</tns:L>".repeat(topic_depth)
+        ));
+        assert_eq!(
+            parse_event_properties_response(&beyond_limit)
+                .unwrap_err()
+                .to_string(),
+            "invalid XML document"
+        );
+    }
+
+    #[test]
+    fn event_topics_reject_count_path_namespace_and_aggregate_limits_before_retention() {
+        const MAX_TOPICS: usize = 1_024;
+        const MAX_PATH_BYTES: usize = 4_096;
+        const MAX_NAMESPACE_BYTES: usize = 2_048;
+        const MAX_RETAINED_BYTES: usize = 256 * 1_024;
+
+        let count_at_limit = (0..MAX_TOPICS)
+            .map(|index| format!("<vendor:T{index:04} wstop:topic=\"true\"/>"))
+            .collect::<String>();
+        let count_at_limit = format!("{count_at_limit}<vendor:T0000 wstop:topic=\"true\"/>");
+        let topics = parse_event_properties_response(&soap(&format!(
+            "<tev:GetEventPropertiesResponse><wstop:TopicSet>{count_at_limit}</wstop:TopicSet></tev:GetEventPropertiesResponse>"
+        )))
+        .unwrap();
+        assert_eq!(topics.len(), MAX_TOPICS);
+
+        let count_overflow =
+            format!("{count_at_limit}<vendor:T{MAX_TOPICS:04} wstop:topic=\"true\"/>");
+        let count_error = parse_event_properties_response(&soap(&format!(
+            "<tev:GetEventPropertiesResponse><wstop:TopicSet>{count_overflow}</wstop:TopicSet></tev:GetEventPropertiesResponse>"
+        )))
+        .unwrap_err();
+        assert_eq!(
+            count_error.to_string(),
+            "invalid Events GetEventProperties response"
+        );
+
+        let maximum_path = format!("T{}", "x".repeat(MAX_PATH_BYTES - 1));
+        assert_eq!(maximum_path.len(), MAX_PATH_BYTES);
+        let topics = parse_event_properties_response(&soap(&format!(
+            "<tev:GetEventPropertiesResponse><wstop:TopicSet><vendor:{maximum_path} wstop:topic=\"true\"/></wstop:TopicSet></tev:GetEventPropertiesResponse>"
+        )))
+        .unwrap();
+        assert_eq!(topics[0].path.len(), MAX_PATH_BYTES);
+
+        let oversized_path = format!("T{}", "x".repeat(MAX_PATH_BYTES));
+        assert_eq!(oversized_path.len(), MAX_PATH_BYTES + 1);
+        let path_error = parse_event_properties_response(&soap(&format!(
+            "<tev:GetEventPropertiesResponse><wstop:TopicSet><vendor:{oversized_path} wstop:topic=\"true\"/></wstop:TopicSet></tev:GetEventPropertiesResponse>"
+        )))
+        .unwrap_err();
+        assert_eq!(
+            path_error.to_string(),
+            "invalid Events GetEventProperties response"
+        );
+
+        let unretained = parse_event_properties_response(&soap(&format!(
+            "<tev:GetEventPropertiesResponse><wstop:TopicSet><vendor:{oversized_path}/></wstop:TopicSet></tev:GetEventPropertiesResponse>"
+        )))
+        .unwrap();
+        assert!(unretained.is_empty());
+
+        let maximum_namespace = format!("urn:{}", "n".repeat(MAX_NAMESPACE_BYTES - 4));
+        assert_eq!(maximum_namespace.len(), MAX_NAMESPACE_BYTES);
+        let topics = parse_event_properties_response(&soap(&format!(
+            "<tev:GetEventPropertiesResponse><wstop:TopicSet><maximum:Topic xmlns:maximum=\"{maximum_namespace}\" wstop:topic=\"true\"/></wstop:TopicSet></tev:GetEventPropertiesResponse>"
+        )))
+        .unwrap();
+        assert_eq!(
+            topics[0].namespace.as_ref().map(String::len),
+            Some(MAX_NAMESPACE_BYTES)
+        );
+
+        let oversized_namespace = format!("urn:{}", "n".repeat(MAX_NAMESPACE_BYTES - 3));
+        assert_eq!(oversized_namespace.len(), MAX_NAMESPACE_BYTES + 1);
+        let namespace_error = parse_event_properties_response(&soap(&format!(
+            "<tev:GetEventPropertiesResponse><wstop:TopicSet><oversized:Topic xmlns:oversized=\"{oversized_namespace}\" wstop:topic=\"true\"/></wstop:TopicSet></tev:GetEventPropertiesResponse>"
+        )))
+        .unwrap_err();
+        assert_eq!(
+            namespace_error.to_string(),
+            "invalid Events GetEventProperties response"
+        );
+
+        let aggregate_at_limit = (0..64)
+            .map(|index| {
+                let wanted_length = 4_086;
+                let prefix = format!("T{index:02}");
+                let name = format!("{prefix}{}", "x".repeat(wanted_length - prefix.len()));
+                assert_eq!(name.len(), wanted_length);
+                format!("<vendor:{name} wstop:topic=\"true\"/>")
+            })
+            .collect::<String>();
+        let first_name = format!("T00{}", "x".repeat(4_086 - 3));
+        let aggregate_at_limit =
+            format!("{aggregate_at_limit}<vendor:{first_name} wstop:topic=\"true\"/>");
+        let retained_bytes = 64 * (4_086 + "urn:vendor".len());
+        assert_eq!(retained_bytes, MAX_RETAINED_BYTES);
+        let topics = parse_event_properties_response(&soap(&format!(
+            "<tev:GetEventPropertiesResponse><wstop:TopicSet>{aggregate_at_limit}</wstop:TopicSet></tev:GetEventPropertiesResponse>"
+        )))
+        .unwrap();
+        assert_eq!(topics.len(), 64);
+
+        let aggregate_overflow = (0..64)
+            .map(|index| {
+                let wanted_length = if index == 63 { 4_087 } else { 4_086 };
+                let prefix = format!("T{index:02}");
+                let name = format!("{prefix}{}", "x".repeat(wanted_length - prefix.len()));
+                assert_eq!(name.len(), wanted_length);
+                format!("<vendor:{name} wstop:topic=\"true\"/>")
+            })
+            .collect::<String>();
+        let retained_bytes = 63 * (4_086 + "urn:vendor".len()) + 4_087 + "urn:vendor".len();
+        assert_eq!(retained_bytes, MAX_RETAINED_BYTES + 1);
+        let aggregate_error = parse_event_properties_response(&soap(&format!(
+            "<tev:GetEventPropertiesResponse><wstop:TopicSet>{aggregate_overflow}</wstop:TopicSet></tev:GetEventPropertiesResponse>"
+        )))
+        .unwrap_err();
+        assert_eq!(
+            aggregate_error.to_string(),
+            "invalid Events GetEventProperties response"
+        );
     }
 
     #[test]
@@ -1964,7 +2131,68 @@ mod tests {
                 "<s:Fault><s:Code><s:Value>s:Sender</s:Value><s:Subcode><s:Value>{code}</s:Value></s:Subcode></s:Code></s:Fault>"
             )))
             .unwrap_err();
-            assert_eq!(error.fault_code.as_deref(), Some(code));
+            assert_eq!(error.fault_code.as_deref(), Some("Fault"));
+            assert_eq!(error.to_string(), "SOAP Fault: Fault");
+            assert!(!error.to_string().contains(code));
+        }
+
+        let soap12_sensitive = soap(
+            "<s:Fault><s:Code><s:Value>s:Sender</s:Value><s:Subcode><s:Value>vendor:camera-password-marker</s:Value></s:Subcode></s:Code><s:Reason><s:Text>viewer-marker</s:Text></s:Reason><s:Detail>PasswordDigestABC123</s:Detail></s:Fault>",
+        );
+        let error = parse_services_response(&soap12_sensitive).unwrap_err();
+        assert_eq!(error.fault_code.as_deref(), Some("Fault"));
+        assert_eq!(error.to_string(), "SOAP Fault: Fault");
+
+        let soap11_sensitive = concat!(
+            "<env:Envelope xmlns:env=\"http://schemas.xmlsoap.org/soap/envelope/\">",
+            "<env:Body><env:Fault><faultcode>camera-password-marker</faultcode>",
+            "<faultstring>viewer-marker</faultstring>",
+            "<detail>PasswordDigestABC123</detail></env:Fault></env:Body></env:Envelope>"
+        );
+        let error = parse_services_response(soap11_sensitive).unwrap_err();
+        assert_eq!(error.fault_code.as_deref(), Some("Fault"));
+        assert_eq!(error.to_string(), "SOAP Fault: Fault");
+
+        for marker in [
+            "camera-password-marker",
+            "viewer-marker",
+            "PasswordDigestABC123",
+        ] {
+            assert!(
+                !parse_services_response(&soap12_sensitive)
+                    .unwrap_err()
+                    .to_string()
+                    .contains(marker)
+            );
+            assert!(
+                !parse_services_response(soap11_sensitive)
+                    .unwrap_err()
+                    .to_string()
+                    .contains(marker)
+            );
+        }
+
+        for expected in [
+            "VersionMismatch",
+            "MustUnderstand",
+            "DataEncodingUnknown",
+            "Sender",
+            "Receiver",
+        ] {
+            let error = parse_services_response(&soap(&format!(
+                "<s:Fault><s:Code><s:Value>s:{expected}</s:Value></s:Code></s:Fault>"
+            )))
+            .unwrap_err();
+            assert_eq!(error.fault_code.as_deref(), Some(expected));
+            assert_eq!(error.to_string(), format!("SOAP Fault: {expected}"));
+        }
+        for expected in ["VersionMismatch", "MustUnderstand", "Client", "Server"] {
+            let xml = format!(
+                "<env:Envelope xmlns:env=\"http://schemas.xmlsoap.org/soap/envelope/\"><env:Body><env:Fault><faultcode>env:{expected}</faultcode><faultstring>request failed</faultstring></env:Fault></env:Body></env:Envelope>"
+            );
+            let error = parse_services_response(&xml).unwrap_err();
+            assert_eq!(error.fault_code.as_deref(), Some(expected));
+            assert_eq!(error.to_string(), format!("SOAP Fault: {expected}"));
         }
 
         for xml in [

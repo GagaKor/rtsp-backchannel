@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use rtsp_backchannel::cli::{Invocation, parse_invocation_from};
 use rtsp_backchannel::discovery::{DiscoveryOptions, parse_probe_matches};
 use rtsp_backchannel::onvif::{
-    CameraCapabilityOptions, DeviceInfo, OnvifDevice, StreamUriOptions, get_camera_capabilities,
+    CameraCapabilityOptions, OnvifDevice, StreamUriOptions, get_camera_capabilities,
     get_stream_uris, parse_profiles,
 };
 
@@ -344,7 +344,8 @@ fn uppercase_direct_rtsp_credentials_are_never_logged() {
 }
 
 #[test]
-fn capability_connect_returns_device_information_in_the_existing_three_requests() {
+fn public_connect_keeps_its_unit_signature_and_existing_three_requests() {
+    let _: fn(&mut OnvifDevice) -> Result<(), String> = OnvifDevice::connect;
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let device_url = format!("http://127.0.0.1:{port}/selected/device");
@@ -364,18 +365,9 @@ fn capability_connect_returns_device_information_in_the_existing_three_requests(
     )
     .unwrap();
 
-    let info = device.connect().unwrap();
+    device.connect().unwrap();
     server.join().unwrap();
 
-    assert_eq!(
-        info,
-        DeviceInfo {
-            manufacturer: Some("Fixture Camera".to_owned()),
-            model: Some("C1".to_owned()),
-            firmware: Some("1.2.3".to_owned()),
-            serial: Some("serial-1".to_owned()),
-        }
-    );
     let requests = requests.lock().unwrap();
     let paths = request_paths(&requests);
     assert_eq!(
@@ -647,6 +639,64 @@ fn capability_authentication_fault_is_fatal_and_never_runs_fallback() {
 }
 
 #[test]
+fn capability_unknown_soap11_and_soap12_fault_codes_are_redacted_before_fallback() {
+    let faults = [
+        capability_soap(
+            "<s:Fault><s:Code><s:Value>s:Sender</s:Value><s:Subcode><s:Value>vendor:camera-password-marker</s:Value></s:Subcode></s:Code><s:Reason><s:Text>viewer-marker</s:Text></s:Reason><s:Detail>PasswordDigestABC123</s:Detail></s:Fault>",
+        ),
+        concat!(
+            "<env:Envelope xmlns:env=\"http://schemas.xmlsoap.org/soap/envelope/\">",
+            "<env:Body><env:Fault><faultcode>camera-password-marker</faultcode>",
+            "<faultstring>viewer-marker</faultstring>",
+            "<detail>PasswordDigestABC123</detail></env:Fault></env:Body></env:Envelope>"
+        )
+        .to_owned(),
+    ];
+
+    for fault in faults {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let device_url = format!("http://127.0.0.1:{port}/selected/device");
+        let connected_media = format!("http://127.0.0.1:{port}/connected/media");
+        let mut responses = capability_connect_responses(&connected_media);
+        responses.extend([
+            ok(capability_soap("<tds:GetScopesResponse/>")),
+            status(500, fault),
+            ok(capability_soap(&format!(
+                "<tds:GetCapabilitiesResponse><tds:Capabilities><tt:Media><tt:XAddr>{connected_media}</tt:XAddr></tt:Media></tds:Capabilities></tds:GetCapabilitiesResponse>"
+            ))),
+            ok(capability_soap("<trt:GetProfilesResponse/>")),
+        ]);
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server = serve_capability_responses(listener, responses, Arc::clone(&requests));
+
+        let report = get_camera_capabilities(&CameraCapabilityOptions {
+            host: "camera".to_owned(),
+            user: "viewer-marker".to_owned(),
+            password: "camera-password-marker".to_owned(),
+            device_urls: vec![device_url],
+            timeout: Duration::from_secs(2),
+        })
+        .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(report.service_discovery, "getCapabilities");
+        assert_eq!(report.warnings.len(), 1);
+        assert_eq!(report.warnings[0].operation, "GetServices");
+        assert_eq!(report.warnings[0].message, "SOAP Fault: Fault");
+        let warning = serde_json::to_string(&report.warnings).unwrap();
+        for marker in [
+            "viewer-marker",
+            "camera-password-marker",
+            "PasswordDigestABC123",
+        ] {
+            assert!(!warning.contains(marker));
+        }
+        assert_eq!(requests.lock().unwrap().len(), 7);
+    }
+}
+
+#[test]
 fn capability_optional_failures_are_sanitized_and_keep_unknowns() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -764,6 +814,81 @@ fn capability_credential_service_url_is_rejected_before_network_dispatch() {
     assert_eq!(report.warnings[0].message, "invalid ONVIF service URL");
     assert!(!report.warnings[0].message.contains("viewer"));
     assert!(!report.warnings[0].message.contains("url-secret"));
+}
+
+#[test]
+fn capability_cross_origin_service_is_retained_but_never_dispatched() {
+    for legacy_fallback in [false, true] {
+        let device_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let device_port = device_listener.local_addr().unwrap().port();
+        let attacker_listener = TcpListener::bind("[::1]:0").unwrap();
+        attacker_listener.set_nonblocking(true).unwrap();
+        let attacker_port = attacker_listener.local_addr().unwrap().port();
+        let attacker = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_millis(750);
+            while Instant::now() < deadline {
+                match attacker_listener.accept() {
+                    Ok((_stream, _)) => return true,
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("attacker listener failed: {error}"),
+                }
+            }
+            false
+        });
+
+        let device_url = format!("http://127.0.0.1:{device_port}/selected/device");
+        let connected_media = format!("http://127.0.0.1:{device_port}/connected/media");
+        let attacker_media = format!("http://[::1]:{attacker_port}/must-not-reach");
+        let mut responses = capability_connect_responses(&connected_media);
+        responses.push(ok(capability_soap("<tds:GetScopesResponse/>")));
+        if legacy_fallback {
+            responses.extend([
+                ok(capability_soap("<tds:GetServicesResponse/>")),
+                ok(capability_soap(&format!(
+                    "<tds:GetCapabilitiesResponse><tds:Capabilities><tt:Media><tt:XAddr>{attacker_media}</tt:XAddr></tt:Media></tds:Capabilities></tds:GetCapabilitiesResponse>"
+                ))),
+            ]);
+        } else {
+            responses.push(ok(capability_soap(&format!(
+                "<tds:GetServicesResponse>{}</tds:GetServicesResponse>",
+                capability_service(MEDIA1_NS, &attacker_media, 1, 0),
+            ))));
+        }
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server = serve_capability_responses(device_listener, responses, Arc::clone(&requests));
+
+        let report = get_camera_capabilities(&CameraCapabilityOptions {
+            host: "camera".to_owned(),
+            user: "admin".to_owned(),
+            password: "camera-secret".to_owned(),
+            device_urls: vec![device_url],
+            timeout: Duration::from_secs(2),
+        })
+        .unwrap();
+        server.join().unwrap();
+        let attacker_contacted = attacker.join().unwrap();
+
+        assert!(!attacker_contacted);
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            if legacy_fallback { 6 } else { 5 }
+        );
+        assert_eq!(report.services[0].xaddr, attacker_media);
+        assert_eq!(
+            report.service_discovery,
+            if legacy_fallback {
+                "getCapabilities"
+            } else {
+                "getServices"
+            }
+        );
+        assert!(report.warnings.iter().any(|warning| {
+            warning.operation == "Media1 GetProfiles"
+                && warning.message == "invalid ONVIF service URL"
+        }));
+    }
 }
 
 #[derive(Clone)]
