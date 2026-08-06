@@ -15,6 +15,22 @@ const SOAP_NS = 'http://www.w3.org/2003/05/soap-envelope';
 const DEV_NS = 'http://www.onvif.org/ver10/device/wsdl';
 const WSTOP_NS = 'http://docs.oasis-open.org/wsn/t-1';
 const TOPIC_NS = 'http://www.onvif.org/ver10/topics';
+const MAX_XML_BYTES = 1024 * 1024;
+
+function xmlWithUtf8ByteLength(totalBytes: number): string {
+  const openingTag = '<root>';
+  const closingTag = '</root>';
+  const contentBytes = totalBytes - Buffer.byteLength(openingTag + closingTag, 'utf8');
+  const multibyteCharacter = '한';
+  const multibyteCharacterBytes = Buffer.byteLength(multibyteCharacter, 'utf8');
+
+  return (
+    openingTag
+    + multibyteCharacter.repeat(Math.floor(contentBytes / multibyteCharacterBytes))
+    + 'x'.repeat(contentBytes % multibyteCharacterBytes)
+    + closingTag
+  );
+}
 
 test('finds namespace-qualified elements when prefixes change and preserves repeated siblings', () => {
   const root = parseXml(`
@@ -78,6 +94,18 @@ test('reports malformed XML with an operation-neutral error', () => {
   );
 });
 
+test('allows declaration-like text inside an XML comment', () => {
+  const root = parseXml('<root><!-- <!DOCTYPE harmless> --><child>ok</child></root>');
+
+  assert.equal(textOf(firstChild(root, '', 'child')), 'ok');
+});
+
+test('allows declaration-like text inside CDATA', () => {
+  const root = parseXml('<root><![CDATA[<!ENTITY harmless>]]></root>');
+
+  assert.equal(textOf(root), '<!ENTITY harmless>');
+});
+
 test('rejects DOCTYPE and ENTITY declarations before parsing', () => {
   const forbidden = [
     '<!DOCTYPE camera SYSTEM "https://example.invalid/camera.dtd"><camera/>',
@@ -90,6 +118,26 @@ test('rejects DOCTYPE and ENTITY declarations before parsing', () => {
       { name: 'Error', message: 'DTD and entity declarations are not allowed' },
     );
   }
+});
+
+test('rejects an entity declaration in a DOCTYPE internal subset', () => {
+  assert.throws(
+    () => parseXml('<!DOCTYPE camera [<!ENTITY secret "classified">]><camera>&secret;</camera>'),
+    { name: 'Error', message: 'DTD and entity declarations are not allowed' },
+  );
+});
+
+test('applies the one MiB input limit to UTF-8 bytes', () => {
+  const atLimit = xmlWithUtf8ByteLength(MAX_XML_BYTES);
+  const aboveLimit = xmlWithUtf8ByteLength(MAX_XML_BYTES + 1);
+
+  assert.equal(Buffer.byteLength(atLimit, 'utf8'), MAX_XML_BYTES);
+  assert.equal(parseXml(atLimit).local, 'root');
+  assert.equal(Buffer.byteLength(aboveLimit, 'utf8'), MAX_XML_BYTES + 1);
+  assert.throws(
+    () => parseXml(aboveLimit),
+    { name: 'RangeError', message: 'XML input exceeds 1048576 bytes' },
+  );
 });
 
 test('rejects XML input larger than one MiB', () => {

@@ -1,7 +1,58 @@
 import { SaxesParser } from 'saxes';
 
 const MAX_XML_BYTES = 1024 * 1024;
-const FORBIDDEN_DECLARATION = /<!\s*(?:DOCTYPE|ENTITY)\b/i;
+const FORBIDDEN_DECLARATION_NAMES = ['DOCTYPE', 'ENTITY'] as const;
+
+function isXmlWhitespace(character: string | undefined): boolean {
+  return character === ' ' || character === '\t' || character === '\n' || character === '\r';
+}
+
+function isAsciiWordCharacter(character: string | undefined): boolean {
+  if (character === undefined) return false;
+  const code = character.charCodeAt(0);
+  return (
+    (code >= 48 && code <= 57)
+    || (code >= 65 && code <= 90)
+    || code === 95
+    || (code >= 97 && code <= 122)
+  );
+}
+
+function containsForbiddenDeclaration(xml: string): boolean {
+  let cursor = 0;
+  while (cursor < xml.length) {
+    const declarationStart = xml.indexOf('<!', cursor);
+    if (declarationStart === -1) return false;
+
+    if (xml.startsWith('<!--', declarationStart)) {
+      const commentEnd = xml.indexOf('-->', declarationStart + 4);
+      if (commentEnd === -1) return false;
+      cursor = commentEnd + 3;
+      continue;
+    }
+
+    if (xml.startsWith('<![CDATA[', declarationStart)) {
+      const cdataEnd = xml.indexOf(']]>', declarationStart + 9);
+      if (cdataEnd === -1) return false;
+      cursor = cdataEnd + 3;
+      continue;
+    }
+
+    let nameStart = declarationStart + 2;
+    while (isXmlWhitespace(xml[nameStart])) nameStart++;
+    for (const name of FORBIDDEN_DECLARATION_NAMES) {
+      const candidate = xml.slice(nameStart, nameStart + name.length);
+      if (
+        candidate.toUpperCase() === name
+        && !isAsciiWordCharacter(xml[nameStart + name.length])
+      ) {
+        return true;
+      }
+    }
+    cursor = declarationStart + 2;
+  }
+  return false;
+}
 
 /** @internal */
 export interface XmlAttribute {
@@ -32,7 +83,7 @@ export function parseXml(xml: string): XmlElement {
   if (Buffer.byteLength(xml, 'utf8') > MAX_XML_BYTES) {
     throw new RangeError(`XML input exceeds ${MAX_XML_BYTES} bytes`);
   }
-  if (FORBIDDEN_DECLARATION.test(xml)) {
+  if (containsForbiddenDeclaration(xml)) {
     throw new Error('DTD and entity declarations are not allowed');
   }
 
