@@ -594,9 +594,16 @@ fn capabilities_cli_rejects_unsafe_values_and_timeout_underflow_before_dispatch(
 
 #[test]
 fn capabilities_cli_enforces_an_inclusive_24_hour_timeout_bound_at_parse_time() {
+    assert_eq!("86400000.000000001".parse::<f64>().unwrap(), 86_400_000.0);
+    for timeout in ["86400000.00000001", "86400000.00000049"] {
+        assert!(timeout.parse::<f64>().unwrap() > 86_400_000.0);
+    }
+
     for timeout_arguments in [
         vec!["--timeout-ms", "86400000"],
         vec!["--timeout-ms=86400000"],
+        vec!["--timeout-ms", "86400000.000000001"],
+        vec!["--timeout-ms=86400000.000000001"],
     ] {
         let mut arguments = vec!["rtsp-backchannel", "capabilities", "--host", "camera.local"];
         arguments.extend(timeout_arguments);
@@ -609,6 +616,16 @@ fn capabilities_cli_enforces_an_inclusive_24_hour_timeout_bound_at_parse_time() 
     }
 
     for (timeout_arguments, reflected_timeout) in [
+        (
+            vec!["--timeout-ms", "86400000.00000001"],
+            "86400000.00000001",
+        ),
+        (vec!["--timeout-ms=86400000.00000001"], "86400000.00000001"),
+        (
+            vec!["--timeout-ms", "86400000.00000049"],
+            "86400000.00000049",
+        ),
+        (vec!["--timeout-ms=86400000.00000049"], "86400000.00000049"),
         (vec!["--timeout-ms", "86400001"], "86400001"),
         (vec!["--timeout-ms=86400001"], "86400001"),
         (vec!["--timeout-ms", "1e22"], "1e22"),
@@ -631,6 +648,16 @@ fn capabilities_cli_enforces_an_inclusive_24_hour_timeout_bound_at_parse_time() 
 #[test]
 fn capabilities_cli_above_24_hour_timeout_exits_without_panic_or_network_dispatch() {
     for (timeout_arguments, reflected_timeout) in [
+        (
+            vec!["--timeout-ms", "86400000.00000001"],
+            "86400000.00000001",
+        ),
+        (vec!["--timeout-ms=86400000.00000001"], "86400000.00000001"),
+        (
+            vec!["--timeout-ms", "86400000.00000049"],
+            "86400000.00000049",
+        ),
+        (vec!["--timeout-ms=86400000.00000049"], "86400000.00000049"),
         (vec!["--timeout-ms", "86400001"], "86400001"),
         (vec!["--timeout-ms=86400001"], "86400001"),
         (vec!["--timeout-ms", "1e22"], "1e22"),

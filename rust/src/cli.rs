@@ -8,7 +8,7 @@ use clap::Parser;
 use crate::audio::CodecPreference;
 
 const INVALID_TIMEOUT_ERROR: &str = "timeout-ms must be finite and greater than 0";
-const MAX_CAPABILITY_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+const MAX_CAPABILITY_TIMEOUT_MS: f64 = 86_400_000.0;
 const TIMEOUT_RANGE_ERROR: &str = "timeout-ms exceeds the 24-hour maximum";
 const CAPABILITY_TERMINATOR_ERROR: &str = "capabilities does not accept an argument terminator";
 
@@ -330,13 +330,13 @@ fn parse_timeout_ms(value: &str) -> Result<Duration, &'static str> {
     if !milliseconds.is_finite() || milliseconds <= 0.0 {
         return Err(INVALID_TIMEOUT_ERROR);
     }
+    if milliseconds > MAX_CAPABILITY_TIMEOUT_MS {
+        return Err(TIMEOUT_RANGE_ERROR);
+    }
     let timeout =
         Duration::try_from_secs_f64(milliseconds / 1000.0).map_err(|_| INVALID_TIMEOUT_ERROR)?;
     if timeout.is_zero() {
         return Err(INVALID_TIMEOUT_ERROR);
-    }
-    if timeout > MAX_CAPABILITY_TIMEOUT {
-        return Err(TIMEOUT_RANGE_ERROR);
     }
     Ok(timeout)
 }
