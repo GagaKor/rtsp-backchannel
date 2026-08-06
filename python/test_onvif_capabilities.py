@@ -492,15 +492,15 @@ class CapabilityOrchestrationTests(unittest.TestCase):
                         return_value=DeviceInfo(manufacturer="Fixture Camera"),
                     ),
                     patch.object(
-                        onvif.urllib.request,
-                        "urlopen",
-                        side_effect=reject,
-                    ) as urlopen,
+                        onvif,
+                        "_discovery_opener",
+                    ) as opener,
                 ):
+                    opener.return_value.open.side_effect = reject
                     with self.assertRaisesRegex(RuntimeError, "HTTP 401"):
                         get_camera_capabilities(host="camera")
 
-                self.assertEqual(urlopen.call_count, 1)
+                self.assertEqual(opener.return_value.open.call_count, 1)
                 self.assertEqual(len(bodies), 1)
                 self.assertEqual(bodies[0].read_calls, 0)
                 self.assertTrue(bodies[0].closed)
@@ -1030,6 +1030,9 @@ class _OnvifFixtureHandler(http.server.BaseHTTPRequestHandler):
     connected_media_xaddr = None
     capability_service_xaddr = None
     capability_legacy_fallback = False
+    redirect_status = None
+    redirect_match = None
+    redirect_location = None
 
     def log_message(self, format, *args):
         return
@@ -1038,6 +1041,19 @@ class _OnvifFixtureHandler(http.server.BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length).decode("utf-8")
         type(self).requests.append((self.path, body))
+        redirect_match = type(self).redirect_match
+        if (
+            type(self).redirect_status is not None
+            and redirect_match is not None
+            and redirect_match in body
+        ):
+            payload = b"<camera-redirect-body-marker/>"
+            self.send_response(type(self).redirect_status)
+            self.send_header("Location", type(self).redirect_location)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         if "GetSystemDateAndTime" in body:
             stage = "system-time"
             payload = soap(
@@ -1143,6 +1159,28 @@ class _OnvifFixtureHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(encoded)
 
 
+class _OnvifRedirectTargetHandler(http.server.BaseHTTPRequestHandler):
+    requests = []
+    response_payload = b""
+
+    def log_message(self, format, *args):
+        return
+
+    def _respond(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length)
+        type(self).requests.append((self.command, self.path, body))
+        payload = type(self).response_payload
+        self.send_response(200)
+        self.send_header("Content-Type", "application/soap+xml")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    do_GET = _respond
+    do_POST = _respond
+
+
 class OnvifCapabilityTransportTests(unittest.TestCase):
     def setUp(self):
         _OnvifFixtureHandler.requests = []
@@ -1151,6 +1189,9 @@ class OnvifCapabilityTransportTests(unittest.TestCase):
         _OnvifFixtureHandler.connected_media_xaddr = None
         _OnvifFixtureHandler.capability_service_xaddr = None
         _OnvifFixtureHandler.capability_legacy_fallback = False
+        _OnvifFixtureHandler.redirect_status = None
+        _OnvifFixtureHandler.redirect_match = None
+        _OnvifFixtureHandler.redirect_location = None
         self.server = http.server.ThreadingHTTPServer(
             ("127.0.0.1", 0), _OnvifFixtureHandler
         )
@@ -1238,6 +1279,104 @@ class OnvifCapabilityTransportTests(unittest.TestCase):
                     [path for path, _ in _OnvifFixtureHandler.requests],
                     ["/selected/device", "/selected/device"],
                 )
+
+    def test_optional_capability_redirects_are_not_followed_and_are_sanitized(self):
+        marker = "attacker-response-body-marker"
+        _OnvifRedirectTargetHandler.response_payload = soap(
+            "<tds:GetScopesResponse><tds:Scopes>"
+            f"<tt:ScopeItem>{marker}</tt:ScopeItem>"
+            "</tds:Scopes></tds:GetScopesResponse>"
+        ).encode("utf-8")
+        attacker = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), _OnvifRedirectTargetHandler
+        )
+        attacker_thread = threading.Thread(
+            target=attacker.serve_forever, daemon=True
+        )
+        attacker_thread.start()
+        _OnvifFixtureHandler.redirect_match = "GetScopes"
+        _OnvifFixtureHandler.redirect_location = (
+            f"http://localhost:{attacker.server_port}/substitute"
+        )
+        selected_url = (
+            f"http://127.0.0.1:{self.server.server_port}/selected/device"
+        )
+
+        try:
+            for status in (301, 302, 303):
+                with self.subTest(status=status):
+                    _OnvifFixtureHandler.redirect_status = status
+                    _OnvifFixtureHandler.requests = []
+                    _OnvifRedirectTargetHandler.requests = []
+
+                    report = get_camera_capabilities(
+                        host="camera",
+                        device_urls=[selected_url],
+                        timeout=2.0,
+                    )
+
+                    self.assertEqual(_OnvifRedirectTargetHandler.requests, [])
+                    self.assertIn(
+                        CameraCapabilityWarning("GetScopes", f"HTTP {status}"),
+                        report.warnings,
+                    )
+                    self.assertNotIn(marker, repr(report))
+                    self.assertNotIn("camera-redirect-body-marker", repr(report))
+        finally:
+            attacker.shutdown()
+            attacker.server_close()
+            attacker_thread.join(timeout=2)
+
+    def test_connect_redirects_are_not_followed_and_remain_fixed_fatal_errors(self):
+        marker = "attacker-system-time-body-marker"
+        _OnvifRedirectTargetHandler.response_payload = soap(
+            "<tds:GetSystemDateAndTimeResponse><tds:SystemDateAndTime>"
+            "<tt:UTCDateTime><tt:Time><tt:Hour>12</tt:Hour>"
+            "<tt:Minute>30</tt:Minute><tt:Second>0</tt:Second></tt:Time>"
+            "<tt:Date><tt:Year>2026</tt:Year><tt:Month>8</tt:Month>"
+            "<tt:Day>6</tt:Day></tt:Date></tt:UTCDateTime>"
+            f"<tt:Extension>{marker}</tt:Extension>"
+            "</tds:SystemDateAndTime></tds:GetSystemDateAndTimeResponse>"
+        ).encode("utf-8")
+        attacker = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), _OnvifRedirectTargetHandler
+        )
+        attacker_thread = threading.Thread(
+            target=attacker.serve_forever, daemon=True
+        )
+        attacker_thread.start()
+        _OnvifFixtureHandler.redirect_match = "GetSystemDateAndTime"
+        _OnvifFixtureHandler.redirect_location = (
+            f"http://localhost:{attacker.server_port}/substitute"
+        )
+        selected_url = (
+            f"http://127.0.0.1:{self.server.server_port}/selected/device"
+        )
+
+        try:
+            for status in (301, 302, 303):
+                with self.subTest(status=status):
+                    _OnvifFixtureHandler.redirect_status = status
+                    _OnvifFixtureHandler.requests = []
+                    _OnvifRedirectTargetHandler.requests = []
+                    device = OnvifDevice(
+                        "camera", device_urls=[selected_url], timeout=2.0
+                    )
+
+                    with self.assertRaisesRegex(
+                        RuntimeError, "^ONVIF connect failed$"
+                    ) as caught:
+                        device.connect()
+
+                    self.assertEqual(_OnvifRedirectTargetHandler.requests, [])
+                    self.assertNotIn(marker, str(caught.exception))
+                    self.assertNotIn(
+                        "camera-redirect-body-marker", str(caught.exception)
+                    )
+        finally:
+            attacker.shutdown()
+            attacker.server_close()
+            attacker_thread.join(timeout=2)
 
     def test_connect_rejects_dtd_entities_at_every_mandatory_parse_stage(self):
         expected_request_count = {
@@ -1383,6 +1522,53 @@ class OnvifCapabilityTransportTests(unittest.TestCase):
         self.assertEqual(allowed_wsse, len(allowed))
         self.assertEqual(request.call_count, len(allowed))
         self.assertEqual(wsse.call_count, len(allowed))
+
+    def test_malformed_numeric_service_hosts_are_fixed_invalid_urls(self):
+        for hostname in ("4294967296", "9" * 5000):
+            with self.subTest(digits=len(hostname)):
+                error = None
+                try:
+                    onvif._validate_service_url_against_device(
+                        f"http://{hostname}/device",
+                        f"http://{hostname}/media",
+                    )
+                except Exception as caught:
+                    error = caught
+
+                self.assertIs(type(error), RuntimeError)
+                self.assertEqual(str(error), "invalid ONVIF service URL")
+
+    def test_giant_numeric_advertised_host_becomes_an_optional_warning(self):
+        giant_xaddr = f"http://{'9' * 5000}/media"
+        _OnvifFixtureHandler.capability_service_xaddr = giant_xaddr
+        selected_url = (
+            f"http://127.0.0.1:{self.server.server_port}/selected/device"
+        )
+
+        try:
+            report = get_camera_capabilities(
+                host="camera",
+                device_urls=[selected_url],
+                timeout=2.0,
+            )
+        except Exception as error:
+            self.fail(
+                f"capability operation leaked {type(error).__name__}"
+            )
+
+        self.assertEqual(report.services[0].xaddr, giant_xaddr)
+        self.assertEqual(
+            report.warnings,
+            (
+                CameraCapabilityWarning(
+                    "Media1 GetProfiles", "invalid ONVIF service URL"
+                ),
+            ),
+        )
+        self.assertEqual(
+            [path for path, _ in _OnvifFixtureHandler.requests],
+            ["/selected/device"] * 5,
+        )
 
     def test_cross_origin_discovered_service_is_retained_warned_and_never_contacted(self):
         class AttackerHandler(http.server.BaseHTTPRequestHandler):

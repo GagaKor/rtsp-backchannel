@@ -775,21 +775,28 @@ def _validate_service_url(value: str) -> None:
 
 
 def _legacy_ipv4_address(hostname: str) -> str | None:
+    if any(
+        character != "." and not "0" <= character <= "9"
+        for character in hostname
+    ):
+        return None
     parts = hostname.split(".")
     if not 1 <= len(parts) <= 4 or any(
         not part
-        or not part.isascii()
-        or not part.isdecimal()
         or (len(part) > 1 and part.startswith("0"))
         for part in parts
     ):
-        return None
-    numbers = [int(part) for part in parts]
-    if any(number > 255 for number in numbers[:-1]):
-        return None
-    last_bits = 8 * (5 - len(numbers))
-    if numbers[-1] >= 1 << last_bits:
-        return None
+        raise RuntimeError("invalid ONVIF service URL")
+    last_bits = 8 * (5 - len(parts))
+    maximums = [255] * (len(parts) - 1) + [(1 << last_bits) - 1]
+    numbers = []
+    for part, maximum in zip(parts, maximums):
+        maximum_text = str(maximum)
+        if len(part) > len(maximum_text) or (
+            len(part) == len(maximum_text) and part > maximum_text
+        ):
+            raise RuntimeError("invalid ONVIF service URL")
+        numbers.append(int(part))
     address = numbers[-1]
     for index, number in enumerate(numbers[:-1]):
         address |= number << (24 - index * 8)
@@ -800,12 +807,12 @@ def _canonical_service_host(parsed) -> str:
     hostname = parsed.hostname
     if hostname is None:
         raise RuntimeError("invalid ONVIF service URL")
+    legacy_ipv4 = _legacy_ipv4_address(hostname)
+    if legacy_ipv4 is not None:
+        return f"ip:{legacy_ipv4}"
     try:
         return f"ip:{ipaddress.ip_address(hostname)}"
     except ValueError:
-        legacy_ipv4 = _legacy_ipv4_address(hostname)
-        if legacy_ipv4 is not None:
-            return f"ip:{legacy_ipv4}"
         try:
             domain = hostname.removesuffix(".").encode("idna").decode("ascii")
         except UnicodeError:
@@ -852,9 +859,7 @@ def _soap_response(
     if remaining <= 0:
         raise TimeoutError("ONVIF SOAP deadline exceeded")
     try:
-        response = urllib.request.urlopen(
-            request, timeout=remaining, context=_TLS_CONTEXT
-        )
+        response = _discovery_opener().open(request, timeout=remaining)
     except urllib.error.HTTPError as error:
         if stop_on_auth_error and error.code in (401, 403):
             error.close()
