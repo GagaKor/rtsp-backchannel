@@ -8,10 +8,12 @@ import json
 import threading
 import unittest
 import urllib.error
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 from xml.etree import ElementTree
 
+from rtsp_backchannel.cli import _camera_capability_json
 from rtsp_backchannel.capabilities import (
     CameraCapabilityProfile,
     CameraCapabilityReport,
@@ -1179,6 +1181,125 @@ class _OnvifRedirectTargetHandler(http.server.BaseHTTPRequestHandler):
 
     do_GET = _respond
     do_POST = _respond
+
+
+class CapabilityParityFixtureTests(unittest.TestCase):
+    def test_capability_report_matches_shared_cross_language_fixture(self):
+        fixture_path = (
+            Path(__file__).resolve().parents[1]
+            / "rust"
+            / "tests"
+            / "fixtures"
+            / "capability-parity.json"
+        )
+        self.assertTrue(
+            fixture_path.is_file(),
+            "shared capability parity fixture is missing",
+        )
+        raw_fixture = fixture_path.read_text(encoding="utf-8")
+        fixture = json.loads(raw_fixture)
+        expected_operations = [
+            "GetSystemDateAndTime",
+            "GetDeviceInformation",
+            "GetCapabilitiesMedia",
+            "GetScopes",
+            "GetServices",
+            "Media1GetProfiles",
+            "PtzGetServiceCapabilities",
+            "PtzGetNodes",
+            "EventsGetServiceCapabilities",
+            "EventsGetEventProperties",
+            "Media2GetProfiles",
+            "Media2GetVideoEncoderConfigurationOptions",
+        ]
+        operations_seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                return
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length).decode("utf-8")
+                path = self.path
+                if "GetSystemDateAndTime" in body:
+                    operation = "GetSystemDateAndTime"
+                elif "GetDeviceInformation" in body:
+                    operation = "GetDeviceInformation"
+                elif (
+                    "GetCapabilities" in body
+                    and "<Category>Media</Category>" in body
+                ):
+                    operation = "GetCapabilitiesMedia"
+                elif "GetScopes" in body:
+                    operation = "GetScopes"
+                elif "GetServices" in body:
+                    operation = "GetServices"
+                elif "GetVideoEncoderConfigurationOptions" in body:
+                    operation = "Media2GetVideoEncoderConfigurationOptions"
+                elif "GetEventProperties" in body:
+                    operation = "EventsGetEventProperties"
+                elif "GetNodes" in body:
+                    operation = "PtzGetNodes"
+                elif "GetProfiles" in body and path.endswith("/media1"):
+                    operation = "Media1GetProfiles"
+                elif "GetProfiles" in body and path.endswith("/media2"):
+                    operation = "Media2GetProfiles"
+                elif (
+                    "GetServiceCapabilities" in body
+                    and path.endswith("/ptz")
+                ):
+                    operation = "PtzGetServiceCapabilities"
+                elif (
+                    "GetServiceCapabilities" in body
+                    and path.endswith("/events")
+                ):
+                    operation = "EventsGetServiceCapabilities"
+                else:
+                    operation = None
+
+                if operation is None or operation not in fixture["operations"]:
+                    payload = soap("<s:Fault/>").encode("utf-8")
+                    self.send_response(500)
+                else:
+                    operations_seen.append(operation)
+                    payload = soap(
+                        fixture["operations"][operation]
+                    ).encode("utf-8")
+                    self.send_response(200)
+                self.send_header("Content-Type", "application/soap+xml")
+                self.send_header("Content-Length", str(len(payload)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(payload)
+
+        with http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+            base_url = f"http://127.0.0.1:{server.server_port}"
+            fixture.clear()
+            fixture.update(
+                json.loads(
+                    raw_fixture.replace("{{BASE_URL}}", base_url)
+                )
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                report = get_camera_capabilities(
+                    host="camera",
+                    user="viewer",
+                    password="camera-secret",
+                    device_urls=[f"{base_url}/device"],
+                    timeout=2.0,
+                )
+
+                self.assertEqual(operations_seen, expected_operations)
+                self.assertEqual(
+                    _camera_capability_json(report), fixture["expectedReport"]
+                )
+            finally:
+                server.shutdown()
+                thread.join(timeout=2)
+                self.assertFalse(thread.is_alive(), "fixture server thread leaked")
 
 
 class OnvifCapabilityTransportTests(unittest.TestCase):

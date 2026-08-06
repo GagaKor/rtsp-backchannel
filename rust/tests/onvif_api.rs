@@ -1213,6 +1213,104 @@ fn public_connect_keeps_its_unit_signature_and_existing_three_requests() {
 }
 
 #[test]
+fn capability_report_matches_shared_cross_language_fixture() {
+    let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/capability-parity.json");
+    assert!(
+        fixture_path.is_file(),
+        "shared capability parity fixture is missing: {}",
+        fixture_path.display()
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base_url = format!("http://127.0.0.1:{port}");
+    let raw_fixture = std::fs::read_to_string(&fixture_path).unwrap();
+    let fixture: serde_json::Value =
+        serde_json::from_str(&raw_fixture.replace("{{BASE_URL}}", &base_url)).unwrap();
+    let operations = fixture
+        .get("operations")
+        .and_then(serde_json::Value::as_object)
+        .expect("fixture operations must be an object");
+    let operation_order = [
+        "GetSystemDateAndTime",
+        "GetDeviceInformation",
+        "GetCapabilitiesMedia",
+        "GetScopes",
+        "GetServices",
+        "Media1GetProfiles",
+        "PtzGetServiceCapabilities",
+        "PtzGetNodes",
+        "EventsGetServiceCapabilities",
+        "EventsGetEventProperties",
+        "Media2GetProfiles",
+        "Media2GetVideoEncoderConfigurationOptions",
+    ];
+    let responses = operation_order
+        .iter()
+        .map(|operation| {
+            let body = operations
+                .get(*operation)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_else(|| panic!("fixture operation {operation} must be a string"));
+            ok(capability_soap(body))
+        })
+        .collect();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let server = serve_capability_responses(listener, responses, Arc::clone(&requests));
+
+    let report = get_camera_capabilities(&CameraCapabilityOptions {
+        host: "camera".to_owned(),
+        user: "viewer".to_owned(),
+        password: "camera-secret".to_owned(),
+        device_urls: vec![format!("{base_url}/device")],
+        timeout: Duration::from_secs(2),
+    })
+    .unwrap();
+    server.join().unwrap();
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(
+        request_paths(&requests),
+        [
+            "/device", "/device", "/device", "/device", "/device", "/media1", "/ptz", "/ptz",
+            "/events", "/events", "/media2", "/media2",
+        ]
+    );
+    let operation_markers = [
+        format!("<GetSystemDateAndTime xmlns=\"{DEVICE_NS}\"/>"),
+        format!("<GetDeviceInformation xmlns=\"{DEVICE_NS}\"/>"),
+        format!(
+            "<GetCapabilities xmlns=\"{DEVICE_NS}\"><Category>Media</Category></GetCapabilities>"
+        ),
+        format!("<GetScopes xmlns=\"{DEVICE_NS}\"/>"),
+        format!(
+            "<GetServices xmlns=\"{DEVICE_NS}\"><IncludeCapability>true</IncludeCapability></GetServices>"
+        ),
+        format!("<GetProfiles xmlns=\"{MEDIA1_NS}\"/>"),
+        format!("<GetServiceCapabilities xmlns=\"{PTZ_NS}\"/>"),
+        format!("<GetNodes xmlns=\"{PTZ_NS}\"/>"),
+        format!("<GetServiceCapabilities xmlns=\"{EVENTS_NS}\"/>"),
+        format!("<GetEventProperties xmlns=\"{EVENTS_NS}\"/>"),
+        format!("<GetProfiles xmlns=\"{MEDIA2_NS}\"><Type>All</Type></GetProfiles>"),
+        format!("<GetVideoEncoderConfigurationOptions xmlns=\"{MEDIA2_NS}\"/>"),
+    ];
+    for (request, marker) in requests.iter().zip(operation_markers) {
+        assert!(
+            request_body(request).contains(&marker),
+            "capability request did not contain expected operation marker: {marker}"
+        );
+    }
+    assert_eq!(
+        serde_json::to_value(report).unwrap(),
+        fixture
+            .get("expectedReport")
+            .cloned()
+            .expect("fixture expectedReport is required")
+    );
+}
+
+#[test]
 fn capability_report_routes_exact_operations_to_advertised_service_endpoints() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();

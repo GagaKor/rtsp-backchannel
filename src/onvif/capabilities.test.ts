@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { existsSync, readFileSync } from 'node:fs';
 import http from 'node:http';
 import { test } from 'node:test';
 
@@ -1472,5 +1473,99 @@ test('retains cross-host advertised XAddr facts but warns without contacting the
       new Promise<void>((resolve, reject) =>
         attacker.close((error) => (error ? reject(error) : resolve()))),
     ]);
+  }
+});
+
+test('capability report matches shared cross-language fixture', async () => {
+  const fixtureUrl = new URL('../../rust/tests/fixtures/capability-parity.json', import.meta.url);
+  assert.equal(existsSync(fixtureUrl), true, 'shared capability parity fixture is missing');
+
+  type Fixture = {
+    operations: Record<string, string>;
+    expectedReport: unknown;
+  };
+  const rawFixture = readFileSync(fixtureUrl, 'utf8');
+  const expectedOperations = [
+    'GetSystemDateAndTime',
+    'GetDeviceInformation',
+    'GetCapabilitiesMedia',
+    'GetScopes',
+    'GetServices',
+    'Media1GetProfiles',
+    'PtzGetServiceCapabilities',
+    'PtzGetNodes',
+    'EventsGetServiceCapabilities',
+    'EventsGetEventProperties',
+    'Media2GetProfiles',
+    'Media2GetVideoEncoderConfigurationOptions',
+  ];
+  let fixture: Fixture;
+  const operationsSeen: string[] = [];
+  const server = http.createServer((request, response) => {
+    let body = '';
+    request.setEncoding('utf8');
+    request.on('data', (chunk) => {
+      body += chunk;
+    });
+    request.on('end', () => {
+      const path = request.url ?? '';
+      const operation = body.includes('GetSystemDateAndTime')
+        ? 'GetSystemDateAndTime'
+        : body.includes('GetDeviceInformation')
+          ? 'GetDeviceInformation'
+          : body.includes('GetCapabilities') && body.includes('<Category>Media</Category>')
+            ? 'GetCapabilitiesMedia'
+            : body.includes('GetScopes')
+              ? 'GetScopes'
+              : body.includes('GetServices')
+                ? 'GetServices'
+                : body.includes('GetVideoEncoderConfigurationOptions')
+                  ? 'Media2GetVideoEncoderConfigurationOptions'
+                  : body.includes('GetEventProperties')
+                    ? 'EventsGetEventProperties'
+                    : body.includes('GetNodes')
+                      ? 'PtzGetNodes'
+                      : body.includes('GetProfiles') && path.endsWith('/media1')
+                        ? 'Media1GetProfiles'
+                        : body.includes('GetProfiles') && path.endsWith('/media2')
+                          ? 'Media2GetProfiles'
+                          : body.includes('GetServiceCapabilities') && path.endsWith('/ptz')
+                            ? 'PtzGetServiceCapabilities'
+                            : body.includes('GetServiceCapabilities') && path.endsWith('/events')
+                              ? 'EventsGetServiceCapabilities'
+                              : undefined;
+
+      response.setHeader('Connection', 'close');
+      response.setHeader('Content-Type', 'application/soap+xml');
+      if (!operation || !Object.hasOwn(fixture.operations, operation)) {
+        response.statusCode = 500;
+        response.end(soap('<s:Fault/>'));
+        return;
+      }
+      operationsSeen.push(operation);
+      response.end(soap(fixture.operations[operation]));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const address = server.address();
+    assert.ok(address && typeof address !== 'string');
+    const baseUrl = `http://127.0.0.1:${address.port}`;
+    fixture = JSON.parse(
+      rawFixture.replaceAll('{{BASE_URL}}', baseUrl),
+    ) as Fixture;
+    const report = await getCameraCapabilities({
+      host: 'camera',
+      user: 'viewer',
+      pass: 'camera-secret',
+      deviceUrls: [`${baseUrl}/device`],
+      timeoutMs: 2_000,
+    });
+
+    assert.deepEqual(operationsSeen, expectedOperations);
+    assert.deepEqual(JSON.parse(JSON.stringify(report)), fixture.expectedReport);
+  } finally {
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())));
   }
 });
