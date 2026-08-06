@@ -1,11 +1,14 @@
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, TcpListener};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rtsp_backchannel::cli::{CapabilitiesCli, Invocation, parse_invocation_from};
+use rtsp_backchannel::cli::{
+    ApplicationInvocation, CapabilitiesCli, Invocation, parse_application_invocation_from,
+    parse_invocation_from,
+};
 use rtsp_backchannel::discovery::{DiscoveryOptions, parse_probe_matches};
 use rtsp_backchannel::onvif::{
     CameraCapabilityOptions, OnvifDevice, StreamUriOptions, get_camera_capabilities,
@@ -190,9 +193,40 @@ fn parses_discover_and_streams_without_breaking_direct_playback_flags() {
     ));
 }
 
+fn classify_legacy_invocation(invocation: Invocation) -> &'static str {
+    match invocation {
+        Invocation::Play(_) => "play",
+        Invocation::Discover(_) => "discover",
+        Invocation::Streams(_) => "streams",
+    }
+}
+
+#[test]
+fn application_parser_adds_capabilities_without_breaking_legacy_invocation_exhaustiveness() {
+    let legacy =
+        parse_invocation_from(["rtsp-backchannel", "discover", "--timeout-ms", "50"]).unwrap();
+    assert_eq!(classify_legacy_invocation(legacy), "discover");
+
+    assert!(
+        parse_invocation_from(["rtsp-backchannel", "capabilities", "--host", "camera.local",])
+            .is_err()
+    );
+
+    assert!(matches!(
+        parse_application_invocation_from([
+            "rtsp-backchannel",
+            "capabilities",
+            "--host",
+            "camera.local",
+        ])
+        .unwrap(),
+        ApplicationInvocation::Capabilities(_)
+    ));
+}
+
 #[test]
 fn capabilities_cli_parses_defaults_repeated_values_and_exact_command_dispatch() {
-    match parse_invocation_from([
+    match parse_application_invocation_from([
         "rtsp-backchannel",
         "capabilities",
         "--host",
@@ -210,7 +244,7 @@ fn capabilities_cli_parses_defaults_repeated_values_and_exact_command_dispatch()
     ])
     .unwrap()
     {
-        Invocation::Capabilities(cli) => {
+        ApplicationInvocation::Capabilities(cli) => {
             let cli: CapabilitiesCli = cli;
             assert_eq!(cli.host, "camera.local");
             assert_eq!(cli.user.as_deref(), Some("operator"));
@@ -227,7 +261,7 @@ fn capabilities_cli_parses_defaults_repeated_values_and_exact_command_dispatch()
         _ => panic!("expected capabilities invocation"),
     }
 
-    match parse_invocation_from([
+    match parse_application_invocation_from([
         "rtsp-backchannel",
         "capabilities",
         "--host",
@@ -237,7 +271,7 @@ fn capabilities_cli_parses_defaults_repeated_values_and_exact_command_dispatch()
     ])
     .unwrap()
     {
-        Invocation::Capabilities(cli) => {
+        ApplicationInvocation::Capabilities(cli) => {
             assert_eq!(cli.user, None);
             assert_eq!(cli.password.as_deref(), Some(""));
             assert!(cli.device_urls.is_empty());
@@ -264,8 +298,8 @@ fn capabilities_cli_parses_defaults_repeated_values_and_exact_command_dispatch()
         ],
     ] {
         assert!(matches!(
-            parse_invocation_from(arguments).unwrap(),
-            Invocation::Play(_)
+            parse_application_invocation_from(arguments).unwrap(),
+            ApplicationInvocation::Play(_)
         ));
     }
 }
@@ -358,13 +392,15 @@ fn capabilities_cli_rejects_unsafe_values_and_timeout_underflow_before_dispatch(
         ],
     ];
     for arguments in cases {
-        let diagnostic = parse_invocation_from(arguments).unwrap_err().to_string();
+        let diagnostic = parse_application_invocation_from(arguments)
+            .unwrap_err()
+            .to_string();
         assert!(!diagnostic.contains("validation-only-secret"));
         assert!(!diagnostic.contains("environment-only-secret"));
     }
 
     for timeout in ["0", "-1", "5e-324", "NaN", "inf", "1e309"] {
-        let diagnostic = parse_invocation_from([
+        let diagnostic = parse_application_invocation_from([
             "rtsp-backchannel",
             "capabilities",
             "--host",
@@ -428,7 +464,9 @@ fn capabilities_cli_rejects_unsafe_values_and_timeout_underflow_before_dispatch(
             "--timeout-secret-marker",
         ),
     ] {
-        let diagnostic = parse_invocation_from(arguments).unwrap_err().to_string();
+        let diagnostic = parse_application_invocation_from(arguments)
+            .unwrap_err()
+            .to_string();
         assert!(
             diagnostic.contains(&format!("missing value for --{option}")),
             "unexpected diagnostic: {diagnostic}"
@@ -480,7 +518,9 @@ fn capabilities_cli_rejects_unsafe_values_and_timeout_underflow_before_dispatch(
             "--timeout-equals-secret-marker",
         ),
     ] {
-        let diagnostic = parse_invocation_from(arguments).unwrap_err().to_string();
+        let diagnostic = parse_application_invocation_from(arguments)
+            .unwrap_err()
+            .to_string();
         assert!(
             diagnostic.contains(&format!("missing value for --{option}")),
             "unexpected diagnostic: {diagnostic}"
@@ -511,8 +551,8 @@ fn capabilities_cli_rejects_unsafe_values_and_timeout_underflow_before_dispatch(
             "--equals-password-secret",
         ),
     ] {
-        match parse_invocation_from(arguments).unwrap() {
-            Invocation::Capabilities(cli) => {
+        match parse_application_invocation_from(arguments).unwrap() {
+            ApplicationInvocation::Capabilities(cli) => {
                 assert_eq!(cli.password.as_deref(), Some(expected_password));
             }
             _ => panic!("expected capabilities invocation"),
@@ -532,11 +572,13 @@ fn capabilities_cli_rejects_unsafe_values_and_timeout_underflow_before_dispatch(
         let mut arguments = vec!["rtsp-backchannel", "capabilities", "--host", "camera.local"];
         arguments.extend(password_arguments);
         arguments.extend(["--timeout-ms", "0"]);
-        let diagnostic = parse_invocation_from(arguments).unwrap_err().to_string();
+        let diagnostic = parse_application_invocation_from(arguments)
+            .unwrap_err()
+            .to_string();
         assert!(!diagnostic.contains(secret));
     }
 
-    let known_flag = parse_invocation_from([
+    let known_flag = parse_application_invocation_from([
         "rtsp-backchannel",
         "capabilities",
         "--host",
@@ -548,6 +590,194 @@ fn capabilities_cli_rejects_unsafe_values_and_timeout_underflow_before_dispatch(
     .unwrap_err()
     .to_string();
     assert!(known_flag.contains("missing value for --pass"));
+}
+
+#[test]
+fn capabilities_cli_rejects_huge_finite_timeouts_at_parse_time() {
+    for timeout_arguments in [vec!["--timeout-ms", "1e22"], vec!["--timeout-ms=1e22"]] {
+        let mut arguments = vec!["rtsp-backchannel", "capabilities", "--host", "camera.local"];
+        arguments.extend(timeout_arguments);
+        let diagnostic = parse_application_invocation_from(arguments)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            diagnostic.contains("timeout-ms exceeds the platform timer range"),
+            "unexpected diagnostic: {diagnostic}"
+        );
+        assert!(!diagnostic.contains("1e22"));
+    }
+}
+
+#[test]
+fn capabilities_cli_huge_timeout_exits_without_panic_or_network_dispatch() {
+    for timeout_arguments in [vec!["--timeout-ms", "1e22"], vec!["--timeout-ms=1e22"]] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let device_url =
+            format!("http://huge-url-user:huge-url-pass@127.0.0.1:{port}/must-not-reach");
+        let (stop_sentinel, sentinel) = start_network_sentinel(listener);
+
+        let mut command = Command::new(env!("CARGO_BIN_EXE_rtsp-backchannel"));
+        command.args([
+            "capabilities",
+            "--host",
+            "camera.local",
+            "--pass",
+            "huge-password-secret",
+            "--device-url",
+            &device_url,
+        ]);
+        command.args(timeout_arguments);
+        command.env("ONVIF_PASSWORD", "huge-environment-secret");
+        let output = command_output_with_timeout(&mut command, Duration::from_secs(10));
+        let _ = stop_sentinel.send(());
+        let network_contacted = sentinel.join().unwrap();
+
+        assert!(!output.status.success());
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        let diagnostic = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            diagnostic.contains("timeout-ms exceeds the platform timer range"),
+            "unexpected diagnostic: {diagnostic}"
+        );
+        for reflected in [
+            "1e22",
+            "huge-url-user",
+            "huge-url-pass",
+            "huge-password-secret",
+            "huge-environment-secret",
+            "panicked",
+        ] {
+            assert!(!diagnostic.contains(reflected));
+        }
+        assert!(!network_contacted);
+    }
+}
+
+#[test]
+fn capabilities_cli_treats_bare_terminator_as_control_before_password_rewrite() {
+    let diagnostic = parse_application_invocation_from([
+        "rtsp-backchannel",
+        "capabilities",
+        "--host",
+        "camera.local",
+        "--pass",
+        "control-password-secret",
+        "--",
+    ])
+    .unwrap_err()
+    .to_string();
+    assert!(
+        diagnostic.contains("capabilities does not accept an argument terminator"),
+        "unexpected diagnostic: {diagnostic}"
+    );
+    assert!(!diagnostic.contains("control-password-secret"));
+
+    let diagnostic = parse_application_invocation_from([
+        "rtsp-backchannel",
+        "capabilities",
+        "--host",
+        "camera.local",
+        "--pass",
+        "--",
+        "--pass=trailing-equals-secret",
+    ])
+    .unwrap_err()
+    .to_string();
+
+    assert!(
+        diagnostic.contains("missing value for --pass"),
+        "unexpected diagnostic: {diagnostic}"
+    );
+    assert!(!diagnostic.contains("trailing-equals-secret"));
+}
+
+#[test]
+fn capabilities_cli_keeps_attached_double_dash_password_opaque() {
+    match parse_application_invocation_from([
+        "rtsp-backchannel",
+        "capabilities",
+        "--host",
+        "camera.local",
+        "--pass=--",
+    ])
+    .unwrap()
+    {
+        ApplicationInvocation::Capabilities(cli) => {
+            assert_eq!(cli.password.as_deref(), Some("--"));
+        }
+        _ => panic!("expected capabilities invocation"),
+    }
+}
+
+#[test]
+fn capabilities_cli_sanitizes_control_trailing_credentials_without_network_dispatch() {
+    let mut trailing_cases = vec![
+        vec![std::ffi::OsString::from("--pass=trailing-equals-secret")],
+        vec![
+            std::ffi::OsString::from("--pass"),
+            std::ffi::OsString::from("trailing-separate-secret"),
+        ],
+    ];
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+
+        trailing_cases.push(vec![std::ffi::OsString::from_vec(
+            b"\xffnon-utf8-trailing-secret".to_vec(),
+        )]);
+    }
+
+    for trailing_arguments in trailing_cases {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let device_url =
+            format!("http://control-url-user:control-url-pass@127.0.0.1:{port}/must-not-reach");
+        let (stop_sentinel, sentinel) = start_network_sentinel(listener);
+
+        let mut command = Command::new(env!("CARGO_BIN_EXE_rtsp-backchannel"));
+        command
+            .args([
+                "capabilities",
+                "--host",
+                "camera.local",
+                "--pass",
+                "control-password-secret",
+                "--device-url",
+                &device_url,
+                "--timeout-ms",
+                "50",
+                "--",
+            ])
+            .args(trailing_arguments)
+            .env("ONVIF_PASSWORD", "control-environment-secret");
+        let output = command_output_with_timeout(&mut command, Duration::from_secs(10));
+        let _ = stop_sentinel.send(());
+        let network_contacted = sentinel.join().unwrap();
+
+        assert!(!output.status.success());
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        let diagnostic = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            diagnostic.contains("capabilities does not accept an argument terminator"),
+            "unexpected diagnostic: {diagnostic}"
+        );
+        for reflected in [
+            "trailing-equals-secret",
+            "trailing-separate-secret",
+            "non-utf8-trailing-secret",
+            "control-url-user",
+            "control-url-pass",
+            "control-password-secret",
+            "control-environment-secret",
+        ] {
+            assert!(!diagnostic.contains(reflected));
+        }
+        assert!(!network_contacted);
+    }
 }
 
 #[test]
@@ -741,6 +971,8 @@ fn capabilities_cli_documentation_covers_native_report_and_hardened_semantics() 
     assert!(korean.contains("초기 연결 및 인증 실패는 치명적 오류"));
     assert!(korean.contains("camelCase JSON 객체를 정확히 한 줄"));
     assert!(korean.contains("서로 다른 포트와 경로는 허용"));
+    assert!(english.contains("platform timer range"));
+    assert!(korean.contains("플랫폼 타이머 범위"));
 }
 
 #[test]
@@ -1512,6 +1744,25 @@ fn command_output_with_timeout(command: &mut Command, timeout: Duration) -> std:
         }
         thread::sleep(Duration::from_millis(5));
     }
+}
+
+fn start_network_sentinel(listener: TcpListener) -> (mpsc::Sender<()>, thread::JoinHandle<bool>) {
+    listener.set_nonblocking(true).unwrap();
+    let (stop_sender, stop_receiver) = mpsc::channel();
+    let sentinel = thread::spawn(move || {
+        loop {
+            match listener.accept() {
+                Ok((_stream, _address)) => return true,
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                Err(error) => panic!("network sentinel failed: {error}"),
+            }
+            if stop_receiver.try_recv().is_ok() {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    });
+    (stop_sender, sentinel)
 }
 
 fn ok(body: String) -> CapabilityHttpResponse {

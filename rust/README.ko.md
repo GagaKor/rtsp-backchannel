@@ -314,10 +314,10 @@ rtsp-backchannel play \
 `capabilities` 명령은 상태 줄 없이 camelCase JSON 객체를 정확히 한 줄 출력하고 newline
 하나를 덧붙입니다. `--pass`를 생략하면 `ONVIF_PASSWORD`를 사용하며, 명시적인
 `--pass ""`는 환경변수를 빈 비밀번호로 덮어씁니다. 비어 있지 않은 `--device-url`을
-반복하면 입력 순서대로 시도합니다. `--timeout-ms`는 유한한 양의 decimal 밀리초를
-받아 0이 아닌 per-request `Duration`으로 변환하며, 생략하면 API 기본값 8초를
-유지합니다. 도움말과 입력 검증 실패는 네트워크를 열거나 credentials/environment
-값을 출력하지 않습니다.
+반복하면 입력 순서대로 시도합니다. `--timeout-ms`는 플랫폼 타이머 범위에 들어오는
+유한한 양의 decimal 밀리초를 받아 0이 아닌 per-request `Duration`으로 변환하며,
+생략하면 API 기본값 8초를 유지합니다. 도움말과 입력 검증 실패는 네트워크를 열거나
+credentials/environment 값을 출력하지 않습니다.
 
 하위 호환성을 위해 `play` 단어는 생략할 수 있습니다. 수동 실행에서는 `--pass`도
 사용할 수 있지만, `ONVIF_PASSWORD`를 사용하면 비밀번호가 프로세스 인자 목록에

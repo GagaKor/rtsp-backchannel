@@ -1,11 +1,15 @@
 use std::ffi::{OsStr, OsString};
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 
 use crate::audio::CodecPreference;
+
+const INVALID_TIMEOUT_ERROR: &str = "timeout-ms must be finite and greater than 0";
+const TIMEOUT_RANGE_ERROR: &str = "timeout-ms exceeds the platform timer range";
+const CAPABILITY_TERMINATOR_ERROR: &str = "capabilities does not accept an argument terminator";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -127,6 +131,13 @@ pub enum Invocation {
     Play(Cli),
     Discover(DiscoveryCli),
     Streams(StreamsCli),
+}
+
+#[derive(Debug)]
+pub enum ApplicationInvocation {
+    Play(Cli),
+    Discover(DiscoveryCli),
+    Streams(StreamsCli),
     Capabilities(CapabilitiesCli),
 }
 
@@ -149,11 +160,35 @@ where
     match command {
         Some("discover") => DiscoveryCli::try_parse_from(delegated(2)).map(Invocation::Discover),
         Some("streams") => StreamsCli::try_parse_from(delegated(2)).map(Invocation::Streams),
-        Some("capabilities") => normalize_capability_arguments(&arguments)
-            .and_then(CapabilitiesCli::try_parse_from)
-            .map(Invocation::Capabilities),
         Some("play") => Cli::try_parse_from(delegated(2)).map(Invocation::Play),
         _ => Cli::try_parse_from(arguments).map(Invocation::Play),
+    }
+}
+
+pub fn parse_application_invocation_from<I, T>(
+    arguments: I,
+) -> Result<ApplicationInvocation, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    let arguments: Vec<OsString> = arguments.into_iter().map(Into::into).collect();
+    if arguments.get(1).and_then(|value| value.to_str()) == Some("capabilities") {
+        normalize_capability_arguments(&arguments)
+            .and_then(CapabilitiesCli::try_parse_from)
+            .map(ApplicationInvocation::Capabilities)
+    } else {
+        parse_invocation_from(arguments).map(ApplicationInvocation::from)
+    }
+}
+
+impl From<Invocation> for ApplicationInvocation {
+    fn from(invocation: Invocation) -> Self {
+        match invocation {
+            Invocation::Play(cli) => Self::Play(cli),
+            Invocation::Discover(cli) => Self::Discover(cli),
+            Invocation::Streams(cli) => Self::Streams(cli),
+        }
     }
 }
 
@@ -194,7 +229,42 @@ fn missing_capability_value(option: &str) -> clap::Error {
     )
 }
 
+fn reject_platform_unsafe_timeout(value: &str) -> Result<(), clap::Error> {
+    if parse_timeout_ms(value).is_err_and(|error| error == TIMEOUT_RANGE_ERROR) {
+        return Err(clap::Error::raw(
+            clap::error::ErrorKind::InvalidValue,
+            TIMEOUT_RANGE_ERROR,
+        ));
+    }
+    Ok(())
+}
+
+fn reject_capability_terminator(arguments: &[OsString]) -> Result<(), clap::Error> {
+    let Some(index) = arguments
+        .iter()
+        .enumerate()
+        .skip(2)
+        .find_map(|(index, argument)| (argument == OsStr::new("--")).then_some(index))
+    else {
+        return Ok(());
+    };
+
+    if let Some(option) = index
+        .checked_sub(1)
+        .and_then(|previous| arguments.get(previous))
+        .and_then(|argument| exact_capability_option_name(argument))
+    {
+        return Err(missing_capability_value(option));
+    }
+
+    Err(clap::Error::raw(
+        clap::error::ErrorKind::InvalidValue,
+        CAPABILITY_TERMINATOR_ERROR,
+    ))
+}
+
 fn normalize_capability_arguments(arguments: &[OsString]) -> Result<Vec<OsString>, clap::Error> {
+    reject_capability_terminator(arguments)?;
     let mut normalized = vec![OsString::from("rtsp-backchannel capabilities")];
     let mut index = 2;
     while index < arguments.len() {
@@ -202,6 +272,9 @@ fn normalize_capability_arguments(arguments: &[OsString]) -> Result<Vec<OsString
         if let Some((option, value)) = attached_capability_option(argument) {
             if option != "pass" && value.starts_with('-') {
                 return Err(missing_capability_value(option));
+            }
+            if option == "timeout-ms" {
+                reject_platform_unsafe_timeout(value)?;
             }
             normalized.push(argument.clone());
             index += 1;
@@ -229,6 +302,11 @@ fn normalize_capability_arguments(arguments: &[OsString]) -> Result<Vec<OsString
         } else if value.to_string_lossy().starts_with('-') {
             return Err(missing_capability_value(option));
         }
+        if option == "timeout-ms" {
+            if let Some(value) = value.to_str() {
+                reject_platform_unsafe_timeout(value)?;
+            }
+        }
         normalized.push(argument.clone());
         index += 1;
     }
@@ -243,14 +321,21 @@ fn parse_nonempty_text(value: &str) -> Result<String, String> {
 }
 
 fn parse_positive_timeout_ms(value: &str) -> Result<Duration, String> {
-    let invalid = || "timeout-ms must be finite and greater than 0".to_owned();
-    let milliseconds = value.parse::<f64>().map_err(|_| invalid())?;
+    parse_timeout_ms(value).map_err(str::to_owned)
+}
+
+fn parse_timeout_ms(value: &str) -> Result<Duration, &'static str> {
+    let milliseconds = value.parse::<f64>().map_err(|_| INVALID_TIMEOUT_ERROR)?;
     if !milliseconds.is_finite() || milliseconds <= 0.0 {
-        return Err(invalid());
+        return Err(INVALID_TIMEOUT_ERROR);
     }
-    let timeout = Duration::try_from_secs_f64(milliseconds / 1000.0).map_err(|_| invalid())?;
+    let timeout =
+        Duration::try_from_secs_f64(milliseconds / 1000.0).map_err(|_| INVALID_TIMEOUT_ERROR)?;
     if timeout.is_zero() {
-        return Err(invalid());
+        return Err(INVALID_TIMEOUT_ERROR);
+    }
+    if Instant::now().checked_add(timeout).is_none() {
+        return Err(TIMEOUT_RANGE_ERROR);
     }
     Ok(timeout)
 }
