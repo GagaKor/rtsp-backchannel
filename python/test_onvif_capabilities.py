@@ -897,25 +897,28 @@ class OnvifCapabilityTransportTests(unittest.TestCase):
         self.assertRegex(requests[3][1], "wsse:Security")
         self.assertRegex(requests[4][1], "wsse:Security")
 
-    def test_connect_rejects_a_success_shaped_http_auth_response(self):
-        _OnvifFixtureHandler.device_information_status = 401
-        selected_url = (
-            f"http://127.0.0.1:{self.server.server_port}/selected/device"
-        )
-        device = OnvifDevice(
-            "camera",
-            "admin",
-            "password",
-            device_urls=[selected_url],
-        )
+    def test_connect_rejects_success_shaped_http_error_responses(self):
+        for status in (401, 403, 500):
+            with self.subTest(status=status):
+                _OnvifFixtureHandler.requests = []
+                _OnvifFixtureHandler.device_information_status = status
+                selected_url = (
+                    f"http://127.0.0.1:{self.server.server_port}/selected/device"
+                )
+                device = OnvifDevice(
+                    "camera",
+                    "admin",
+                    "password",
+                    device_urls=[selected_url],
+                )
 
-        with self.assertRaisesRegex(RuntimeError, "ONVIF connect failed"):
-            device.connect()
+                with self.assertRaisesRegex(RuntimeError, "ONVIF connect failed"):
+                    device.connect()
 
-        self.assertEqual(
-            [path for path, _ in _OnvifFixtureHandler.requests],
-            ["/selected/device", "/selected/device"],
-        )
+                self.assertEqual(
+                    [path for path, _ in _OnvifFixtureHandler.requests],
+                    ["/selected/device", "/selected/device"],
+                )
 
     def test_rejects_unsafe_service_urls_before_wsse_or_network(self):
         device = OnvifDevice("camera", "viewer", "camera-secret")

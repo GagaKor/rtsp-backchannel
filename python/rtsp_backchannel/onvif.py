@@ -814,6 +814,8 @@ class OnvifDevice:
         assert isinstance(response, _SoapResponse)
         if response.status_code in (401, 403):
             raise RuntimeError("ONVIF authentication failed")
+        if not 200 <= response.status_code < 300:
+            raise RuntimeError(f"HTTP {response.status_code}")
         return response
 
     def _system_time(self, url: str) -> datetime.datetime:
