@@ -28,6 +28,7 @@ const PTZ_NS = 'http://www.onvif.org/ver20/ptz/wsdl';
 const EVENTS_NS = 'http://www.onvif.org/ver10/events/wsdl';
 const WSTOP_NS = 'http://docs.oasis-open.org/wsn/t-1';
 const TOPICS_NS = 'http://www.onvif.org/ver10/topics';
+const NBSP = '\u00a0';
 
 const GET_SCOPES = `<GetScopes xmlns="${DEV_NS}"/>`;
 const GET_SERVICES = `<GetServices xmlns="${DEV_NS}"><IncludeCapability>true</IncludeCapability></GetServices>`;
@@ -140,6 +141,24 @@ test('accepts signed xs:int service versions but omits negative and out-of-range
     { namespace: 'urn:overflow', xaddr: 'http://camera/overflow' },
     { namespace: 'urn:plus', xaddr: 'http://camera/plus', version: { major: 1, minor: 2 } },
     { namespace: 'urn:underflow', xaddr: 'http://camera/underflow' },
+  ]);
+});
+
+test('accepts only XML whitespace around integer version elements', () => {
+  const parsed = parseServicesResponse(soap(`
+    <tds:GetServicesResponse>
+      <tds:Service><tds:Namespace>urn:nbsp</tds:Namespace><tds:XAddr>http://camera/nbsp</tds:XAddr>
+        <tds:Version><tt:Major>${NBSP}+1${NBSP}</tt:Major><tt:Minor>2</tt:Minor></tds:Version>
+      </tds:Service>
+      <tds:Service><tds:Namespace>urn:xml-space</tds:Namespace><tds:XAddr>http://camera/xml-space</tds:XAddr>
+        <tds:Version><tt:Major> \t+1\r\n</tt:Major><tt:Minor>\n+2\t</tt:Minor></tds:Version>
+      </tds:Service>
+    </tds:GetServicesResponse>
+  `));
+
+  assert.deepEqual(parsed.services, [
+    { namespace: 'urn:nbsp', xaddr: 'http://camera/nbsp' },
+    { namespace: 'urn:xml-space', xaddr: 'http://camera/xml-space', version: { major: 1, minor: 2 } },
   ]);
 });
 
@@ -334,6 +353,18 @@ test('rejects uppercase and mixed-case XML Schema boolean lexical forms', () => 
   `)), {});
 });
 
+test('accepts only XML whitespace around boolean attributes', () => {
+  assert.deepEqual(parsePtzServiceCapabilitiesResponse(soap(`
+    <tptz:GetServiceCapabilitiesResponse>
+      <tptz:Capabilities EFlip="${NBSP}true${NBSP}" Reverse=" \tfalse\r\n"
+        MoveStatus="\n1\t"/>
+    </tptz:GetServiceCapabilitiesResponse>
+  `)), {
+    reverse: false,
+    moveStatus: true,
+  });
+});
+
 test('keeps PTZ movement spaces distinct across multiple nodes and zoom-only nodes', () => {
   const parsed = parsePtzNodesResponse(soap(`
     <tptz:GetNodesResponse>
@@ -438,6 +469,30 @@ test('applies xs:int lexical and range rules before nonnegative PTZ preset seman
   ]);
 });
 
+test('accepts only XML whitespace around typed PTZ element values', () => {
+  const parsed = parsePtzNodesResponse(soap(`
+    <tptz:GetNodesResponse>
+      <tptz:PTZNode token="nbsp"><tt:SupportedPTZSpaces/>
+        <tt:MaximumNumberOfPresets>${NBSP}+1${NBSP}</tt:MaximumNumberOfPresets>
+        <tt:HomeSupported>${NBSP}true${NBSP}</tt:HomeSupported>
+      </tptz:PTZNode>
+      <tptz:PTZNode token="xml-space"><tt:SupportedPTZSpaces/>
+        <tt:MaximumNumberOfPresets> \t+2\r\n</tt:MaximumNumberOfPresets>
+        <tt:HomeSupported>\nfalse\t</tt:HomeSupported>
+      </tptz:PTZNode>
+    </tptz:GetNodesResponse>
+  `));
+
+  assert.deepEqual(parsed.nodes.map((node) => ({
+    token: node.token,
+    maximumPresets: node.maximumPresets,
+    homeSupported: node.homeSupported,
+  })), [
+    { token: 'nbsp', maximumPresets: undefined, homeSupported: undefined },
+    { token: 'xml-space', maximumPresets: 2, homeSupported: false },
+  ]);
+});
+
 test('parses modern Event attributes strictly and merges them over legacy fields', () => {
   const modern = parseEventServiceCapabilitiesResponse(soap(`
     <tev:GetServiceCapabilitiesResponse><tev:Capabilities
@@ -487,6 +542,32 @@ test('accepts signed xs:int counts and omits negative or out-of-range values', (
     </tev:GetServiceCapabilitiesResponse>
   `)), {
     maxPullPoints: 2147483647,
+  });
+});
+
+test('accepts only XML whitespace around integer capability attributes', () => {
+  assert.deepEqual(parseEventServiceCapabilitiesResponse(soap(`
+    <tev:GetServiceCapabilitiesResponse><tev:Capabilities
+      MaxNotificationProducers="${NBSP}+1${NBSP}" MaxPullPoints=" \t+2\r\n"
+      MaxEventBrokers="\n3\t"/>
+    </tev:GetServiceCapabilitiesResponse>
+  `)), {
+    maxPullPoints: 2,
+    maxEventBrokers: 3,
+  });
+});
+
+test('accepts only XML whitespace around legacy boolean elements', () => {
+  const parsed = parseCapabilitiesResponse(soap(`
+    <tds:GetCapabilitiesResponse><tds:Capabilities><tt:Events>
+      <tt:XAddr>http://camera/events</tt:XAddr>
+      <tt:WSSubscriptionPolicySupport>${NBSP}true${NBSP}</tt:WSSubscriptionPolicySupport>
+      <tt:WSPullPointSupport> \ttrue\r\n</tt:WSPullPointSupport>
+    </tt:Events></tds:Capabilities></tds:GetCapabilitiesResponse>
+  `));
+
+  assert.deepEqual(parsed.eventServiceCapabilities, {
+    wsPullPointSupport: true,
   });
 });
 

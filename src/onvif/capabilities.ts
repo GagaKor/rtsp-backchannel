@@ -153,9 +153,16 @@ function compareText(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
+function normalizeXmlScalarWhitespace(value: string): string {
+  return value
+    .replace(/[\x20\t\r\n]+/g, ' ')
+    .replace(/^ +/, '')
+    .replace(/ +$/, '');
+}
+
 function strictBoolean(value: string | undefined): boolean | undefined {
   if (value === undefined) return undefined;
-  switch (value.trim()) {
+  switch (normalizeXmlScalarWhitespace(value)) {
     case 'true':
     case '1':
       return true;
@@ -168,8 +175,10 @@ function strictBoolean(value: string | undefined): boolean | undefined {
 }
 
 function strictInteger(value: string | undefined): number | undefined {
-  if (value === undefined || !/^[+-]?\d+$/.test(value.trim())) return undefined;
-  const parsed = Number(value.trim());
+  if (value === undefined) return undefined;
+  const normalized = normalizeXmlScalarWhitespace(value);
+  if (!/^[+-]?\d+$/.test(normalized)) return undefined;
+  const parsed = Number(normalized);
   if (parsed < -2_147_483_648 || parsed > 2_147_483_647) return undefined;
   return parsed === 0 ? 0 : parsed;
 }
@@ -290,7 +299,7 @@ function eventCapabilitiesFromChildren(node: XmlElement): EventServiceCapabiliti
   ];
   const result: EventServiceCapabilities = {};
   for (const [elementName, property] of fields) {
-    const value = strictBoolean(textOf(firstChild(node, SCHEMA_NS, elementName)));
+    const value = strictBoolean(firstChild(node, SCHEMA_NS, elementName)?.text);
     if (value !== undefined) Object.assign(result, { [property]: value });
   }
   return result;
@@ -347,10 +356,10 @@ export function parseServicesResponse(xml: string): ParsedServiceDiscovery {
     if (!namespace || !xaddr) continue;
     const versionNode = firstChild(source, DEV_NS, 'Version');
     const major = strictNonNegativeInteger(
-      versionNode ? textOf(firstChild(versionNode, SCHEMA_NS, 'Major')) : undefined,
+      versionNode ? firstChild(versionNode, SCHEMA_NS, 'Major')?.text : undefined,
     );
     const minor = strictNonNegativeInteger(
-      versionNode ? textOf(firstChild(versionNode, SCHEMA_NS, 'Minor')) : undefined,
+      versionNode ? firstChild(versionNode, SCHEMA_NS, 'Minor')?.text : undefined,
     );
     const service: CameraCapabilityService = {
       namespace,
@@ -579,10 +588,10 @@ export function parsePtzNodesResponse(xml: string): ParsedPtzNodes {
       spaces[property] = Boolean(firstChild(supported, SCHEMA_NS, elementName));
     }
     const maximumPresets = strictNonNegativeInteger(
-      textOf(firstChild(node, SCHEMA_NS, 'MaximumNumberOfPresets')),
+      firstChild(node, SCHEMA_NS, 'MaximumNumberOfPresets')?.text,
     );
     const homeSupported = strictBoolean(
-      textOf(firstChild(node, SCHEMA_NS, 'HomeSupported')),
+      firstChild(node, SCHEMA_NS, 'HomeSupported')?.text,
     );
     const auxiliaryCommands = [...new Set(
       childElements(node, SCHEMA_NS, 'AuxiliaryCommands')
