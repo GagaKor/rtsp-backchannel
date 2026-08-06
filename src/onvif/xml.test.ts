@@ -106,6 +106,32 @@ test('allows declaration-like text inside CDATA', () => {
   assert.equal(textOf(root), '<!ENTITY harmless>');
 });
 
+test('allows declaration-like text inside a processing instruction', () => {
+  const root = parseXml('<root><?note <!DOCTYPE harmless>?></root>');
+
+  assert.equal(root.local, 'root');
+});
+
+test('does not let a fake comment marker in a processing instruction hide a real DOCTYPE', () => {
+  assert.throws(
+    () => parseXml(
+      '<?note <!-- fake?><!DOCTYPE camera SYSTEM "https://example.invalid/camera.dtd">'
+      + '<!-- --><camera/>',
+    ),
+    { name: 'Error', message: 'DTD and entity declarations are not allowed' },
+  );
+});
+
+test('does not let a fake CDATA marker in a processing instruction hide a real DOCTYPE', () => {
+  assert.throws(
+    () => parseXml(
+      '<?note <![CDATA[ fake?><!DOCTYPE camera SYSTEM "https://example.invalid/camera.dtd">'
+      + '<camera><![CDATA[safe]]></camera>',
+    ),
+    { name: 'Error', message: 'DTD and entity declarations are not allowed' },
+  );
+});
+
 test('rejects DOCTYPE and ENTITY declarations before parsing', () => {
   const forbidden = [
     '<!DOCTYPE camera SYSTEM "https://example.invalid/camera.dtd"><camera/>',

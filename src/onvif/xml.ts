@@ -19,37 +19,68 @@ function isAsciiWordCharacter(character: string | undefined): boolean {
 }
 
 function containsForbiddenDeclaration(xml: string): boolean {
+  let state: 'document' | 'processing-instruction' | 'comment' | 'cdata' = 'document';
   let cursor = 0;
   while (cursor < xml.length) {
-    const declarationStart = xml.indexOf('<!', cursor);
-    if (declarationStart === -1) return false;
-
-    if (xml.startsWith('<!--', declarationStart)) {
-      const commentEnd = xml.indexOf('-->', declarationStart + 4);
-      if (commentEnd === -1) return false;
-      cursor = commentEnd + 3;
+    if (state === 'processing-instruction') {
+      if (xml.startsWith('?>', cursor)) {
+        state = 'document';
+        cursor += 2;
+      } else {
+        cursor++;
+      }
       continue;
     }
 
-    if (xml.startsWith('<![CDATA[', declarationStart)) {
-      const cdataEnd = xml.indexOf(']]>', declarationStart + 9);
-      if (cdataEnd === -1) return false;
-      cursor = cdataEnd + 3;
+    if (state === 'comment') {
+      if (xml.startsWith('-->', cursor)) {
+        state = 'document';
+        cursor += 3;
+      } else {
+        cursor++;
+      }
       continue;
     }
 
-    let nameStart = declarationStart + 2;
-    while (isXmlWhitespace(xml[nameStart])) nameStart++;
-    for (const name of FORBIDDEN_DECLARATION_NAMES) {
-      const candidate = xml.slice(nameStart, nameStart + name.length);
-      if (
-        candidate.toUpperCase() === name
-        && !isAsciiWordCharacter(xml[nameStart + name.length])
-      ) {
-        return true;
+    if (state === 'cdata') {
+      if (xml.startsWith(']]>', cursor)) {
+        state = 'document';
+        cursor += 3;
+      } else {
+        cursor++;
+      }
+      continue;
+    }
+
+    if (xml.startsWith('<?', cursor)) {
+      state = 'processing-instruction';
+      cursor += 2;
+      continue;
+    }
+    if (xml.startsWith('<!--', cursor)) {
+      state = 'comment';
+      cursor += 4;
+      continue;
+    }
+    if (xml.startsWith('<![CDATA[', cursor)) {
+      state = 'cdata';
+      cursor += 9;
+      continue;
+    }
+    if (xml.startsWith('<!', cursor)) {
+      let nameStart = cursor + 2;
+      while (isXmlWhitespace(xml[nameStart])) nameStart++;
+      for (const name of FORBIDDEN_DECLARATION_NAMES) {
+        const candidate = xml.slice(nameStart, nameStart + name.length);
+        if (
+          candidate.toUpperCase() === name
+          && !isAsciiWordCharacter(xml[nameStart + name.length])
+        ) {
+          return true;
+        }
       }
     }
-    cursor = declarationStart + 2;
+    cursor++;
   }
   return false;
 }
