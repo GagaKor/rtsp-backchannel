@@ -11,6 +11,19 @@ from .onvif import discover_devices, get_stream_uris
 from .playback import play_file
 
 
+_MAX_CAPABILITY_TIMEOUT_MS = 86_400_000.0
+_CAPABILITY_TERMINATOR_ERROR = (
+    "capabilities does not accept an argument terminator"
+)
+_CAPABILITY_OPTION_NAMES = (
+    "host",
+    "user",
+    "pass",
+    "device-url",
+    "timeout-ms",
+)
+
+
 def _volume(value):
     try:
         volume = float(value)
@@ -171,7 +184,55 @@ def _positive_finite_number(value):
         raise argparse.ArgumentTypeError(
             "timeout-ms must be finite and greater than 0"
         )
+    if parsed > _MAX_CAPABILITY_TIMEOUT_MS:
+        raise argparse.ArgumentTypeError(
+            "timeout-ms exceeds the 24-hour maximum"
+        )
     return parsed
+
+
+def _capability_option_name(value):
+    for name in _CAPABILITY_OPTION_NAMES:
+        if value == f"--{name}":
+            return name
+    return None
+
+
+def _is_known_capability_flag(value):
+    return value in ("-h", "--help") or any(
+        value == f"--{name}" or value.startswith(f"--{name}=")
+        for name in _CAPABILITY_OPTION_NAMES
+    )
+
+
+def _normalize_capability_arguments(arguments, parser):
+    if "--" in arguments:
+        index = arguments.index("--")
+        previous = arguments[index - 1] if index else None
+        option = _capability_option_name(previous)
+        if option is not None:
+            parser.error(f"missing value for --{option}")
+        parser.error(_CAPABILITY_TERMINATOR_ERROR)
+
+    normalized = []
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument != "--pass":
+            normalized.append(argument)
+            index += 1
+            continue
+        if index + 1 >= len(arguments):
+            parser.error("missing value for --pass")
+        value = arguments[index + 1]
+        if _is_known_capability_flag(value):
+            parser.error("missing value for --pass")
+        if value.startswith("-"):
+            normalized.append(f"--pass={value}")
+        else:
+            normalized.extend((argument, value))
+        index += 2
+    return normalized
 
 
 def _capabilities_parser():
@@ -202,7 +263,10 @@ def _capabilities_parser():
         "--timeout-ms",
         type=_positive_finite_number,
         default=None,
-        help="finite positive per-request timeout in milliseconds",
+        help=(
+            "finite positive per-request timeout in milliseconds "
+            "(maximum: 24 hours)"
+        ),
     )
     return parser
 
@@ -411,7 +475,9 @@ def main(argv=None):
             print(json.dumps(_stream_json(stream), ensure_ascii=False))
         return
     if arguments[:1] == ["capabilities"]:
-        args = _capabilities_parser().parse_args(arguments[1:])
+        parser = _capabilities_parser()
+        normalized = _normalize_capability_arguments(arguments[1:], parser)
+        args = parser.parse_args(normalized)
         capability_options = dict(
             host=args.host,
             user=args.user,

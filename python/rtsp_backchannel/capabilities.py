@@ -27,6 +27,11 @@ _PTZ_NS = "http://www.onvif.org/ver20/ptz/wsdl"
 _EVENTS_NS = "http://www.onvif.org/ver10/events/wsdl"
 _WSTOP_NS = "http://docs.oasis-open.org/wsn/t-1"
 
+_MAX_EVENT_TOPICS = 1024
+_MAX_EVENT_TOPIC_PATH_BYTES = 4096
+_MAX_EVENT_TOPIC_NAMESPACE_BYTES = 2048
+_MAX_EVENT_TOPIC_RETAINED_BYTES = 256 * 1024
+
 _AUTH_FAULT_PATTERNS = (
     (
         "NotAuthorized",
@@ -300,38 +305,57 @@ def _strict_nonnegative_int32(value: str | None) -> int | None:
     return parsed
 
 
-def _safe_fault_code(value: str | None) -> str | None:
+def _canonical_protocol_fault_code(
+    value: str | None, soap_ns: str
+) -> str | None:
     normalized = _xml_scalar(value)
     if not normalized:
         return None
     local = normalized.rsplit(":", 1)[-1]
-    if re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", local):
-        return local
-    return None
+    allowed = ["ActionNotSupported"]
+    if soap_ns == _SOAP11_NS:
+        allowed.extend(("VersionMismatch", "MustUnderstand", "Client", "Server"))
+    elif soap_ns == _SOAP12_NS:
+        allowed.extend(
+            (
+                "VersionMismatch",
+                "MustUnderstand",
+                "DataEncodingUnknown",
+                "Sender",
+                "Receiver",
+            )
+        )
+    return next(
+        (
+            canonical
+            for canonical in allowed
+            if local.casefold() == canonical.casefold()
+        ),
+        None,
+    )
 
 
 def _canonical_fault_code(
-    values: tuple[str | None, ...], fallback: str | None
+    values: tuple[str | None, ...], deepest_code: str | None, soap_ns: str
 ) -> str:
     joined = " ".join(_xml_scalar(value) or "" for value in values)
     for canonical, pattern in _AUTH_FAULT_PATTERNS:
         if re.search(pattern, joined, re.IGNORECASE):
             return canonical
-    return fallback or "Fault"
+    return _canonical_protocol_fault_code(deepest_code, soap_ns) or "Fault"
 
 
 def _raise_fault(fault: ElementTree.Element, soap_ns: str) -> None:
     values: list[str | None] = []
-    fallback: str | None = None
+    deepest_code: str | None = None
     if soap_ns == _SOAP12_NS:
         code = _child(fault, soap_ns, "Code")
         while code is not None:
             value = _child(code, soap_ns, "Value")
             text = value.text if value is not None else None
             values.append(text)
-            safe = _safe_fault_code(text)
-            if safe:
-                fallback = safe
+            if text is not None:
+                deepest_code = text
             code = _child(code, soap_ns, "Subcode")
         reason = _child(fault, soap_ns, "Reason")
         if reason is not None:
@@ -347,8 +371,8 @@ def _raise_fault(fault: ElementTree.Element, soap_ns: str) -> None:
                 reason.text if reason is not None else None,
             )
         )
-        fallback = _safe_fault_code(values[0])
-    canonical = _canonical_fault_code(tuple(values), fallback)
+        deepest_code = values[0]
+    canonical = _canonical_fault_code(tuple(values), deepest_code, soap_ns)
     raise _OnvifResponseError(
         "fault", f"SOAP Fault: {canonical}", fault_code=canonical
     )
@@ -847,7 +871,8 @@ def _parse_event_properties_response(
         raise _OnvifResponseError(
             "invalid", "invalid Events GetEventProperties response"
         )
-    topics: list[EventTopic] = []
+    topics: dict[tuple[str, str | None], EventTopic] = {}
+    retained_bytes = 0
     path: list[str] = []
     stack: list[tuple[ElementTree.Element, bool]] = [
         (item, False) for item in reversed(list(topic_set))
@@ -860,18 +885,40 @@ def _parse_event_properties_response(
         namespace, local = _tag_parts(element.tag)
         path.append(local)
         if _strict_bool(element.attrib.get(f"{{{_WSTOP_NS}}}topic")) is True:
-            topics.append(
-                EventTopic(namespace=namespace or None, path="/".join(path))
-            )
+            retained_path = "/".join(path)
+            retained_namespace = namespace or None
+            path_bytes = len(retained_path.encode("utf-8"))
+            namespace_bytes = len(namespace.encode("utf-8"))
+            if (
+                path_bytes > _MAX_EVENT_TOPIC_PATH_BYTES
+                or namespace_bytes > _MAX_EVENT_TOPIC_NAMESPACE_BYTES
+            ):
+                raise _OnvifResponseError(
+                    "invalid",
+                    "invalid Events GetEventProperties response",
+                )
+            key = (retained_path, retained_namespace)
+            if key not in topics:
+                topic_bytes = path_bytes + namespace_bytes
+                if (
+                    len(topics) >= _MAX_EVENT_TOPICS
+                    or retained_bytes + topic_bytes
+                    > _MAX_EVENT_TOPIC_RETAINED_BYTES
+                ):
+                    raise _OnvifResponseError(
+                        "invalid",
+                        "invalid Events GetEventProperties response",
+                    )
+                retained_bytes += topic_bytes
+                topics[key] = EventTopic(
+                    namespace=retained_namespace,
+                    path=retained_path,
+                )
         stack.append((element, True))
         stack.extend((item, False) for item in reversed(list(element)))
-    unique = {
-        (topic.path, topic.namespace): topic
-        for topic in topics
-    }
     return tuple(
         sorted(
-            unique.values(),
+            topics.values(),
             key=lambda topic: (topic.path, topic.namespace or ""),
         )
     )
@@ -953,6 +1000,8 @@ def _sanitized_warning_message(error: BaseException) -> str:
     if isinstance(error, _OnvifResponseError):
         return str(error)
     message = str(error)
+    if message == "invalid ONVIF service URL":
+        return message
     if re.search(r"timeout|timed out|deadline", message, re.IGNORECASE):
         return "request timeout"
     if re.search(r"response body exceeds", message, re.IGNORECASE):

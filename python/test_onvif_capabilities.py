@@ -686,7 +686,50 @@ class CapabilityOrchestrationTests(unittest.TestCase):
         report, _ = self._run_with_fake(fake, host="camera")
 
         self.assertEqual(report.service_discovery, "getCapabilities")
-        self.assertEqual(report.warnings[0].message, "SOAP Fault: UnauthorizedOperation")
+        self.assertEqual(report.warnings[0].message, "SOAP Fault: Fault")
+
+    def test_event_topic_budget_failure_is_a_sanitized_warning_with_unknown_topics(self):
+        overflow_topics = "".join(
+            f'<vendor:T{index:04} wstop:topic="true"/>'
+            for index in range(1025)
+        )
+
+        def respond(body, endpoint):
+            if body == GET_SCOPES:
+                return raw_response("<tds:GetScopesResponse/>")
+            if body == GET_SERVICES:
+                return raw_response(
+                    "<tds:GetServicesResponse>"
+                    + service(EVENTS_NS, "http://camera/events")
+                    + "</tds:GetServicesResponse>"
+                )
+            if body == MEDIA1_GET_PROFILES:
+                return raw_response("<trt:GetProfilesResponse/>")
+            if body == EVENTS_GET_CAPABILITIES:
+                return raw_response(
+                    "<tev:GetServiceCapabilitiesResponse>"
+                    "<tev:Capabilities/>"
+                    "</tev:GetServiceCapabilitiesResponse>"
+                )
+            if body == EVENTS_GET_PROPERTIES:
+                return raw_response(
+                    "<tev:GetEventPropertiesResponse><wstop:TopicSet>"
+                    + overflow_topics
+                    + "</wstop:TopicSet></tev:GetEventPropertiesResponse>"
+                )
+            raise AssertionError(body)
+
+        fake = FakeCapabilityDevice(respond)
+        report, _ = self._run_with_fake(fake, host="camera")
+
+        self.assertEqual(report.events.topics, ())
+        self.assertIn(
+            CameraCapabilityWarning(
+                "Events GetEventProperties",
+                "invalid Events GetEventProperties response",
+            ),
+            report.warnings,
+        )
 
     def test_connect_failure_is_fatal_before_any_capability_request(self):
         class ConnectFailureDevice(FakeCapabilityDevice):
@@ -984,6 +1027,9 @@ class _OnvifFixtureHandler(http.server.BaseHTTPRequestHandler):
     requests = []
     device_information_status = 200
     forbidden_declaration_stage = None
+    connected_media_xaddr = None
+    capability_service_xaddr = None
+    capability_legacy_fallback = False
 
     def log_message(self, format, *args):
         return
@@ -1014,10 +1060,40 @@ class _OnvifFixtureHandler(http.server.BaseHTTPRequestHandler):
         elif "<Category>Media</Category>" in body:
             stage = "media-capabilities"
             port = self.server.server_port
+            media_xaddr = type(self).connected_media_xaddr or (
+                f"http://127.0.0.1:{port}/advertised/media"
+            )
             payload = soap(
                 "<tds:GetCapabilitiesResponse><tds:Capabilities><tt:Media><tt:XAddr>"
-                f"http://127.0.0.1:{port}/advertised/media"
+                f"{media_xaddr}"
                 "</tt:XAddr></tt:Media></tds:Capabilities></tds:GetCapabilitiesResponse>"
+            )
+            status = 200
+        elif "GetServices" in body and type(self).capability_service_xaddr:
+            stage = None
+            if type(self).capability_legacy_fallback:
+                payload = soap("<tds:GetServicesResponse/>")
+            else:
+                payload = soap(
+                    "<tds:GetServicesResponse>"
+                    + service(
+                        MEDIA1_NS,
+                        type(self).capability_service_xaddr,
+                    )
+                    + "</tds:GetServicesResponse>"
+                )
+            status = 200
+        elif (
+            "<Category>All</Category>" in body
+            and type(self).capability_service_xaddr
+        ):
+            stage = None
+            payload = soap(
+                "<tds:GetCapabilitiesResponse><tds:Capabilities>"
+                "<tt:Media><tt:XAddr>"
+                f"{type(self).capability_service_xaddr}"
+                "</tt:XAddr></tt:Media></tds:Capabilities>"
+                "</tds:GetCapabilitiesResponse>"
             )
             status = 200
         elif self.path == "/auth-fault":
@@ -1072,6 +1148,9 @@ class OnvifCapabilityTransportTests(unittest.TestCase):
         _OnvifFixtureHandler.requests = []
         _OnvifFixtureHandler.device_information_status = 200
         _OnvifFixtureHandler.forbidden_declaration_stage = None
+        _OnvifFixtureHandler.connected_media_xaddr = None
+        _OnvifFixtureHandler.capability_service_xaddr = None
+        _OnvifFixtureHandler.capability_legacy_fallback = False
         self.server = http.server.ThreadingHTTPServer(
             ("127.0.0.1", 0), _OnvifFixtureHandler
         )
@@ -1214,19 +1293,161 @@ class OnvifCapabilityTransportTests(unittest.TestCase):
             json.dumps(messages), "viewer|camera-secret|url-secret|must-not-reach"
         )
 
-    def test_allows_an_advertised_endpoint_on_a_different_host(self):
+    def test_rejects_a_connected_cross_origin_endpoint_before_wsse_or_network(self):
         device = OnvifDevice("connected-camera", "admin", "password")
         device.device_url = "http://connected-camera.invalid/onvif/device_service"
         endpoint = f"http://127.0.0.1:{self.server.server_port}/foreign-service"
 
-        response = device.read_only_call(GET_SCOPES, endpoint)
+        with patch.object(
+            onvif, "_wsse_header", wraps=onvif._wsse_header
+        ) as wsse:
+            with self.assertRaisesRegex(
+                RuntimeError, "^invalid ONVIF service URL$"
+            ):
+                device.read_only_call(GET_SCOPES, endpoint)
 
-        self.assertEqual(response.status_code, 200)
-        self.assertRegex(response.xml, "GetScopesResponse")
-        self.assertEqual(
-            [path for path, _ in _OnvifFixtureHandler.requests],
-            ["/foreign-service"],
+        self.assertEqual(wsse.call_count, 0)
+        self.assertEqual(_OnvifFixtureHandler.requests, [])
+
+    def test_connect_rejects_media_xaddr_outside_the_selected_device_origin(self):
+        port = self.server.server_port
+        _OnvifFixtureHandler.connected_media_xaddr = (
+            f"https://127.0.0.1:{port}/advertised/media"
         )
+        device = OnvifDevice(
+            "camera",
+            "admin",
+            "password",
+            device_urls=[f"http://127.0.0.1:{port}/selected/device"],
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "^ONVIF connect failed$"):
+            device.connect()
+
+        self.assertIsNone(device.device_url)
+        self.assertIsNone(device.media_url)
+        self.assertEqual(len(_OnvifFixtureHandler.requests), 3)
+
+    def test_service_origin_binding_canonicalizes_hosts_and_allows_ports_and_paths(self):
+        allowed = (
+            (
+                "https://Camera.Example./onvif/device_service",
+                "https://camera.example:8443/vendor/media?opaque=value",
+            ),
+            ("http://127.0.0.1:80/device", "http://127.0.0.1:9000/media"),
+            ("http://127.1/device", "http://127.0.0.1:9000/media"),
+            ("http://[0:0:0:0:0:0:0:1]/device", "http://[::1]:9000/media"),
+        )
+        rejected = (
+            (
+                "https://camera.example/device",
+                "http://camera.example/media",
+            ),
+            (
+                "https://camera.example/device",
+                "https://other.example/media",
+            ),
+            ("https://camera.example/device", "https://127.0.0.1/media"),
+            ("http://127.0.0.1/device", "http://127.0.0.2/media"),
+            ("http://[::1]/device", "http://[::2]/media"),
+            ("http://4294967296/device", "http://0.0.0.0/media"),
+        )
+
+        with (
+            patch.object(
+                onvif,
+                "_soap_response",
+                return_value=onvif._SoapResponse(200, soap("<tds:GetScopesResponse/>")),
+            ) as request,
+            patch.object(
+                onvif, "_wsse_header", return_value="<security/>"
+            ) as wsse,
+        ):
+            for device_url, endpoint in allowed:
+                with self.subTest(kind="allowed", endpoint=endpoint):
+                    device = OnvifDevice("camera", "admin", "password")
+                    device.device_url = device_url
+                    device.read_only_call(GET_SCOPES, endpoint)
+            allowed_calls = request.call_count
+            allowed_wsse = wsse.call_count
+            for device_url, endpoint in rejected:
+                with self.subTest(kind="rejected", endpoint=endpoint):
+                    device = OnvifDevice("camera", "admin", "password")
+                    device.device_url = device_url
+                    with self.assertRaisesRegex(
+                        RuntimeError, "^invalid ONVIF service URL$"
+                    ):
+                        device.read_only_call(GET_SCOPES, endpoint)
+
+        self.assertEqual(allowed_calls, len(allowed))
+        self.assertEqual(allowed_wsse, len(allowed))
+        self.assertEqual(request.call_count, len(allowed))
+        self.assertEqual(wsse.call_count, len(allowed))
+
+    def test_cross_origin_discovered_service_is_retained_warned_and_never_contacted(self):
+        class AttackerHandler(http.server.BaseHTTPRequestHandler):
+            requests = []
+
+            def log_message(self, format, *args):
+                return
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                type(self).requests.append(self.rfile.read(length))
+                payload = soap("<trt:GetProfilesResponse/>").encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+        attacker = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), AttackerHandler
+        )
+        attacker_thread = threading.Thread(
+            target=attacker.serve_forever, daemon=True
+        )
+        attacker_thread.start()
+        attacker_xaddr = (
+            f"http://localhost:{attacker.server_port}/must-not-reach"
+        )
+        _OnvifFixtureHandler.capability_service_xaddr = attacker_xaddr
+        selected_url = (
+            f"http://127.0.0.1:{self.server.server_port}/selected/device"
+        )
+
+        try:
+            for legacy_fallback in (False, True):
+                with self.subTest(legacy_fallback=legacy_fallback):
+                    AttackerHandler.requests = []
+                    _OnvifFixtureHandler.requests = []
+                    _OnvifFixtureHandler.capability_legacy_fallback = (
+                        legacy_fallback
+                    )
+                    report = get_camera_capabilities(
+                        host="camera",
+                        user="admin",
+                        password="camera-secret",
+                        device_urls=[selected_url],
+                        timeout=2.0,
+                    )
+
+                    self.assertEqual(AttackerHandler.requests, [])
+                    self.assertEqual(report.services[0].xaddr, attacker_xaddr)
+                    self.assertEqual(
+                        report.service_discovery,
+                        "getCapabilities" if legacy_fallback else "getServices",
+                    )
+                    self.assertIn(
+                        CameraCapabilityWarning(
+                            "Media1 GetProfiles",
+                            "invalid ONVIF service URL",
+                        ),
+                        report.warnings,
+                    )
+        finally:
+            attacker.shutdown()
+            attacker.server_close()
+            attacker_thread.join(timeout=2)
 
     def test_connect_failure_does_not_expose_credential_like_candidates(self):
         devices = (
@@ -1532,15 +1753,75 @@ class CapabilityProtocolParserTests(unittest.TestCase):
         self.assertEqual(caught.exception.fault_code, "NotAuthorized")
         self.assertNotIn("detail marker", str(caught.exception))
 
-        for code in ("NotAuthorized2", "foo.NotAuthorized"):
+        for code in (
+            "UnauthorizedOperation",
+            "NotAuthorized2",
+            "foo.NotAuthorized",
+            "camera-password-marker",
+        ):
             with self.subTest(code=code):
                 non_auth_fault = soap(
                     "<s:Fault><s:Code><s:Value>s:Sender</s:Value><s:Subcode>"
-                    f"<s:Value>{code}</s:Value></s:Subcode></s:Code></s:Fault>"
+                    f"<s:Value>{code}</s:Value></s:Subcode></s:Code>"
+                    "<s:Reason><s:Text>viewer-marker</s:Text></s:Reason>"
+                    "</s:Fault>"
                 )
                 with self.assertRaises(_OnvifResponseError) as non_auth:
                     _parse_services_response(non_auth_fault)
-                self.assertEqual(non_auth.exception.fault_code, code)
+                self.assertEqual(non_auth.exception.fault_code, "Fault")
+                self.assertEqual(str(non_auth.exception), "SOAP Fault: Fault")
+                self.assertNotRegex(
+                    str(non_auth.exception),
+                    "camera-password-marker|viewer-marker",
+                )
+
+        soap11_sensitive = soap11(
+            "<env:Fault><faultcode>camera-password-marker</faultcode>"
+            "<faultstring>viewer-marker</faultstring>"
+            "<detail>PasswordDigestABC123</detail></env:Fault>"
+        )
+        with self.assertRaises(_OnvifResponseError) as soap11_unknown:
+            _parse_services_response(soap11_sensitive)
+        self.assertEqual(soap11_unknown.exception.fault_code, "Fault")
+        self.assertEqual(str(soap11_unknown.exception), "SOAP Fault: Fault")
+
+        protocol_codes = {
+            SOAP12_NS: (
+                "VersionMismatch",
+                "MustUnderstand",
+                "DataEncodingUnknown",
+                "Sender",
+                "Receiver",
+            ),
+            SOAP11_NS: (
+                "VersionMismatch",
+                "MustUnderstand",
+                "Client",
+                "Server",
+            ),
+        }
+        for namespace, codes in protocol_codes.items():
+            for code in codes:
+                with self.subTest(namespace=namespace, code=code):
+                    if namespace == SOAP12_NS:
+                        protocol_fault = soap(
+                            "<s:Fault><s:Code>"
+                            f"<s:Value>s:{code}</s:Value>"
+                            "</s:Code></s:Fault>"
+                        )
+                    else:
+                        protocol_fault = soap11(
+                            "<env:Fault>"
+                            f"<faultcode>env:{code}</faultcode>"
+                            "<faultstring>request failed</faultstring>"
+                            "</env:Fault>"
+                        )
+                    with self.assertRaises(_OnvifResponseError) as allowed:
+                        _parse_services_response(protocol_fault)
+                    self.assertEqual(allowed.exception.fault_code, code)
+                    self.assertEqual(
+                        str(allowed.exception), f"SOAP Fault: {code}"
+                    )
 
     def test_parses_media1_and_media2_profiles_with_namespace_association(self):
         media1 = _parse_media1_profiles_response(
@@ -1810,21 +2091,169 @@ class CapabilityProtocolParserTests(unittest.TestCase):
                 )
             )
 
-    def test_event_topic_walk_is_iterative_at_large_depth(self):
-        depth = 5000
+    def test_event_topic_walk_is_iterative_within_the_xml_depth_limit(self):
+        maximum_xml_depth = 64
+        soap_and_operation_depth = 4
+        topic_depth = maximum_xml_depth - soap_and_operation_depth
+        within_limit = soap(
+            "<tev:GetEventPropertiesResponse><wstop:TopicSet>"
+            + "<tns:L>" * (topic_depth - 1)
+            + '<vendor:Leaf wstop:topic="true"/>'
+            + "</tns:L>" * (topic_depth - 1)
+            + "</wstop:TopicSet></tev:GetEventPropertiesResponse>"
+        )
+        topics = _parse_event_properties_response(within_limit)
+        self.assertEqual(len(topics), 1)
+        self.assertEqual(topics[0].namespace, "urn:vendor")
+        self.assertEqual(len(topics[0].path.split("/")), topic_depth)
+
+        beyond_limit = soap(
+            "<tev:GetEventPropertiesResponse><wstop:TopicSet>"
+            + "<tns:L>" * topic_depth
+            + '<vendor:Leaf wstop:topic="true"/>'
+            + "</tns:L>" * topic_depth
+            + "</wstop:TopicSet></tev:GetEventPropertiesResponse>"
+        )
+        with self.assertRaisesRegex(
+            _OnvifResponseError, "^invalid XML document$"
+        ):
+            _parse_event_properties_response(beyond_limit)
+
+    def test_event_topics_enforce_count_path_namespace_and_aggregate_budgets(self):
+        maximum_topics = 1024
+        maximum_path_bytes = 4096
+        maximum_namespace_bytes = 2048
+        maximum_retained_bytes = 256 * 1024
+
+        count_at_limit = "".join(
+            f'<vendor:T{index:04} wstop:topic="true"/>'
+            for index in range(maximum_topics)
+        )
+        count_at_limit += '<vendor:T0000 wstop:topic="true"/>'
         topics = _parse_event_properties_response(
             soap(
                 "<tev:GetEventPropertiesResponse><wstop:TopicSet>"
-                + "<tns:L>" * depth
-                + '<vendor:Leaf wstop:topic="true"/>'
-                + "</tns:L>" * depth
+                + count_at_limit
                 + "</wstop:TopicSet></tev:GetEventPropertiesResponse>"
             )
         )
+        self.assertEqual(len(topics), maximum_topics)
 
-        self.assertEqual(len(topics), 1)
-        self.assertEqual(topics[0].namespace, "urn:vendor")
-        self.assertEqual(len(topics[0].path.split("/")), depth + 1)
+        with self.assertRaisesRegex(
+            _OnvifResponseError,
+            "^invalid Events GetEventProperties response$",
+        ):
+            _parse_event_properties_response(
+                soap(
+                    "<tev:GetEventPropertiesResponse><wstop:TopicSet>"
+                    + count_at_limit
+                    + f'<vendor:T{maximum_topics:04} wstop:topic="true"/>'
+                    + "</wstop:TopicSet></tev:GetEventPropertiesResponse>"
+                )
+            )
+
+        maximum_path = "T" + "x" * (maximum_path_bytes - 1)
+        topics = _parse_event_properties_response(
+            soap(
+                "<tev:GetEventPropertiesResponse><wstop:TopicSet>"
+                f'<vendor:{maximum_path} wstop:topic="true"/>'
+                "</wstop:TopicSet></tev:GetEventPropertiesResponse>"
+            )
+        )
+        self.assertEqual(len(topics[0].path.encode("utf-8")), maximum_path_bytes)
+
+        oversized_path = "T" + "x" * maximum_path_bytes
+        with self.assertRaisesRegex(
+            _OnvifResponseError,
+            "^invalid Events GetEventProperties response$",
+        ):
+            _parse_event_properties_response(
+                soap(
+                    "<tev:GetEventPropertiesResponse><wstop:TopicSet>"
+                    f'<vendor:{oversized_path} wstop:topic="true"/>'
+                    "</wstop:TopicSet></tev:GetEventPropertiesResponse>"
+                )
+            )
+        self.assertEqual(
+            _parse_event_properties_response(
+                soap(
+                    "<tev:GetEventPropertiesResponse><wstop:TopicSet>"
+                    f"<vendor:{oversized_path}/>"
+                    "</wstop:TopicSet></tev:GetEventPropertiesResponse>"
+                )
+            ),
+            (),
+        )
+
+        maximum_namespace = "urn:" + "n" * (maximum_namespace_bytes - 4)
+        topics = _parse_event_properties_response(
+            soap(
+                "<tev:GetEventPropertiesResponse><wstop:TopicSet>"
+                f'<maximum:Topic xmlns:maximum="{maximum_namespace}" '
+                'wstop:topic="true"/>'
+                "</wstop:TopicSet></tev:GetEventPropertiesResponse>"
+            )
+        )
+        self.assertEqual(
+            len(topics[0].namespace.encode("utf-8")),
+            maximum_namespace_bytes,
+        )
+
+        oversized_namespace = "urn:" + "n" * (maximum_namespace_bytes - 3)
+        with self.assertRaisesRegex(
+            _OnvifResponseError,
+            "^invalid Events GetEventProperties response$",
+        ):
+            _parse_event_properties_response(
+                soap(
+                    "<tev:GetEventPropertiesResponse><wstop:TopicSet>"
+                    f'<oversized:Topic xmlns:oversized="{oversized_namespace}" '
+                    'wstop:topic="true"/>'
+                    "</wstop:TopicSet></tev:GetEventPropertiesResponse>"
+                )
+            )
+
+        aggregate_at_limit = []
+        for index in range(64):
+            wanted_length = 4086
+            prefix = f"T{index:02}"
+            name = prefix + "x" * (wanted_length - len(prefix))
+            aggregate_at_limit.append(
+                f'<vendor:{name} wstop:topic="true"/>'
+            )
+        first_name = "T00" + "x" * (4086 - 3)
+        aggregate_at_limit.append(
+            f'<vendor:{first_name} wstop:topic="true"/>'
+        )
+        self.assertEqual(64 * (4086 + len("urn:vendor")), maximum_retained_bytes)
+        topics = _parse_event_properties_response(
+            soap(
+                "<tev:GetEventPropertiesResponse><wstop:TopicSet>"
+                + "".join(aggregate_at_limit)
+                + "</wstop:TopicSet></tev:GetEventPropertiesResponse>"
+            )
+        )
+        self.assertEqual(len(topics), 64)
+
+        aggregate_overflow = []
+        for index in range(64):
+            wanted_length = 4087 if index == 63 else 4086
+            prefix = f"T{index:02}"
+            name = prefix + "x" * (wanted_length - len(prefix))
+            aggregate_overflow.append(
+                f'<vendor:{name} wstop:topic="true"/>'
+            )
+        with self.assertRaisesRegex(
+            _OnvifResponseError,
+            "^invalid Events GetEventProperties response$",
+        ):
+            _parse_event_properties_response(
+                soap(
+                    "<tev:GetEventPropertiesResponse><wstop:TopicSet>"
+                    + "".join(aggregate_overflow)
+                    + "</wstop:TopicSet></tev:GetEventPropertiesResponse>"
+                )
+            )
 
     def test_media2_options_are_standard_namespace_aware_sorted_and_deduplicated(self):
         encodings = _parse_media2_options_response(

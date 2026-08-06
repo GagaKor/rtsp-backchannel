@@ -30,6 +30,7 @@ _DEFAULT_CIDR_CONCURRENCY = 64
 _MAX_CIDR_HOSTS = 4096
 _MAX_DISCOVERY_RESPONSE_BYTES = 1024 * 1024
 _MAX_SOAP_RESPONSE_BYTES = 1024 * 1024
+_MAX_XML_ELEMENT_DEPTH = 64
 _DISCOVERY_READ_CHUNK_BYTES = 64 * 1024
 _SOAP11_NS = "http://schemas.xmlsoap.org/soap/envelope/"
 _SOAP12_NS = "http://www.w3.org/2003/05/soap-envelope"
@@ -192,12 +193,30 @@ def _contains_forbidden_declaration(xml: bytes | str) -> bool:
         cursor = markup + 1
 
 
+class _DepthBoundedTreeBuilder(ElementTree.TreeBuilder):
+    def __init__(self) -> None:
+        super().__init__()
+        self._depth = 0
+
+    def start(self, tag, attrs):
+        self._depth += 1
+        if self._depth > _MAX_XML_ELEMENT_DEPTH:
+            raise ElementTree.ParseError("invalid XML document")
+        return super().start(tag, attrs)
+
+    def end(self, tag):
+        element = super().end(tag)
+        self._depth -= 1
+        return element
+
+
 def _safe_xml_fromstring(xml: bytes | str) -> ElementTree.Element:
     if _contains_forbidden_declaration(xml):
         raise ElementTree.ParseError(
             "DTD and entity declarations are not allowed"
         )
-    return ElementTree.fromstring(xml)
+    parser = ElementTree.XMLParser(target=_DepthBoundedTreeBuilder())
+    return ElementTree.fromstring(xml, parser=parser)
 
 
 def _first_text(element: ElementTree.Element, name: str) -> str | None:
@@ -728,7 +747,7 @@ def parse_profiles(xml: bytes | str) -> list[OnvifProfile]:
     return profiles
 
 
-def _validate_service_url(value: str) -> None:
+def _validated_service_url(value: str):
     if not isinstance(value, str) or any(
         ord(character) <= 0x20 or ord(character) == 0x7F
         for character in value
@@ -746,6 +765,62 @@ def _validate_service_url(value: str) -> None:
         or parsed.password is not None
         or parsed.fragment
         or port == 0
+    ):
+        raise RuntimeError("invalid ONVIF service URL")
+    return parsed
+
+
+def _validate_service_url(value: str) -> None:
+    _validated_service_url(value)
+
+
+def _legacy_ipv4_address(hostname: str) -> str | None:
+    parts = hostname.split(".")
+    if not 1 <= len(parts) <= 4 or any(
+        not part
+        or not part.isascii()
+        or not part.isdecimal()
+        or (len(part) > 1 and part.startswith("0"))
+        for part in parts
+    ):
+        return None
+    numbers = [int(part) for part in parts]
+    if any(number > 255 for number in numbers[:-1]):
+        return None
+    last_bits = 8 * (5 - len(numbers))
+    if numbers[-1] >= 1 << last_bits:
+        return None
+    address = numbers[-1]
+    for index, number in enumerate(numbers[:-1]):
+        address |= number << (24 - index * 8)
+    return str(ipaddress.IPv4Address(address))
+
+
+def _canonical_service_host(parsed) -> str:
+    hostname = parsed.hostname
+    if hostname is None:
+        raise RuntimeError("invalid ONVIF service URL")
+    try:
+        return f"ip:{ipaddress.ip_address(hostname)}"
+    except ValueError:
+        legacy_ipv4 = _legacy_ipv4_address(hostname)
+        if legacy_ipv4 is not None:
+            return f"ip:{legacy_ipv4}"
+        try:
+            domain = hostname.removesuffix(".").encode("idna").decode("ascii")
+        except UnicodeError:
+            raise RuntimeError("invalid ONVIF service URL") from None
+        return f"domain:{domain.lower()}"
+
+
+def _validate_service_url_against_device(
+    device_url: str, service_url: str
+) -> None:
+    device = _validated_service_url(device_url)
+    service = _validated_service_url(service_url)
+    if (
+        device.scheme.lower() != service.scheme.lower()
+        or _canonical_service_host(device) != _canonical_service_host(service)
     ):
         raise RuntimeError("invalid ONVIF service URL")
 
@@ -878,7 +953,10 @@ class OnvifDevice:
         authenticated: bool,
         include_status: bool,
     ) -> str | _SoapResponse:
-        _validate_service_url(url)
+        if self.device_url is None:
+            _validate_service_url(url)
+        else:
+            _validate_service_url_against_device(self.device_url, url)
         header = ""
         if authenticated and (self.user or self.password):
             now = datetime.datetime.now(datetime.timezone.utc) + self.clock_offset
@@ -957,6 +1035,9 @@ class OnvifDevice:
         )
 
     def connect(self) -> DeviceInfo:
+        self.device_url = None
+        self.media_url = None
+        self.clock_offset = datetime.timedelta()
         for url in self._candidates():
             try:
                 camera_time = self._system_time(url)
@@ -967,10 +1048,14 @@ class OnvifDevice:
                     f'<GetDeviceInformation xmlns="{_DEVICE_NS}"/>',
                 ).xml
                 device_info = _parse_device_information(info)
+                media_url = self._media_service_url(url)
                 self.device_url = url
-                self.media_url = self._media_service_url(url)
+                self.media_url = media_url
                 return device_info
             except _EXPECTED_OPERATION_ERRORS:
+                self.device_url = None
+                self.media_url = None
+                self.clock_offset = datetime.timedelta()
                 continue
         raise RuntimeError("ONVIF connect failed") from None
 
@@ -986,8 +1071,11 @@ class OnvifDevice:
                 continue
             xaddr = _first_text(candidate, "XAddr")
             if xaddr:
+                _validate_service_url_against_device(device_url, xaddr)
                 return xaddr
-        return device_url.replace("device_service", "media_service")
+        fallback = device_url.replace("device_service", "media_service")
+        _validate_service_url_against_device(device_url, fallback)
+        return fallback
 
     def _required_media_url(self) -> str:
         if self.media_url is None:

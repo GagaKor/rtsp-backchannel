@@ -244,8 +244,20 @@ JSON 표기를 출력합니다. 장치가 보고하지 않은 선택적인 JSON 
 인증의 증명은 아닙니다.
 
 서비스 검색에 성공하면 선택적인 Media, PTZ, Events 보강 요청은 각각 일치하는 광고된
-서비스 XAddr로 routing됩니다. `timeout`은 요청마다 적용되므로 여러 요청을 수행하는
-보고서의 전체 시간은 한 timeout 구간보다 길 수 있습니다.
+서비스 XAddr로 routing됩니다. 반환된 서비스 URL은 WSSE 생성이나 네트워크 I/O 전에
+동일 출처 규칙으로 검증합니다. 스킴과 정규화한 호스트 이름은 선택된 Device 서비스와
+같아야 하며 port, path, query는 달라도 됩니다. 다른 출처의 XAddr도 `services`에는
+그대로 남지만 보강 요청은 보내지 않고 `invalid ONVIF service URL` warning을 기록합니다.
+연결 과정에서 반환된 Media XAddr에도 같은 규칙을 적용합니다.
+
+XML은 encoding-aware DTD/entity 차단을 유지하며 element 깊이는 최대 64단계입니다.
+Event 보존 예산은 고유 topic 1,024개, topic path당 UTF-8 4,096byte, namespace당 UTF-8
+2,048byte, 전체 256 KiB입니다. 예산을 넘으면 안전한 warning을 남기고 해당 선택 정보는
+unknown으로 유지합니다. SOAP fault는 `ActionNotSupported`를 포함한 고정 인증/프로토콜
+allowlist만 출력하며 알 수 없는 code는 항상 `SOAP Fault: Fault`로 정규화합니다.
+
+`timeout`은 요청마다 적용되므로 여러 요청을 수행하는 보고서의 전체 시간은 한 timeout
+구간보다 길 수 있습니다.
 
 ### `play_file`
 
@@ -324,7 +336,15 @@ rtsp-backchannel play \
 지정할 수 있습니다. 반복된 `--device-url`은 입력 순서를 보존합니다. API를 한 번
 호출하고 native camelCase JSON object를 정확히 한 줄 출력합니다. `--timeout-ms`를
 생략하면 API 기본값을 사용하고, 지정한 값은 소수도 가능하지만 0보다 큰 유한한
-요청별 millisecond 값이어야 합니다.
+요청별 millisecond 값이어야 하며 24시간 상한(86,400,000ms)을 포함하여 그 이하여야
+합니다. 파싱한 millisecond 숫자를 second로 변환하기 전에 검증합니다. 잘못되었거나
+상한을 넘는 값은 API 또는 네트워크 호출 전에 값이 포함되지 않은 고정 진단과 종료
+상태 2로 거부합니다.
+
+capability CLI는 bare `--` argument terminator를 값이 포함되지 않은 고정 진단으로
+거부합니다. `--pass=--value` 또는 `--pass` 다음의 별도 값으로 전달한 hyphen-prefixed
+password는 opaque 값으로 유지하고, 알려진 capability flag는 비밀번호 누락으로
+처리합니다. 명시적인 `--pass ""`의 환경변수 override 동작은 그대로입니다.
 
 ## 재생 동작
 

@@ -143,6 +143,18 @@ class LibraryApiTests(unittest.TestCase):
         )
         self.assertEqual(explicit.timeout_ms, 2500.5)
 
+        for timeout_arguments in (
+            ["--timeout-ms", "86400000"],
+            ["--timeout-ms=86400000"],
+            ["--timeout-ms", "86400000.000000001"],
+            ["--timeout-ms=86400000.000000001"],
+        ):
+            with self.subTest(timeout_arguments=timeout_arguments):
+                boundary = parser.parse_args(
+                    ["--host", "camera.local", *timeout_arguments]
+                )
+                self.assertEqual(boundary.timeout_ms, 86_400_000.0)
+
     def test_capabilities_help_is_specific_and_never_opens_network(self):
         cli = importlib.import_module("rtsp_backchannel.cli")
 
@@ -1229,7 +1241,7 @@ class LibraryApiTests(unittest.TestCase):
                     "--timeout-ms",
                     "50",
                 ],
-                "expected one argument",
+                "missing value for --pass",
             ),
             (
                 ["--host", "camera.local", "--device-url"],
@@ -1293,6 +1305,243 @@ class LibraryApiTests(unittest.TestCase):
 
         capabilities.assert_not_called()
 
+    def test_capabilities_cli_enforces_inclusive_24_hour_timeout_before_seconds_conversion(self):
+        cli = importlib.import_module("rtsp_backchannel.cli")
+        report = _minimal_capability_report()
+
+        with (
+            patch.object(
+                cli,
+                "get_camera_capabilities",
+                return_value=report,
+                create=True,
+            ) as capabilities,
+            patch.dict(
+                os.environ,
+                {"ONVIF_PASSWORD": "environment-only-secret"},
+                clear=True,
+            ),
+            redirect_stdout(io.StringIO()),
+        ):
+            cli.main(
+                [
+                    "capabilities",
+                    "--host",
+                    "camera.local",
+                    "--timeout-ms",
+                    "86400000",
+                ]
+            )
+            cli.main(
+                [
+                    "capabilities",
+                    "--host",
+                    "camera.local",
+                    "--timeout-ms=86400000",
+                ]
+            )
+
+        self.assertEqual(
+            capabilities.call_args_list,
+            [
+                call(
+                    host="camera.local",
+                    user="",
+                    password="environment-only-secret",
+                    timeout=86_400.0,
+                ),
+                call(
+                    host="camera.local",
+                    user="",
+                    password="environment-only-secret",
+                    timeout=86_400.0,
+                ),
+            ],
+        )
+
+        rejected = (
+            (["--timeout-ms", "86400000.00000001"], "86400000.00000001"),
+            (["--timeout-ms=86400000.00000001"], "86400000.00000001"),
+            (["--timeout-ms", "86400000.00000049"], "86400000.00000049"),
+            (["--timeout-ms=86400000.00000049"], "86400000.00000049"),
+            (["--timeout-ms", "86400001"], "86400001"),
+            (["--timeout-ms=86400001"], "86400001"),
+            (["--timeout-ms", "1e22"], "1e22"),
+            (["--timeout-ms=1e22"], "1e22"),
+        )
+        with (
+            patch.object(
+                cli,
+                "get_camera_capabilities",
+                return_value=report,
+                create=True,
+            ) as rejected_capabilities,
+            patch.dict(
+                os.environ,
+                {"ONVIF_PASSWORD": "environment-only-secret"},
+                clear=True,
+            ),
+        ):
+            for timeout_arguments, reflected in rejected:
+                with self.subTest(timeout_arguments=timeout_arguments):
+                    with (
+                        redirect_stdout(io.StringIO()) as output,
+                        redirect_stderr(io.StringIO()) as errors,
+                        self.assertRaises(SystemExit) as stopped,
+                    ):
+                        cli.main(
+                            [
+                                "capabilities",
+                                "--host",
+                                "camera.local",
+                                "--pass",
+                                "argv-password-secret",
+                                *timeout_arguments,
+                            ]
+                        )
+                    self.assertEqual(stopped.exception.code, 2)
+                    diagnostic = output.getvalue() + errors.getvalue()
+                    self.assertIn(
+                        "timeout-ms exceeds the 24-hour maximum",
+                        diagnostic,
+                    )
+                    self.assertNotIn(reflected, diagnostic)
+                    self.assertNotRegex(
+                        diagnostic,
+                        "argv-password-secret|environment-only-secret",
+                    )
+        rejected_capabilities.assert_not_called()
+
+    def test_capabilities_cli_rejects_bare_terminator_without_reflecting_values(self):
+        cli = importlib.import_module("rtsp_backchannel.cli")
+        cases = (
+            (
+                [
+                    "--host",
+                    "camera.local",
+                    "--pass",
+                    "control-password-secret",
+                    "--",
+                ],
+                "capabilities does not accept an argument terminator",
+            ),
+            (
+                [
+                    "--host",
+                    "camera.local",
+                    "--pass",
+                    "--",
+                    "--pass=trailing-equals-secret",
+                ],
+                "missing value for --pass",
+            ),
+            (
+                ["--host", "camera.local", "--"],
+                "capabilities does not accept an argument terminator",
+            ),
+        )
+
+        with (
+            patch.object(
+                cli, "get_camera_capabilities", create=True
+            ) as capabilities,
+            patch.dict(
+                os.environ,
+                {"ONVIF_PASSWORD": "environment-only-secret"},
+                clear=True,
+            ),
+        ):
+            for arguments, expected in cases:
+                with self.subTest(arguments=arguments):
+                    with (
+                        redirect_stdout(io.StringIO()) as output,
+                        redirect_stderr(io.StringIO()) as errors,
+                        self.assertRaises(SystemExit) as stopped,
+                    ):
+                        cli.main(["capabilities", *arguments])
+                    self.assertEqual(stopped.exception.code, 2)
+                    diagnostic = output.getvalue() + errors.getvalue()
+                    self.assertIn(expected, diagnostic)
+                    self.assertNotRegex(
+                        diagnostic,
+                        "control-password-secret|trailing-equals-secret|environment-only-secret",
+                    )
+
+        capabilities.assert_not_called()
+
+    def test_capabilities_cli_keeps_hyphen_prefixed_passwords_opaque(self):
+        cli = importlib.import_module("rtsp_backchannel.cli")
+        report = _minimal_capability_report()
+        password_arguments = (
+            (["--pass", "--separate-password-secret"], "--separate-password-secret"),
+            (["--pass=--equals-password-secret"], "--equals-password-secret"),
+            (["--pass=--"], "--"),
+        )
+
+        with (
+            patch.object(
+                cli,
+                "get_camera_capabilities",
+                return_value=report,
+                create=True,
+            ) as capabilities,
+            patch.dict(
+                os.environ,
+                {"ONVIF_PASSWORD": "environment-only-secret"},
+                clear=True,
+            ),
+            redirect_stdout(io.StringIO()) as output,
+        ):
+            for arguments, expected_password in password_arguments:
+                with self.subTest(arguments=arguments):
+                    try:
+                        cli.main(
+                            [
+                                "capabilities",
+                                "--host",
+                                "camera.local",
+                                *arguments,
+                            ]
+                        )
+                    except SystemExit as error:
+                        self.fail(
+                            "opaque password form was rejected with "
+                            f"exit {error.code}"
+                        )
+                    self.assertEqual(
+                        capabilities.call_args.kwargs["password"],
+                        expected_password,
+                    )
+
+        self.assertEqual(capabilities.call_count, len(password_arguments))
+        self.assertNotRegex(
+            output.getvalue(),
+            "separate-password-secret|equals-password-secret|environment-only-secret",
+        )
+
+        capabilities.reset_mock()
+        with (
+            redirect_stdout(io.StringIO()) as output,
+            redirect_stderr(io.StringIO()) as errors,
+            self.assertRaises(SystemExit) as stopped,
+        ):
+            cli.main(
+                [
+                    "capabilities",
+                    "--host",
+                    "camera.local",
+                    "--pass",
+                    "--timeout-ms",
+                    "50",
+                ]
+            )
+        self.assertEqual(stopped.exception.code, 2)
+        self.assertIn(
+            "missing value for --pass",
+            output.getvalue() + errors.getvalue(),
+        )
+        capabilities.assert_not_called()
+
     def test_documents_camera_capabilities_in_both_python_readmes(self):
         english = pathlib.Path("python/README.md").read_text(
             encoding="utf-8"
@@ -1326,6 +1575,12 @@ class LibraryApiTests(unittest.TestCase):
                 "rtsp-backchannel capabilities",
                 "--device-url",
                 "--timeout-ms",
+                "XAddr",
+                "86,400,000",
+                "1,024",
+                "4,096",
+                "2,048",
+                "256 KiB",
             ):
                 self.assertIn(expected, readme)
             self.assertRegex(
@@ -1345,6 +1600,30 @@ class LibraryApiTests(unittest.TestCase):
             r"Initial connection and authentication failures are fatal",
         )
         self.assertRegex(korean, r"최초 연결 또는\s+인증 실패는 치명적")
+        self.assertRegex(
+            english,
+            r"same-origin[\s\S]{0,500}scheme[\s\S]{0,500}hostname",
+        )
+        self.assertRegex(
+            korean,
+            r"동일 출처[\s\S]{0,500}스킴[\s\S]{0,500}호스트",
+        )
+        self.assertRegex(
+            english,
+            r"64[\s\S]{0,500}1,024[\s\S]{0,500}4,096[\s\S]{0,500}2,048[\s\S]{0,500}256 KiB",
+        )
+        self.assertRegex(
+            korean,
+            r"64[\s\S]{0,500}1,024[\s\S]{0,500}4,096[\s\S]{0,500}2,048[\s\S]{0,500}256 KiB",
+        )
+        self.assertRegex(
+            english,
+            r"inclusive 24-hour\s+maximum \(86,400,000 ms\)",
+        )
+        self.assertRegex(
+            korean,
+            r"24시간 상한\(86,400,000ms\)",
+        )
 
 
 if __name__ == "__main__":

@@ -252,9 +252,23 @@ advertisement and successful H.265 enrichment are useful Profile T evidence,
 not proof of Profile T certification.
 
 Successful service discovery routes each optional Media, PTZ, and Events
-enrichment request to the matching advertised service XAddr. `timeout` applies
-per request; because one report performs multiple requests, its total elapsed
-time can exceed one timeout interval.
+enrichment request to the matching advertised service XAddr. Returned service
+URLs are subject to a same-origin rule before WSSE generation or network I/O:
+their scheme and canonical hostname must match the selected Device service;
+ports, paths, and queries may differ. A cross-origin XAddr remains in
+`services`, but its enrichment is skipped with an `invalid ONVIF service URL`
+warning. The connected Media XAddr is validated by the same rule.
+
+XML keeps the encoding-aware DTD/entity rejection and permits at most 64
+element levels. Event retention allows at most 1,024 unique topics, 4,096 UTF-8
+bytes per topic path, 2,048 UTF-8 bytes per namespace, and 256 KiB in aggregate.
+An exceeded budget becomes a sanitized warning and leaves that optional fact
+unknown. SOAP fault output uses a fixed authentication/protocol allowlist,
+including `ActionNotSupported`; every unknown code is reported only as
+`SOAP Fault: Fault`.
+
+`timeout` applies per request; because one report performs multiple requests,
+its total elapsed time can exceed one timeout interval.
 
 ### `play_file`
 
@@ -372,7 +386,16 @@ password.
 preserves repeatable `--device-url` values in supplied order. It calls the API
 once and prints exactly one native camelCase JSON object. Omitting
 `--timeout-ms` uses the API default; a supplied value may be decimal but must
-be finite and greater than zero. It is a per-request millisecond value.
+be finite and greater than zero and no greater than the inclusive 24-hour
+maximum (86,400,000 ms). The parsed millisecond number is validated before it
+is converted to seconds. Invalid or excessive values exit with status 2 and a
+fixed value-free diagnostic before API or network dispatch.
+
+The capability CLI rejects a bare `--` argument terminator with a fixed
+value-free diagnostic. Hyphen-prefixed passwords remain opaque when supplied
+as `--pass=--value` or as the separate value to `--pass`; known capability
+flags are still treated as a missing password. The explicit `--pass ""`
+environment override is unchanged.
 
 ## Playback Behavior
 
