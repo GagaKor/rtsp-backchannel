@@ -365,10 +365,10 @@ The `capabilities` command prints exactly one camelCase JSON object followed by
 one newline and no status line. Omit `--pass` to use `ONVIF_PASSWORD`; an
 explicit `--pass ""` overrides the environment with an empty password.
 Repeated non-empty `--device-url` values are tried in supplied order.
-`--timeout-ms` accepts a finite positive decimal number of milliseconds that
-fits the platform timer range and converts it to a nonzero per-request
-`Duration`; omitting it keeps the API's eight-second default. Help and
-validation failures do not open the network or echo credential/environment
+`--timeout-ms` accepts a finite positive decimal number of milliseconds up to
+the inclusive 24-hour maximum (86,400,000 ms) and converts it to a nonzero
+per-request `Duration`; omitting it keeps the API's eight-second default. Help
+and validation failures do not open the network or echo credential/environment
 values.
 
 The `play` word is optional for backward compatibility. `--pass` is available

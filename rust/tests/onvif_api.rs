@@ -593,8 +593,27 @@ fn capabilities_cli_rejects_unsafe_values_and_timeout_underflow_before_dispatch(
 }
 
 #[test]
-fn capabilities_cli_rejects_huge_finite_timeouts_at_parse_time() {
-    for timeout_arguments in [vec!["--timeout-ms", "1e22"], vec!["--timeout-ms=1e22"]] {
+fn capabilities_cli_enforces_an_inclusive_24_hour_timeout_bound_at_parse_time() {
+    for timeout_arguments in [
+        vec!["--timeout-ms", "86400000"],
+        vec!["--timeout-ms=86400000"],
+    ] {
+        let mut arguments = vec!["rtsp-backchannel", "capabilities", "--host", "camera.local"];
+        arguments.extend(timeout_arguments);
+        match parse_application_invocation_from(arguments).unwrap() {
+            ApplicationInvocation::Capabilities(cli) => {
+                assert_eq!(cli.timeout, Some(Duration::from_secs(86_400)));
+            }
+            _ => panic!("expected capabilities invocation"),
+        }
+    }
+
+    for (timeout_arguments, reflected_timeout) in [
+        (vec!["--timeout-ms", "86400001"], "86400001"),
+        (vec!["--timeout-ms=86400001"], "86400001"),
+        (vec!["--timeout-ms", "1e22"], "1e22"),
+        (vec!["--timeout-ms=1e22"], "1e22"),
+    ] {
         let mut arguments = vec!["rtsp-backchannel", "capabilities", "--host", "camera.local"];
         arguments.extend(timeout_arguments);
         let diagnostic = parse_application_invocation_from(arguments)
@@ -602,16 +621,21 @@ fn capabilities_cli_rejects_huge_finite_timeouts_at_parse_time() {
             .to_string();
 
         assert!(
-            diagnostic.contains("timeout-ms exceeds the platform timer range"),
+            diagnostic.contains("timeout-ms exceeds the 24-hour maximum"),
             "unexpected diagnostic: {diagnostic}"
         );
-        assert!(!diagnostic.contains("1e22"));
+        assert!(!diagnostic.contains(reflected_timeout));
     }
 }
 
 #[test]
-fn capabilities_cli_huge_timeout_exits_without_panic_or_network_dispatch() {
-    for timeout_arguments in [vec!["--timeout-ms", "1e22"], vec!["--timeout-ms=1e22"]] {
+fn capabilities_cli_above_24_hour_timeout_exits_without_panic_or_network_dispatch() {
+    for (timeout_arguments, reflected_timeout) in [
+        (vec!["--timeout-ms", "86400001"], "86400001"),
+        (vec!["--timeout-ms=86400001"], "86400001"),
+        (vec!["--timeout-ms", "1e22"], "1e22"),
+        (vec!["--timeout-ms=1e22"], "1e22"),
+    ] {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let device_url =
@@ -639,11 +663,11 @@ fn capabilities_cli_huge_timeout_exits_without_panic_or_network_dispatch() {
         assert!(output.stdout.is_empty());
         let diagnostic = String::from_utf8_lossy(&output.stderr);
         assert!(
-            diagnostic.contains("timeout-ms exceeds the platform timer range"),
+            diagnostic.contains("timeout-ms exceeds the 24-hour maximum"),
             "unexpected diagnostic: {diagnostic}"
         );
         for reflected in [
-            "1e22",
+            reflected_timeout,
             "huge-url-user",
             "huge-url-pass",
             "huge-password-secret",
@@ -971,8 +995,8 @@ fn capabilities_cli_documentation_covers_native_report_and_hardened_semantics() 
     assert!(korean.contains("초기 연결 및 인증 실패는 치명적 오류"));
     assert!(korean.contains("camelCase JSON 객체를 정확히 한 줄"));
     assert!(korean.contains("서로 다른 포트와 경로는 허용"));
-    assert!(english.contains("platform timer range"));
-    assert!(korean.contains("플랫폼 타이머 범위"));
+    assert!(english.contains("24-hour maximum"));
+    assert!(korean.contains("24시간 상한"));
 }
 
 #[test]

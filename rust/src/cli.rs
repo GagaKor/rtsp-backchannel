@@ -1,14 +1,15 @@
 use std::ffi::{OsStr, OsString};
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use clap::Parser;
 
 use crate::audio::CodecPreference;
 
 const INVALID_TIMEOUT_ERROR: &str = "timeout-ms must be finite and greater than 0";
-const TIMEOUT_RANGE_ERROR: &str = "timeout-ms exceeds the platform timer range";
+const MAX_CAPABILITY_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+const TIMEOUT_RANGE_ERROR: &str = "timeout-ms exceeds the 24-hour maximum";
 const CAPABILITY_TERMINATOR_ERROR: &str = "capabilities does not accept an argument terminator";
 
 #[derive(Debug, Parser)]
@@ -121,7 +122,7 @@ pub struct CapabilitiesCli {
         value_name = "MILLISECONDS",
         value_parser = parse_positive_timeout_ms,
         allow_hyphen_values = true,
-        help = "Finite positive per-request timeout in milliseconds"
+        help = "Finite positive per-request timeout in milliseconds (maximum: 24 hours)"
     )]
     pub timeout: Option<Duration>,
 }
@@ -229,7 +230,7 @@ fn missing_capability_value(option: &str) -> clap::Error {
     )
 }
 
-fn reject_platform_unsafe_timeout(value: &str) -> Result<(), clap::Error> {
+fn reject_excessive_capability_timeout(value: &str) -> Result<(), clap::Error> {
     if parse_timeout_ms(value).is_err_and(|error| error == TIMEOUT_RANGE_ERROR) {
         return Err(clap::Error::raw(
             clap::error::ErrorKind::InvalidValue,
@@ -274,7 +275,7 @@ fn normalize_capability_arguments(arguments: &[OsString]) -> Result<Vec<OsString
                 return Err(missing_capability_value(option));
             }
             if option == "timeout-ms" {
-                reject_platform_unsafe_timeout(value)?;
+                reject_excessive_capability_timeout(value)?;
             }
             normalized.push(argument.clone());
             index += 1;
@@ -304,7 +305,7 @@ fn normalize_capability_arguments(arguments: &[OsString]) -> Result<Vec<OsString
         }
         if option == "timeout-ms" {
             if let Some(value) = value.to_str() {
-                reject_platform_unsafe_timeout(value)?;
+                reject_excessive_capability_timeout(value)?;
             }
         }
         normalized.push(argument.clone());
@@ -334,7 +335,7 @@ fn parse_timeout_ms(value: &str) -> Result<Duration, &'static str> {
     if timeout.is_zero() {
         return Err(INVALID_TIMEOUT_ERROR);
     }
-    if Instant::now().checked_add(timeout).is_none() {
+    if timeout > MAX_CAPABILITY_TIMEOUT {
         return Err(TIMEOUT_RANGE_ERROR);
     }
     Ok(timeout)
