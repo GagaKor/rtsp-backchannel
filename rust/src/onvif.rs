@@ -6,7 +6,15 @@ use sha1::{Digest, Sha1};
 use std::io::Read;
 use std::time::Duration;
 
-use crate::rtsp::{has_rtsp_scheme, sanitize_rtsp_uri};
+use crate::rtsp::sanitize_rtsp_uri;
+
+pub mod capabilities;
+pub use capabilities::{
+    CameraCapabilityOptions, CameraCapabilityProfile, CameraCapabilityReport,
+    CameraCapabilityService, CameraCapabilityVersion, CameraCapabilityWarning,
+    EventCapabilityReport, EventServiceCapabilities, EventTopic, Media2CapabilityReport,
+    PtzCapabilityReport, PtzNode, PtzServiceCapabilities, PtzSpaces, get_camera_capabilities,
+};
 
 const DEVICE_NS: &str = "http://www.onvif.org/ver10/device/wsdl";
 const MEDIA_NS: &str = "http://www.onvif.org/ver10/media/wsdl";
@@ -56,14 +64,39 @@ fn descendant_text<'a>(node: roxmltree::Node<'a, 'a>, name: &str) -> Option<&'a 
 }
 
 pub fn parse_device_time(xml: &str) -> Result<DateTime<Utc>, String> {
-    let document = roxmltree::Document::parse(xml)
-        .map_err(|error| format!("invalid ONVIF time XML: {error}"))?;
-    let utc = document
-        .descendants()
-        .find(|node| node.is_element() && node.tag_name().name() == "UTCDateTime")
-        .ok_or("ONVIF response has no UTCDateTime")?;
+    let document =
+        capabilities::parse_document(xml).map_err(|_| "invalid ONVIF time XML".to_owned())?;
+    let strict_response =
+        compatible_operation_response(&document, DEVICE_NS, "GetSystemDateAndTimeResponse")
+            .filter(|response| response.tag_name().namespace() == Some(DEVICE_NS));
+    if strict_response.is_none() && is_recognized_soap_envelope(&document) {
+        return Err("invalid GetSystemDateAndTime response".to_owned());
+    }
+    let utc = if let Some(response) = strict_response {
+        let system_time = direct_child(response, DEVICE_NS, "SystemDateAndTime")
+            .ok_or("ONVIF response has no SystemDateAndTime")?;
+        direct_child(system_time, SCHEMA_NS, "UTCDateTime")
+            .ok_or("ONVIF response has no UTCDateTime")?
+    } else {
+        document
+            .descendants()
+            .find(|node| node.is_element() && node.tag_name().name() == "UTCDateTime")
+            .ok_or("ONVIF response has no UTCDateTime")?
+    };
+    let date = strict_response.and_then(|_| direct_child(utc, SCHEMA_NS, "Date"));
+    let time = strict_response.and_then(|_| direct_child(utc, SCHEMA_NS, "Time"));
     let number = |name: &str| -> Result<u32, String> {
-        descendant_text(utc, name)
+        let value = if strict_response.is_some() {
+            let container = match name {
+                "Year" | "Month" | "Day" => date,
+                _ => time,
+            }
+            .ok_or_else(|| format!("ONVIF UTCDateTime has no {name}"))?;
+            direct_child(container, SCHEMA_NS, name).and_then(|node| node.text())
+        } else {
+            descendant_text(utc, name)
+        };
+        value
             .ok_or_else(|| format!("ONVIF UTCDateTime has no {name}"))?
             .parse()
             .map_err(|_| format!("ONVIF UTCDateTime has invalid {name}"))
@@ -87,6 +120,19 @@ pub struct OnvifProfile {
     pub has_audio_encoder: bool,
     pub has_audio_output: bool,
     pub has_audio_source: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manufacturer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub firmware: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serial: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,20 +170,53 @@ pub struct StreamUri {
 }
 
 pub fn parse_profiles(xml: &str) -> Result<Vec<OnvifProfile>, String> {
-    let document = roxmltree::Document::parse(xml)
-        .map_err(|error| format!("invalid GetProfiles XML: {error}"))?;
-    Ok(document
-        .descendants()
-        .filter(|node| node.is_element() && node.tag_name().name() == "Profiles")
+    let document =
+        capabilities::parse_document(xml).map_err(|_| "invalid GetProfiles XML".to_owned())?;
+    let root = document.root_element();
+    let strict_response = compatible_operation_response(&document, MEDIA_NS, "GetProfilesResponse")
+        .filter(|response| response.tag_name().namespace() == Some(MEDIA_NS))
+        .or_else(|| {
+            (root.tag_name().namespace() == Some(MEDIA_NS)
+                && root.tag_name().name() == "GetProfilesResponse")
+                .then_some(root)
+        });
+    if strict_response.is_none() && is_recognized_soap_envelope(&document) {
+        return Err("invalid GetProfiles response".to_owned());
+    }
+    let profiles = if let Some(response) = strict_response {
+        response
+            .children()
+            .filter(|node| {
+                node.is_element()
+                    && node.tag_name().namespace() == Some(MEDIA_NS)
+                    && node.tag_name().name() == "Profiles"
+            })
+            .collect::<Vec<_>>()
+    } else {
+        document
+            .descendants()
+            .filter(|node| node.is_element() && node.tag_name().name() == "Profiles")
+            .collect::<Vec<_>>()
+    };
+    Ok(profiles
+        .into_iter()
         .filter_map(|node| {
             let token = node.attribute("token")?.to_owned();
             let has_element = |name: &str| {
-                node.descendants()
-                    .any(|child| child.is_element() && child.tag_name().name() == name)
+                if strict_response.is_some() {
+                    direct_child(node, SCHEMA_NS, name).is_some()
+                } else {
+                    node.descendants()
+                        .any(|child| child.is_element() && child.tag_name().name() == name)
+                }
             };
             Some(OnvifProfile {
                 token,
-                name: descendant_text(node, "Name").map(str::to_owned),
+                name: if strict_response.is_some() {
+                    direct_text(node, SCHEMA_NS, "Name")
+                } else {
+                    descendant_text(node, "Name").map(str::to_owned)
+                },
                 has_audio_encoder: has_element("AudioEncoderConfiguration"),
                 has_audio_output: has_element("AudioOutputConfiguration"),
                 has_audio_source: has_element("AudioSourceConfiguration"),
@@ -154,11 +233,11 @@ pub fn parse_profile_tokens(xml: &str) -> Result<Vec<String>, String> {
 }
 
 pub struct OnvifDevice {
-    host: String,
     user: String,
     password: String,
     device_urls: Vec<String>,
     client: Client,
+    device_url: Option<String>,
     media_url: Option<String>,
     clock_offset: ChronoDuration,
 }
@@ -193,7 +272,7 @@ impl OnvifDevice {
     }
 
     pub fn with_device_urls_and_timeout(
-        host: &str,
+        _host: &str,
         user: &str,
         password: &str,
         device_urls: Vec<String>,
@@ -210,18 +289,17 @@ impl OnvifDevice {
             .build()
             .map_err(|error| format!("failed to build ONVIF HTTP client: {error}"))?;
         Ok(Self {
-            host: host.to_owned(),
             user: user.to_owned(),
             password: password.to_owned(),
             device_urls,
             client,
+            device_url: None,
             media_url: None,
             clock_offset: ChronoDuration::zero(),
         })
     }
 
-    pub fn connect(&mut self) -> Result<(), String> {
-        let mut last_error = None;
+    pub fn connect(&mut self) -> Result<DeviceInfo, String> {
         for device_url in self.device_urls.clone() {
             let result = (|| {
                 let time_xml = self.soap(
@@ -237,9 +315,7 @@ impl OnvifDevice {
                     &format!("<GetDeviceInformation xmlns=\"{DEVICE_NS}\"/>"),
                     true,
                 )?;
-                if !information.contains("GetDeviceInformationResponse") {
-                    return Err("GetDeviceInformation was rejected".to_owned());
-                }
+                let device_information = parse_device_information(&information)?;
 
                 let capabilities = self.soap(
                     &device_url,
@@ -248,24 +324,17 @@ impl OnvifDevice {
                     ),
                     true,
                 )?;
-                let media_url = parse_first_text(&capabilities, "XAddr")
-                    .filter(|value| value.to_ascii_lowercase().contains("media"))
+                let media_url = parse_media_xaddr(&capabilities)?
                     .unwrap_or_else(|| device_url.replace("device_service", "media_service"));
-                Ok::<String, String>(media_url)
+                Ok::<(DeviceInfo, String), String>((device_information, media_url))
             })();
-            match result {
-                Ok(media_url) => {
-                    self.media_url = Some(media_url);
-                    return Ok(());
-                }
-                Err(error) => last_error = Some(error),
+            if let Ok((device_information, media_url)) = result {
+                self.device_url = Some(device_url);
+                self.media_url = Some(media_url);
+                return Ok(device_information);
             }
         }
-        Err(format!(
-            "ONVIF connect failed for {}: {}",
-            safe_host(&self.host),
-            last_error.unwrap_or_else(|| "no device service candidates".to_owned())
-        ))
+        Err("ONVIF connect failed".to_owned())
     }
 
     pub fn profile_tokens(&self) -> Result<Vec<String>, String> {
@@ -298,7 +367,13 @@ impl OnvifDevice {
             xml_escape(profile_token)
         );
         let xml = self.soap(self.require_media_url()?, &body, true)?;
-        parse_first_text(&xml, "Uri").ok_or_else(|| "GetStreamUri returned no Uri".to_owned())
+        parse_stream_uri(&xml)?.ok_or_else(|| "GetStreamUri returned no Uri".to_owned())
+    }
+
+    fn require_device_url(&self) -> Result<&str, String> {
+        self.device_url
+            .as_deref()
+            .ok_or_else(|| "call ONVIF connect() first".to_owned())
     }
 
     fn require_media_url(&self) -> Result<&str, String> {
@@ -309,7 +384,7 @@ impl OnvifDevice {
 
     fn soap(&self, url: &str, body: &str, authenticated: bool) -> Result<String, String> {
         let (status, text) = self.soap_response(url, body, authenticated)?;
-        if status.is_server_error() && !text.contains("Envelope") {
+        if !status.is_success() {
             return Err(format!(
                 "ONVIF request to {} returned HTTP {status}",
                 safe_url(url)
@@ -324,6 +399,7 @@ impl OnvifDevice {
         body: &str,
         authenticated: bool,
     ) -> Result<(reqwest::StatusCode, String), String> {
+        validate_service_url(url)?;
         let security = if authenticated && !(self.user.is_empty() && self.password.is_empty()) {
             let mut nonce = [0u8; 16];
             rand::fill(&mut nonce[..]);
@@ -347,8 +423,11 @@ impl OnvifDevice {
             .header("Content-Type", "application/soap+xml; charset=utf-8")
             .body(envelope)
             .send()
-            .map_err(|error| format!("ONVIF request to {} failed: {error}", safe_url(url)))?;
+            .map_err(|_| format!("ONVIF request to {} failed", safe_url(url)))?;
         let status = response.status();
+        if matches!(status.as_u16(), 401 | 403) {
+            return Ok((status, String::new()));
+        }
         if response
             .content_length()
             .is_some_and(|length| length > MAX_ONVIF_RESPONSE_BYTES as u64)
@@ -362,12 +441,7 @@ impl OnvifDevice {
         response
             .take((MAX_ONVIF_RESPONSE_BYTES + 1) as u64)
             .read_to_end(&mut bytes)
-            .map_err(|error| {
-                format!(
-                    "failed to read ONVIF response from {}: {error}",
-                    safe_url(url)
-                )
-            })?;
+            .map_err(|_| format!("failed to read ONVIF response from {}", safe_url(url)))?;
         if bytes.len() > MAX_ONVIF_RESPONSE_BYTES {
             return Err(format!(
                 "ONVIF response body from {} exceeds {MAX_ONVIF_RESPONSE_BYTES} byte limit",
@@ -433,6 +507,8 @@ fn safe_url(url: &str) -> String {
     if let Ok(mut parsed) = url::Url::parse(url) {
         let _ = parsed.set_username("");
         let _ = parsed.set_password(None);
+        parsed.set_path("/");
+        parsed.set_query(None);
         parsed.set_fragment(None);
         parsed.to_string()
     } else {
@@ -440,21 +516,140 @@ fn safe_url(url: &str) -> String {
     }
 }
 
-fn safe_host(host: &str) -> String {
-    if has_rtsp_scheme(host) {
-        safe_url(host)
+fn validate_service_url(url: &str) -> Result<(), String> {
+    if url
+        .chars()
+        .any(|character| character.is_control() || character.is_whitespace())
+    {
+        return Err("invalid ONVIF service URL".to_owned());
+    }
+    let parsed = url::Url::parse(url).map_err(|_| "invalid ONVIF service URL".to_owned())?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.fragment().is_some()
+        || parsed.port() == Some(0)
+    {
+        return Err("invalid ONVIF service URL".to_owned());
+    }
+    Ok(())
+}
+
+fn direct_child<'document, 'input>(
+    parent: roxmltree::Node<'document, 'input>,
+    namespace: &str,
+    local: &str,
+) -> Option<roxmltree::Node<'document, 'input>> {
+    parent.children().find(|node| {
+        node.is_element()
+            && node.tag_name().namespace().unwrap_or_default() == namespace
+            && node.tag_name().name() == local
+    })
+}
+
+fn is_recognized_soap_envelope(document: &roxmltree::Document<'_>) -> bool {
+    const SOAP11_NS: &str = "http://schemas.xmlsoap.org/soap/envelope/";
+    const SOAP12_NS: &str = "http://www.w3.org/2003/05/soap-envelope";
+    let root = document.root_element();
+    root.tag_name().name() == "Envelope"
+        && matches!(root.tag_name().namespace(), Some(SOAP11_NS | SOAP12_NS))
+}
+
+fn compatible_operation_response<'document, 'input>(
+    document: &'document roxmltree::Document<'input>,
+    namespace: &str,
+    local: &str,
+) -> Option<roxmltree::Node<'document, 'input>> {
+    const SOAP11_NS: &str = "http://schemas.xmlsoap.org/soap/envelope/";
+    const SOAP12_NS: &str = "http://www.w3.org/2003/05/soap-envelope";
+    let root = document.root_element();
+    let root_namespace = root.tag_name().namespace().unwrap_or_default();
+    if root.tag_name().name() != "Envelope" {
+        return None;
+    }
+    if matches!(root_namespace, SOAP11_NS | SOAP12_NS) {
+        let body = direct_child(root, root_namespace, "Body")?;
+        direct_child(body, namespace, local)
+    } else if root_namespace.is_empty() {
+        let container = direct_child(root, "", "Body").unwrap_or(root);
+        direct_child(container, "", local)
     } else {
-        host.to_owned()
+        None
     }
 }
 
-fn parse_first_text(xml: &str, name: &str) -> Option<String> {
-    let document = roxmltree::Document::parse(xml).ok()?;
-    document
-        .descendants()
-        .find(|node| node.is_element() && node.tag_name().name() == name)?
+fn direct_text(parent: roxmltree::Node<'_, '_>, namespace: &str, local: &str) -> Option<String> {
+    direct_child(parent, namespace, local)?
         .text()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
         .map(str::to_owned)
+}
+
+fn parse_device_information(xml: &str) -> Result<DeviceInfo, String> {
+    let document = capabilities::parse_document(xml)
+        .map_err(|_| "invalid GetDeviceInformation response".to_owned())?;
+    let response =
+        compatible_operation_response(&document, DEVICE_NS, "GetDeviceInformationResponse")
+            .ok_or_else(|| "invalid GetDeviceInformation response".to_owned())?;
+    let namespace = response.tag_name().namespace().unwrap_or_default();
+    Ok(DeviceInfo {
+        manufacturer: direct_text(response, namespace, "Manufacturer"),
+        model: direct_text(response, namespace, "Model"),
+        firmware: direct_text(response, namespace, "FirmwareVersion"),
+        serial: direct_text(response, namespace, "SerialNumber"),
+    })
+}
+
+fn parse_media_xaddr(xml: &str) -> Result<Option<String>, String> {
+    let document = capabilities::parse_document(xml)
+        .map_err(|_| "invalid GetCapabilities response".to_owned())?;
+    let root = document.root_element();
+    let response = compatible_operation_response(&document, DEVICE_NS, "GetCapabilitiesResponse");
+    let (container, device_namespace, schema_namespace) = if let Some(response) = response {
+        let namespace = response.tag_name().namespace().unwrap_or_default();
+        let schema = if namespace.is_empty() { "" } else { SCHEMA_NS };
+        (response, namespace, schema)
+    } else if root.tag_name().namespace().is_none() && root.tag_name().name() == "Envelope" {
+        (root, "", "")
+    } else {
+        return Err("invalid GetCapabilities response".to_owned());
+    };
+    let capabilities = direct_child(container, device_namespace, "Capabilities")
+        .ok_or_else(|| "invalid GetCapabilities response".to_owned())?;
+    let Some(media) = direct_child(capabilities, schema_namespace, "Media") else {
+        return Ok(None);
+    };
+    Ok(direct_text(media, schema_namespace, "XAddr"))
+}
+
+fn parse_stream_uri(xml: &str) -> Result<Option<String>, String> {
+    let document =
+        capabilities::parse_document(xml).map_err(|_| "invalid ONVIF XML response".to_owned())?;
+    let root = document.root_element();
+    let strict_response =
+        compatible_operation_response(&document, MEDIA_NS, "GetStreamUriResponse")
+            .filter(|response| response.tag_name().namespace() == Some(MEDIA_NS))
+            .or_else(|| {
+                (root.tag_name().namespace() == Some(MEDIA_NS)
+                    && root.tag_name().name() == "GetStreamUriResponse")
+                    .then_some(root)
+            });
+    if strict_response.is_none() && is_recognized_soap_envelope(&document) {
+        return Err("invalid GetStreamUri response".to_owned());
+    }
+    if let Some(response) = strict_response {
+        let Some(media_uri) = direct_child(response, MEDIA_NS, "MediaUri") else {
+            return Ok(None);
+        };
+        return Ok(direct_text(media_uri, SCHEMA_NS, "Uri"));
+    }
+    Ok(document
+        .descendants()
+        .find(|node| node.is_element() && node.tag_name().name() == "Uri")
+        .and_then(|node| node.text())
+        .map(str::to_owned))
 }
 
 #[cfg(test)]
@@ -467,7 +662,8 @@ mod tests {
     use chrono::{TimeZone, Utc};
 
     use super::{
-        OnvifDevice, parse_device_time, parse_profile_tokens, probe_device_service, wsse_header,
+        OnvifDevice, parse_device_information, parse_device_time, parse_media_xaddr,
+        parse_profile_tokens, parse_profiles, parse_stream_uri, probe_device_service, wsse_header,
     };
 
     #[test]
@@ -501,6 +697,64 @@ mod tests {
         )
         .unwrap();
         assert_eq!(profiles, ["main", "sub"]);
+    }
+
+    #[test]
+    fn recognized_soap_envelopes_reject_wrong_operations_and_vendor_decoys() {
+        const SOAP12: &str = "http://www.w3.org/2003/05/soap-envelope";
+        let time_error = parse_device_time(&format!(
+            "<s:Envelope xmlns:s=\"{SOAP12}\" xmlns:v=\"urn:vendor\"><s:Body><v:WrongResponse><v:UTCDateTime><v:Time><v:Hour>13</v:Hour><v:Minute>14</v:Minute><v:Second>15</v:Second></v:Time><v:Date><v:Year>2026</v:Year><v:Month>7</v:Month><v:Day>16</v:Day></v:Date></v:UTCDateTime></v:WrongResponse></s:Body></s:Envelope>"
+        ))
+        .unwrap_err();
+        assert_eq!(time_error, "invalid GetSystemDateAndTime response");
+
+        let profiles_error = parse_profiles(&format!(
+            "<s:Envelope xmlns:s=\"{SOAP12}\" xmlns:v=\"urn:vendor\"><s:Body><v:WrongResponse><v:Profiles token=\"decoy-secret\"/></v:WrongResponse></s:Body></s:Envelope>"
+        ))
+        .unwrap_err();
+        assert_eq!(profiles_error, "invalid GetProfiles response");
+        assert!(!profiles_error.contains("decoy-secret"));
+
+        let stream_error = parse_stream_uri(&format!(
+            "<s:Envelope xmlns:s=\"{SOAP12}\" xmlns:v=\"urn:vendor\"><s:Body><v:WrongResponse><v:Uri>rtsp://camera/decoy-secret</v:Uri></v:WrongResponse></s:Body></s:Envelope>"
+        ))
+        .unwrap_err();
+        assert_eq!(stream_error, "invalid GetStreamUri response");
+        assert!(!stream_error.contains("decoy-secret"));
+    }
+
+    #[test]
+    fn rejects_dtd_entities_at_every_onvif_xml_boundary_without_payload_leakage() {
+        let forbidden = |xml: &str| {
+            format!("<!DOCTYPE s:Envelope [<!ENTITY injected \"entity-payload-marker\">]>{xml}")
+        };
+        let cases = [
+            parse_device_time(&forbidden(
+                "<Envelope><UTCDateTime><Year>2026</Year></UTCDateTime></Envelope>",
+            ))
+            .map(|_| ()),
+            parse_profiles(&forbidden(
+                "<Envelope><GetProfilesResponse><Profiles token=\"main\"/></GetProfilesResponse></Envelope>",
+            ))
+            .map(|_| ()),
+            parse_device_information(&forbidden(
+                "<Envelope><GetDeviceInformationResponse/></Envelope>",
+            ))
+            .map(|_| ()),
+            parse_media_xaddr(&forbidden(
+                "<Envelope><Capabilities><Media><XAddr>&injected;</XAddr></Media></Capabilities></Envelope>",
+            ))
+            .map(|_| ()),
+            parse_stream_uri(&forbidden(
+                "<Envelope><GetStreamUriResponse><Uri>&injected;</Uri></GetStreamUriResponse></Envelope>",
+            ))
+            .map(|_| ()),
+        ];
+
+        for result in cases {
+            let error = result.unwrap_err();
+            assert!(!error.contains("entity-payload-marker"));
+        }
     }
 
     #[test]
@@ -648,6 +902,25 @@ mod tests {
         server.join().unwrap();
 
         assert!(error.contains("404"));
+    }
+
+    #[test]
+    fn onvif_transport_errors_hide_url_paths_queries_and_client_details() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let error = probe_device_service(
+            &format!("http://127.0.0.1:{port}/path-secret?token=query-secret"),
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            format!("ONVIF request to http://127.0.0.1:{port}/ failed")
+        );
+        assert!(!error.contains("path-secret"));
+        assert!(!error.contains("query-secret"));
     }
 
     #[test]

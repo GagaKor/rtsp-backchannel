@@ -7,7 +7,20 @@ use std::time::{Duration, Instant};
 
 use rtsp_backchannel::cli::{Invocation, parse_invocation_from};
 use rtsp_backchannel::discovery::{DiscoveryOptions, parse_probe_matches};
-use rtsp_backchannel::onvif::{StreamUriOptions, get_stream_uris, parse_profiles};
+use rtsp_backchannel::onvif::{
+    CameraCapabilityOptions, DeviceInfo, OnvifDevice, StreamUriOptions, get_camera_capabilities,
+    get_stream_uris, parse_profiles,
+};
+
+const SOAP12_NS: &str = "http://www.w3.org/2003/05/soap-envelope";
+const DEVICE_NS: &str = "http://www.onvif.org/ver10/device/wsdl";
+const SCHEMA_NS: &str = "http://www.onvif.org/ver10/schema";
+const MEDIA1_NS: &str = "http://www.onvif.org/ver10/media/wsdl";
+const MEDIA2_NS: &str = "http://www.onvif.org/ver20/media/wsdl";
+const PTZ_NS: &str = "http://www.onvif.org/ver20/ptz/wsdl";
+const EVENTS_NS: &str = "http://www.onvif.org/ver10/events/wsdl";
+const WSTOP_NS: &str = "http://docs.oasis-open.org/wsn/t-1";
+const TOPICS_NS: &str = "http://www.onvif.org/ver10/topics";
 
 const PROBE_RESPONSE: &str = r#"<?xml version="1.0"?>
 <s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
@@ -328,6 +341,539 @@ fn uppercase_direct_rtsp_credentials_are_never_logged() {
     assert!(!combined.contains("log-user"));
     assert!(!combined.contains("log-pass"));
     assert!(!combined.contains("#secret"));
+}
+
+#[test]
+fn capability_connect_returns_device_information_in_the_existing_three_requests() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let device_url = format!("http://127.0.0.1:{port}/selected/device");
+    let media_url = format!("http://127.0.0.1:{port}/connected/media");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let server = serve_capability_responses(
+        listener,
+        capability_connect_responses(&media_url),
+        Arc::clone(&requests),
+    );
+    let mut device = OnvifDevice::with_device_urls_and_timeout(
+        "camera",
+        "admin",
+        "password",
+        vec![device_url],
+        Duration::from_secs(2),
+    )
+    .unwrap();
+
+    let info = device.connect().unwrap();
+    server.join().unwrap();
+
+    assert_eq!(
+        info,
+        DeviceInfo {
+            manufacturer: Some("Fixture Camera".to_owned()),
+            model: Some("C1".to_owned()),
+            firmware: Some("1.2.3".to_owned()),
+            serial: Some("serial-1".to_owned()),
+        }
+    );
+    let requests = requests.lock().unwrap();
+    let paths = request_paths(&requests);
+    assert_eq!(
+        paths,
+        ["/selected/device", "/selected/device", "/selected/device"]
+    );
+}
+
+#[test]
+fn capability_report_routes_exact_operations_to_advertised_service_endpoints() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let device_url = format!("http://127.0.0.1:{port}/selected/device");
+    let connected_media = format!("http://127.0.0.1:{port}/connected/media");
+    let media1 = format!("http://127.0.0.1:{port}/advertised/media1");
+    let ptz = format!("http://127.0.0.1:{port}/advertised/ptz");
+    let events = format!("http://127.0.0.1:{port}/advertised/events");
+    let media2 = format!("http://127.0.0.1:{port}/advertised/media2");
+    let mut responses = capability_connect_responses(&connected_media);
+    responses.extend([
+        ok(capability_soap(
+            "<tds:GetScopesResponse><tds:Scopes><tt:ScopeItem>onvif://www.onvif.org/Profile/Streaming</tt:ScopeItem></tds:Scopes></tds:GetScopesResponse>",
+        )),
+        ok(capability_soap(&format!(
+            "<tds:GetServicesResponse>{}{}{}{}</tds:GetServicesResponse>",
+            capability_service(MEDIA1_NS, &media1, 2, 0),
+            capability_service(PTZ_NS, &ptz, 2, 0),
+            capability_service(EVENTS_NS, &events, 2, 0),
+            capability_service(MEDIA2_NS, &media2, 2, 0),
+        ))),
+        ok(capability_soap(
+            "<trt:GetProfilesResponse><trt:Profiles token=\"legacy\"><tt:Name>Legacy</tt:Name><tt:PTZConfiguration token=\"ptz-legacy\"><tt:NodeToken>node-1</tt:NodeToken></tt:PTZConfiguration></trt:Profiles></trt:GetProfilesResponse>",
+        )),
+        ok(capability_soap(
+            "<tptz:GetServiceCapabilitiesResponse><tptz:Capabilities EFlip=\"true\"/></tptz:GetServiceCapabilitiesResponse>",
+        )),
+        ok(capability_soap(
+            "<tptz:GetNodesResponse><tptz:PTZNode token=\"node-1\"><tt:SupportedPTZSpaces><tt:AbsolutePanTiltPositionSpace/><tt:AbsoluteZoomPositionSpace/></tt:SupportedPTZSpaces></tptz:PTZNode></tptz:GetNodesResponse>",
+        )),
+        ok(capability_soap(
+            "<tev:GetServiceCapabilitiesResponse><tev:Capabilities WSPullPointSupport=\"true\"/></tev:GetServiceCapabilitiesResponse>",
+        )),
+        ok(capability_soap(
+            "<tev:GetEventPropertiesResponse><wstop:TopicSet><tns:Motion wstop:topic=\"true\"/></wstop:TopicSet></tev:GetEventPropertiesResponse>",
+        )),
+        ok(capability_soap(
+            "<tr2:GetProfilesResponse><tr2:Profiles token=\"modern\"><tr2:Configurations><tr2:PTZ token=\"ptz-modern\"/></tr2:Configurations></tr2:Profiles></tr2:GetProfilesResponse>",
+        )),
+        ok(capability_soap(
+            "<tr2:GetVideoEncoderConfigurationOptionsResponse><tr2:Options><tt:Encoding>H264</tt:Encoding></tr2:Options><tr2:Options><tt:Encoding>H265</tt:Encoding></tr2:Options></tr2:GetVideoEncoderConfigurationOptionsResponse>",
+        )),
+    ]);
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let server = serve_capability_responses(listener, responses, Arc::clone(&requests));
+    let report = get_camera_capabilities(&CameraCapabilityOptions {
+        host: "camera".to_owned(),
+        user: "admin".to_owned(),
+        password: "password".to_owned(),
+        device_urls: vec![device_url],
+        timeout: Duration::from_secs(2),
+    })
+    .unwrap();
+    server.join().unwrap();
+
+    assert_eq!(
+        report.device.manufacturer.as_deref(),
+        Some("Fixture Camera")
+    );
+    assert_eq!(report.declared_profiles, ["S"]);
+    assert_eq!(report.service_discovery, "getServices");
+    assert_eq!(
+        report
+            .profiles
+            .iter()
+            .map(|profile| (profile.token.as_str(), profile.source.as_str()))
+            .collect::<Vec<_>>(),
+        [("legacy", "media1"), ("modern", "media2")]
+    );
+    assert_eq!(report.ptz.profile_tokens, ["legacy", "modern"]);
+    assert_eq!(report.ptz.detected, Some(true));
+    assert_eq!(report.ptz.pan_tilt_supported, Some(true));
+    assert_eq!(report.ptz.zoom_supported, Some(true));
+    assert_eq!(report.events.detected, Some(true));
+    assert_eq!(
+        report.events.topics[0].namespace.as_deref(),
+        Some(TOPICS_NS)
+    );
+    assert_eq!(report.events.topics[0].path, "Motion");
+    assert_eq!(report.media2.detected, Some(true));
+    assert_eq!(report.media2.encodings, ["H264", "H265"]);
+    assert_eq!(report.media2.h265_supported, Some(true));
+    assert!(report.warnings.is_empty());
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(
+        request_paths(&requests),
+        [
+            "/selected/device",
+            "/selected/device",
+            "/selected/device",
+            "/selected/device",
+            "/selected/device",
+            "/advertised/media1",
+            "/advertised/ptz",
+            "/advertised/ptz",
+            "/advertised/events",
+            "/advertised/events",
+            "/advertised/media2",
+            "/advertised/media2",
+        ]
+    );
+    let bodies = requests
+        .iter()
+        .map(|request| request_body(request))
+        .collect::<Vec<_>>();
+    assert!(bodies[3].contains(&format!("<GetScopes xmlns=\"{DEVICE_NS}\"/>")));
+    assert!(bodies[4].contains(&format!(
+        "<GetServices xmlns=\"{DEVICE_NS}\"><IncludeCapability>true</IncludeCapability></GetServices>"
+    )));
+    assert!(bodies[5].contains(&format!("<GetProfiles xmlns=\"{MEDIA1_NS}\"/>")));
+    assert!(bodies[6].contains(&format!("<GetServiceCapabilities xmlns=\"{PTZ_NS}\"/>")));
+    assert!(bodies[7].contains(&format!("<GetNodes xmlns=\"{PTZ_NS}\"/>")));
+    assert!(bodies[8].contains(&format!("<GetServiceCapabilities xmlns=\"{EVENTS_NS}\"/>")));
+    assert!(bodies[9].contains(&format!("<GetEventProperties xmlns=\"{EVENTS_NS}\"/>")));
+    assert!(bodies[10].contains(&format!(
+        "<GetProfiles xmlns=\"{MEDIA2_NS}\"><Type>All</Type></GetProfiles>"
+    )));
+    assert!(bodies[11].contains(&format!(
+        "<GetVideoEncoderConfigurationOptions xmlns=\"{MEDIA2_NS}\"/>"
+    )));
+}
+
+#[test]
+fn capability_action_not_supported_falls_back_to_get_capabilities_all() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let device_url = format!("http://127.0.0.1:{port}/selected/device");
+    let connected_media = format!("http://127.0.0.1:{port}/connected/media");
+    let legacy_media = format!("http://127.0.0.1:{port}/legacy/media");
+    let mut responses = capability_connect_responses(&connected_media);
+    responses.extend([
+        ok(capability_soap("<tds:GetScopesResponse/>")),
+        status(
+            500,
+            capability_soap(
+                "<s:Fault><s:Code><s:Value>s:Sender</s:Value><s:Subcode><s:Value xmlns:ter=\"http://www.onvif.org/ver10/error\">ter:ActionNotSupported</s:Value></s:Subcode></s:Code><s:Reason><s:Text>payload-secret</s:Text></s:Reason></s:Fault>",
+            ),
+        ),
+        ok(capability_soap(&format!(
+            "<tds:GetCapabilitiesResponse><tds:Capabilities><tt:Media><tt:XAddr>{legacy_media}</tt:XAddr></tt:Media></tds:Capabilities></tds:GetCapabilitiesResponse>"
+        ))),
+        ok(capability_soap("<trt:GetProfilesResponse/>")),
+    ]);
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let server = serve_capability_responses(listener, responses, Arc::clone(&requests));
+
+    let report = get_camera_capabilities(&CameraCapabilityOptions {
+        host: "camera".to_owned(),
+        user: String::new(),
+        password: String::new(),
+        device_urls: vec![device_url],
+        timeout: Duration::from_secs(2),
+    })
+    .unwrap();
+    server.join().unwrap();
+
+    assert_eq!(report.service_discovery, "getCapabilities");
+    assert_eq!(report.warnings.len(), 1);
+    assert_eq!(report.warnings[0].operation, "GetServices");
+    assert_eq!(report.warnings[0].message, "SOAP Fault: ActionNotSupported");
+    assert_eq!(report.ptz.detected, Some(false));
+    assert_eq!(report.events.detected, Some(false));
+    assert_eq!(report.media2.detected, None);
+    assert_eq!(report.media2.h265_supported, None);
+    let requests = requests.lock().unwrap();
+    assert_eq!(
+        request_paths(&requests),
+        [
+            "/selected/device",
+            "/selected/device",
+            "/selected/device",
+            "/selected/device",
+            "/selected/device",
+            "/selected/device",
+            "/legacy/media",
+        ]
+    );
+    assert!(request_body(&requests[5]).contains(&format!(
+        "<GetCapabilities xmlns=\"{DEVICE_NS}\"><Category>All</Category></GetCapabilities>"
+    )));
+}
+
+#[test]
+fn capability_malformed_get_services_also_uses_the_legacy_fallback() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let device_url = format!("http://127.0.0.1:{port}/selected/device");
+    let connected_media = format!("http://127.0.0.1:{port}/connected/media");
+    let legacy_media = format!("http://127.0.0.1:{port}/legacy/media");
+    let mut responses = capability_connect_responses(&connected_media);
+    responses.extend([
+        ok(capability_soap("<tds:GetScopesResponse/>")),
+        ok(capability_soap("<tds:GetServicesResponse/>")),
+        ok(capability_soap(&format!(
+            "<tds:GetCapabilitiesResponse><tds:Capabilities><tt:Media><tt:XAddr>{legacy_media}</tt:XAddr></tt:Media></tds:Capabilities></tds:GetCapabilitiesResponse>"
+        ))),
+        ok(capability_soap("<trt:GetProfilesResponse/>")),
+    ]);
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let server = serve_capability_responses(listener, responses, Arc::clone(&requests));
+
+    let report = get_camera_capabilities(&CameraCapabilityOptions {
+        host: "camera".to_owned(),
+        user: String::new(),
+        password: String::new(),
+        device_urls: vec![device_url],
+        timeout: Duration::from_secs(2),
+    })
+    .unwrap();
+    server.join().unwrap();
+
+    assert_eq!(report.service_discovery, "getCapabilities");
+    assert_eq!(report.warnings.len(), 1);
+    assert_eq!(report.warnings[0].operation, "GetServices");
+    assert_eq!(
+        report.warnings[0].message,
+        "no services in GetServices response"
+    );
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 7);
+    assert!(request_body(&requests[5]).contains(&format!(
+        "<GetCapabilities xmlns=\"{DEVICE_NS}\"><Category>All</Category></GetCapabilities>"
+    )));
+}
+
+#[test]
+fn capability_authentication_fault_is_fatal_and_never_runs_fallback() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let device_url = format!("http://127.0.0.1:{port}/selected/device");
+    let connected_media = format!("http://127.0.0.1:{port}/connected/media");
+    let mut responses = capability_connect_responses(&connected_media);
+    responses.extend([
+        ok(capability_soap("<tds:GetScopesResponse/>")),
+        status(
+            500,
+            capability_soap(
+                "<s:Fault><s:Code><s:Value>s:Sender</s:Value></s:Code><s:Reason><s:Text>Not authorized: viewer password payload-secret</s:Text></s:Reason></s:Fault>",
+            ),
+        ),
+    ]);
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let server = serve_capability_responses(listener, responses, Arc::clone(&requests));
+
+    let error = get_camera_capabilities(&CameraCapabilityOptions {
+        host: "camera".to_owned(),
+        user: "viewer".to_owned(),
+        password: "camera-secret".to_owned(),
+        device_urls: vec![device_url],
+        timeout: Duration::from_secs(2),
+    })
+    .unwrap_err();
+    server.join().unwrap();
+
+    assert_eq!(error, "SOAP Fault: NotAuthorized");
+    assert!(!error.contains("viewer"));
+    assert!(!error.contains("secret"));
+    assert_eq!(requests.lock().unwrap().len(), 5);
+}
+
+#[test]
+fn capability_optional_failures_are_sanitized_and_keep_unknowns() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let device_url = format!("http://127.0.0.1:{port}/selected/device");
+    let connected_media = format!("http://127.0.0.1:{port}/connected/media");
+    let media1 = format!("http://127.0.0.1:{port}/advertised/media1");
+    let ptz = format!("http://127.0.0.1:{port}/advertised/ptz");
+    let events = format!("http://127.0.0.1:{port}/advertised/events");
+    let media2 = format!("http://127.0.0.1:{port}/advertised/media2");
+    let mut responses = capability_connect_responses(&connected_media);
+    responses.extend([
+        ok("<!DOCTYPE s:Envelope [<!ENTITY injected \"payload-secret\">]><broken>&injected;</broken>".to_owned()),
+        ok(capability_soap(&format!(
+            "<tds:GetServicesResponse>{}{}{}{}</tds:GetServicesResponse>",
+            capability_service(MEDIA1_NS, &media1, 1, 0),
+            capability_service(PTZ_NS, &ptz, 1, 0),
+            capability_service(EVENTS_NS, &events, 1, 0),
+            capability_service(MEDIA2_NS, &media2, 2, 0),
+        ))),
+        status(500, "operator:camera-pass@camera payload-secret".to_owned()),
+        ok(capability_soap(
+            "<tptz:GetServiceCapabilitiesResponse><tptz:Capabilities Reverse=\"true\"/></tptz:GetServiceCapabilitiesResponse>",
+        )),
+        status(500, "payload-secret".to_owned()),
+        ok(capability_soap(
+            "<tev:GetServiceCapabilitiesResponse><tev:Capabilities/></tev:GetServiceCapabilitiesResponse>",
+        )),
+        status(500, "payload-secret".to_owned()),
+        ok(capability_soap(
+            "<tr2:GetProfilesResponse><tr2:Profiles token=\"media2-only\"><tr2:Configurations><tr2:AudioEncoder/></tr2:Configurations></tr2:Profiles></tr2:GetProfilesResponse>",
+        )),
+        ok(capability_soap(
+            "<tr2:GetVideoEncoderConfigurationOptionsResponse><tr2:Options><vendor:Encoding xmlns:vendor=\"urn:vendor\">H265</vendor:Encoding></tr2:Options></tr2:GetVideoEncoderConfigurationOptionsResponse>",
+        )),
+    ]);
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let server = serve_capability_responses(listener, responses, Arc::clone(&requests));
+
+    let report = get_camera_capabilities(&CameraCapabilityOptions {
+        host: "camera".to_owned(),
+        user: "operator".to_owned(),
+        password: "camera-pass".to_owned(),
+        device_urls: vec![device_url],
+        timeout: Duration::from_secs(2),
+    })
+    .unwrap();
+    server.join().unwrap();
+
+    assert!(report.scopes.is_empty());
+    assert_eq!(report.ptz.detected, Some(true));
+    assert_eq!(report.ptz.pan_tilt_supported, None);
+    assert_eq!(report.ptz.zoom_supported, None);
+    assert_eq!(report.events.detected, Some(true));
+    assert!(report.events.topics.is_empty());
+    assert_eq!(report.media2.detected, Some(true));
+    assert_eq!(report.media2.h265_supported, None);
+    assert_eq!(report.profiles[0].token, "media2-only");
+    assert_eq!(
+        report
+            .warnings
+            .iter()
+            .map(|warning| warning.operation.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "GetScopes",
+            "Media1 GetProfiles",
+            "PTZ GetNodes",
+            "Events GetEventProperties",
+            "Media2 GetVideoEncoderConfigurationOptions",
+        ]
+    );
+    let warning_text = serde_json::to_string(&report.warnings).unwrap();
+    for secret in [
+        "operator",
+        "camera-pass",
+        "payload-secret",
+        "PasswordDigest",
+        "@camera",
+    ] {
+        assert!(!warning_text.contains(secret));
+    }
+}
+
+#[test]
+fn capability_credential_service_url_is_rejected_before_network_dispatch() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let device_url = format!("http://127.0.0.1:{port}/selected/device");
+    let connected_media = format!("http://127.0.0.1:{port}/connected/media");
+    let unsafe_media = format!("http://viewer:url-secret@127.0.0.1:{port}/must-not-reach");
+    let mut responses = capability_connect_responses(&connected_media);
+    responses.extend([
+        ok(capability_soap("<tds:GetScopesResponse/>")),
+        ok(capability_soap(&format!(
+            "<tds:GetServicesResponse>{}</tds:GetServicesResponse>",
+            capability_service(MEDIA1_NS, &unsafe_media, 1, 0),
+        ))),
+    ]);
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let server = serve_capability_responses(listener, responses, Arc::clone(&requests));
+
+    let report = get_camera_capabilities(&CameraCapabilityOptions {
+        host: "camera".to_owned(),
+        user: "admin".to_owned(),
+        password: "camera-secret".to_owned(),
+        device_urls: vec![device_url],
+        timeout: Duration::from_secs(2),
+    })
+    .unwrap();
+    server.join().unwrap();
+
+    assert_eq!(requests.lock().unwrap().len(), 5);
+    assert_eq!(report.warnings.len(), 1);
+    assert_eq!(report.warnings[0].operation, "Media1 GetProfiles");
+    assert_eq!(report.warnings[0].message, "invalid ONVIF service URL");
+    assert!(!report.warnings[0].message.contains("viewer"));
+    assert!(!report.warnings[0].message.contains("url-secret"));
+}
+
+#[derive(Clone)]
+struct CapabilityHttpResponse {
+    status: u16,
+    body: String,
+}
+
+fn ok(body: String) -> CapabilityHttpResponse {
+    status(200, body)
+}
+
+fn status(status: u16, body: String) -> CapabilityHttpResponse {
+    CapabilityHttpResponse { status, body }
+}
+
+fn capability_soap(body: &str) -> String {
+    format!(
+        "<s:Envelope xmlns:s=\"{SOAP12_NS}\" xmlns:tds=\"{DEVICE_NS}\" \
+         xmlns:tt=\"{SCHEMA_NS}\" xmlns:trt=\"{MEDIA1_NS}\" \
+         xmlns:tr2=\"{MEDIA2_NS}\" xmlns:tptz=\"{PTZ_NS}\" \
+         xmlns:tev=\"{EVENTS_NS}\" xmlns:wstop=\"{WSTOP_NS}\" \
+         xmlns:tns=\"{TOPICS_NS}\"><s:Body>{body}</s:Body></s:Envelope>"
+    )
+}
+
+fn capability_connect_responses(media_url: &str) -> Vec<CapabilityHttpResponse> {
+    vec![
+        ok(capability_soap(
+            "<tds:GetSystemDateAndTimeResponse><tds:SystemDateAndTime><tt:UTCDateTime><tt:Time><tt:Hour>12</tt:Hour><tt:Minute>30</tt:Minute><tt:Second>0</tt:Second></tt:Time><tt:Date><tt:Year>2026</tt:Year><tt:Month>8</tt:Month><tt:Day>6</tt:Day></tt:Date></tt:UTCDateTime></tds:SystemDateAndTime></tds:GetSystemDateAndTimeResponse>",
+        )),
+        ok(capability_soap(
+            "<tds:GetDeviceInformationResponse><tds:Manufacturer>Fixture Camera</tds:Manufacturer><tds:Model>C1</tds:Model><tds:FirmwareVersion>1.2.3</tds:FirmwareVersion><tds:SerialNumber>serial-1</tds:SerialNumber></tds:GetDeviceInformationResponse>",
+        )),
+        ok(capability_soap(&format!(
+            "<tds:GetCapabilitiesResponse><tds:Capabilities><tt:Media><tt:XAddr>{media_url}</tt:XAddr></tt:Media></tds:Capabilities></tds:GetCapabilitiesResponse>"
+        ))),
+    ]
+}
+
+fn capability_service(namespace: &str, xaddr: &str, major: i32, minor: i32) -> String {
+    format!(
+        "<tds:Service><tds:Namespace>{namespace}</tds:Namespace><tds:XAddr>{xaddr}</tds:XAddr><tds:Version><tt:Major>{major}</tt:Major><tt:Minor>{minor}</tt:Minor></tds:Version></tds:Service>"
+    )
+}
+
+fn serve_capability_responses(
+    listener: TcpListener,
+    responses: Vec<CapabilityHttpResponse>,
+    requests: Arc<Mutex<Vec<String>>>,
+) -> thread::JoinHandle<()> {
+    listener.set_nonblocking(true).unwrap();
+    thread::spawn(move || {
+        for response in responses {
+            let deadline = Instant::now() + Duration::from_secs(4);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "timed out waiting for capability request"
+                        );
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("capability server accept failed: {error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            requests
+                .lock()
+                .unwrap()
+                .push(read_http_request(&mut stream));
+            let reason = match response.status {
+                200 => "OK",
+                401 => "Unauthorized",
+                403 => "Forbidden",
+                500 => "Internal Server Error",
+                _ => "Test Status",
+            };
+            write!(
+                stream,
+                "HTTP/1.1 {} {}\r\nContent-Type: application/soap+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response.status,
+                reason,
+                response.body.len(),
+                response.body
+            )
+            .unwrap();
+        }
+    })
+}
+
+fn request_paths(requests: &[String]) -> Vec<&str> {
+    requests
+        .iter()
+        .map(|request| {
+            request
+                .lines()
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .nth(1)
+                .unwrap()
+        })
+        .collect()
+}
+
+fn request_body(request: &str) -> &str {
+    request.split_once("\r\n\r\n").unwrap().1
 }
 
 fn read_http_request(stream: &mut impl Read) -> String {
