@@ -975,3 +975,148 @@ test('rejects missing capability hosts and non-positive or non-finite timeouts s
   assert.equal(calls, 0);
   assert.deepEqual(logs, []);
 });
+
+test('enforces an inclusive 24-hour capability timeout for separate and attached forms', async () => {
+  assert.equal(Number('86400000.000000001'), 86_400_000);
+  assert.ok(Number('86400000.00000001') > 86_400_000);
+  const logs: string[] = [];
+  const dependencies = commandDependencies(logs);
+  const calls: unknown[] = [];
+  dependencies.getCameraCapabilities = async (options) => {
+    calls.push(options);
+    return {};
+  };
+
+  for (const timeoutArguments of [
+    ['--timeout-ms', '86400000'],
+    ['--timeout-ms=86400000'],
+    ['--timeout-ms', '86400000.000000001'],
+    ['--timeout-ms=86400000.000000001'],
+  ]) {
+    await commandMain()(
+      ['capabilities', '--host', 'camera.local', ...timeoutArguments],
+      dependencies,
+    );
+  }
+
+  assert.deepEqual(calls, Array.from({ length: 4 }, () => ({
+    host: 'camera.local', user: '', pass: '', timeoutMs: 86_400_000,
+  })));
+});
+
+test('rejects fractional and huge capability timeouts before dispatch without reflecting inputs', async () => {
+  const logs: string[] = [];
+  const dependencies = commandDependencies(logs);
+  let calls = 0;
+  dependencies.getCameraCapabilities = async () => {
+    calls++;
+    throw new Error('capabilities should not run');
+  };
+  const cases = [
+    ['--timeout-ms', '86400000.00000001'],
+    ['--timeout-ms=86400000.00000001'],
+    ['--timeout-ms', '86400000.00000049'],
+    ['--timeout-ms=86400000.00000049'],
+    ['--timeout-ms', '86400001'],
+    ['--timeout-ms=86400001'],
+    ['--timeout-ms', '1e22'],
+    ['--timeout-ms=1e22'],
+  ];
+
+  for (const timeoutArguments of cases) {
+    const timeoutMarker = timeoutArguments.at(-1)!.replace('--timeout-ms=', '');
+    await assert.rejects(
+      commandMain()(
+        [
+          'capabilities', '--host', 'camera.local',
+          '--pass', 'huge-password-secret', ...timeoutArguments,
+        ],
+        dependencies,
+      ),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.equal(error.message, 'timeout-ms exceeds the 24-hour maximum');
+        assert.doesNotMatch(error.message, new RegExp(timeoutMarker));
+        assert.doesNotMatch(error.message, /huge-password-secret/);
+        return true;
+      },
+    );
+  }
+
+  assert.equal(calls, 0);
+  assert.deepEqual(logs, []);
+});
+
+test('rejects a bare capability terminator as control without exposing nearby secrets', async () => {
+  const logs: string[] = [];
+  const dependencies = commandDependencies(logs);
+  let calls = 0;
+  dependencies.getCameraCapabilities = async () => {
+    calls++;
+    return {};
+  };
+  const cases = [
+    {
+      argv: [
+        'capabilities', '--host', 'camera.local', '--pass', 'control-password-secret',
+        '--', '--pass=trailing-attached-secret',
+      ],
+      message: 'capabilities does not accept an argument terminator',
+    },
+    {
+      argv: [
+        'capabilities', '--host', 'camera.local', '--pass', '--',
+        '--pass=trailing-attached-secret',
+      ],
+      message: 'missing value for --pass',
+    },
+  ];
+
+  for (const { argv, message } of cases) {
+    await assert.rejects(
+      commandMain()(argv, dependencies),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.equal(error.message, message);
+        assert.doesNotMatch(
+          error.message,
+          /control-password-secret|trailing-attached-secret|camera\.local/,
+        );
+        return true;
+      },
+    );
+  }
+
+  assert.equal(calls, 0);
+  assert.deepEqual(logs, []);
+});
+
+test('keeps safe separate and attached hyphen-leading capability passwords opaque', async () => {
+  const logs: string[] = [];
+  const dependencies = commandDependencies(logs);
+  const calls: unknown[] = [];
+  dependencies.getCameraCapabilities = async (options) => {
+    calls.push(options);
+    return {};
+  };
+
+  for (const passwordArguments of [
+    ['--pass', '--separate-password-secret'],
+    ['--pass=--attached-password-secret'],
+    ['--pass=--'],
+    ['--pass='],
+  ]) {
+    await commandMain()(
+      ['capabilities', '--host', 'camera.local', ...passwordArguments],
+      dependencies,
+    );
+  }
+
+  assert.deepEqual(calls, [
+    { host: 'camera.local', user: '', pass: '--separate-password-secret' },
+    { host: 'camera.local', user: '', pass: '--attached-password-secret' },
+    { host: 'camera.local', user: '', pass: '--' },
+    { host: 'camera.local', user: '', pass: '' },
+  ]);
+  assert.ok(logs.every((line) => !/password-secret/.test(line)));
+});

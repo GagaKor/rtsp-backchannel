@@ -45,7 +45,7 @@ Discovery options:
 
 Capability options:
   --device-url <url>  ONVIF Device Service URL (repeatable)
-  --timeout-ms <ms>   per-request timeout; must be greater than 0
+  --timeout-ms <ms>   finite positive per-request timeout (maximum: 86,400,000 ms)
 
 Playback profile: SDP codec negotiation, TCP interleaved RTP, real-time pacing.
 `;
@@ -60,6 +60,9 @@ const CODEC_PREFERENCES: readonly CodecPreference[] = [
   'g726-40',
   'aac',
 ];
+const MAX_CAPABILITY_TIMEOUT_MS = 86_400_000;
+const CAPABILITY_TIMEOUT_RANGE_ERROR = 'timeout-ms exceeds the 24-hour maximum';
+const CAPABILITY_TERMINATOR_ERROR = 'capabilities does not accept an argument terminator';
 
 function arg(argv: string[], name: string, def?: string): string {
   const i = argv.indexOf(`--${name}`);
@@ -118,23 +121,90 @@ function args(argv: string[], name: string): string[] {
   return values;
 }
 
-function capabilityOptionValues(
-  argv: string[],
-  name: string,
-  allowEmpty = false,
-): string[] {
-  const option = `--${name}`;
-  const values: string[] = [];
+const CAPABILITY_OPTION_NAMES = [
+  'host',
+  'user',
+  'pass',
+  'device-url',
+  'timeout-ms',
+] as const;
+type CapabilityOptionName = typeof CAPABILITY_OPTION_NAMES[number];
+
+function exactCapabilityOptionName(value: string): CapabilityOptionName | undefined {
+  return CAPABILITY_OPTION_NAMES.find((name) => value === `--${name}`);
+}
+
+function attachedCapabilityOption(
+  value: string,
+): { name: CapabilityOptionName; value: string } | undefined {
+  for (const name of CAPABILITY_OPTION_NAMES) {
+    const prefix = `--${name}=`;
+    if (value.startsWith(prefix)) return { name, value: value.slice(prefix.length) };
+  }
+  return undefined;
+}
+
+function isKnownCapabilityFlag(value: string): boolean {
+  return value === '-h'
+    || value === '--help'
+    || exactCapabilityOptionName(value) !== undefined
+    || attachedCapabilityOption(value) !== undefined;
+}
+
+function missingCapabilityValue(name: CapabilityOptionName): Error {
+  return new Error(`missing value for --${name}`);
+}
+
+interface ParsedCapabilityArguments {
+  host: string[];
+  user: string[];
+  pass: string[];
+  'device-url': string[];
+  'timeout-ms': string[];
+}
+
+function parseCapabilityArguments(argv: string[]): ParsedCapabilityArguments {
+  const terminatorIndex = argv.indexOf('--');
+  if (terminatorIndex >= 0) {
+    const precedingOption = exactCapabilityOptionName(argv[terminatorIndex - 1] ?? '');
+    if (precedingOption) throw missingCapabilityValue(precedingOption);
+    throw new Error(CAPABILITY_TERMINATOR_ERROR);
+  }
+
+  const parsed: ParsedCapabilityArguments = {
+    host: [],
+    user: [],
+    pass: [],
+    'device-url': [],
+    'timeout-ms': [],
+  };
   for (let index = 0; index < argv.length; index++) {
-    if (argv[index] !== option) continue;
-    const value = argv[index + 1];
-    if (value === undefined || value.startsWith('--') || (!allowEmpty && value === '')) {
-      throw new Error(`missing value for ${option}`);
+    const attached = attachedCapabilityOption(argv[index]);
+    if (attached) {
+      if (
+        (attached.name !== 'pass' && attached.value === '')
+        || (attached.name !== 'pass' && attached.value.startsWith('--'))
+      ) {
+        throw missingCapabilityValue(attached.name);
+      }
+      parsed[attached.name].push(attached.value);
+      continue;
     }
-    values.push(value);
+
+    const name = exactCapabilityOptionName(argv[index]);
+    if (!name) continue;
+    const value = argv[index + 1];
+    if (
+      value === undefined
+      || (name !== 'pass' && value === '')
+      || (name === 'pass' ? isKnownCapabilityFlag(value) : value.startsWith('--'))
+    ) {
+      throw missingCapabilityValue(name);
+    }
+    parsed[name].push(value);
     index++;
   }
-  return values;
+  return parsed;
 }
 
 export function parseCliArgs(argv: string[]): PlaybackOptions {
@@ -277,15 +347,19 @@ export async function main(
   }
   if (argv[0] === 'capabilities') {
     const commandArgs = argv.slice(1);
-    const hosts = capabilityOptionValues(commandArgs, 'host');
-    const users = capabilityOptionValues(commandArgs, 'user');
-    const passwords = capabilityOptionValues(commandArgs, 'pass', true);
-    const deviceUrls = capabilityOptionValues(commandArgs, 'device-url');
-    const timeoutValues = capabilityOptionValues(commandArgs, 'timeout-ms');
+    const parsed = parseCapabilityArguments(commandArgs);
+    const hosts = parsed.host;
+    const users = parsed.user;
+    const passwords = parsed.pass;
+    const deviceUrls = parsed['device-url'];
+    const timeoutValues = parsed['timeout-ms'];
     if (hosts.length === 0) throw new Error('missing --host');
     const timeoutMs = timeoutValues.length > 0 ? Number(timeoutValues[0]) : undefined;
     if (timeoutMs !== undefined && (!Number.isFinite(timeoutMs) || timeoutMs <= 0)) {
       throw new RangeError('timeout-ms must be finite and greater than 0');
+    }
+    if (timeoutMs !== undefined && timeoutMs > MAX_CAPABILITY_TIMEOUT_MS) {
+      throw new RangeError(CAPABILITY_TIMEOUT_RANGE_ERROR);
     }
     const report = await dependencies.getCameraCapabilities({
       host: hosts[0],

@@ -1,6 +1,7 @@
 import { SaxesParser } from 'saxes';
 
 const MAX_XML_BYTES = 1024 * 1024;
+const MAX_XML_ELEMENT_DEPTH = 64;
 const FORBIDDEN_DECLARATION_NAMES = ['DOCTYPE', 'ENTITY'] as const;
 
 function isXmlWhitespace(character: string | undefined): boolean {
@@ -123,6 +124,9 @@ export function parseXml(xml: string): XmlElement {
   let root: XmlElement | undefined;
 
   parser.on('opentag', (tag) => {
+    if (stack.length >= MAX_XML_ELEMENT_DEPTH) {
+      throw new Error('invalid XML document');
+    }
     const attributes = Object.values(tag.attributes).map((entry) =>
       Object.freeze({ uri: entry.uri, local: entry.local, value: entry.value })
     );

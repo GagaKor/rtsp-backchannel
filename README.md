@@ -233,6 +233,22 @@ The public report fields have these meanings:
   Initial connection and authentication failures are fatal; they reject the
   promise instead of becoming warnings.
 
+Authenticated service routing is anchored to the selected Device Service URL.
+The connected Media endpoint and every advertised Media1, Media2, PTZ, or Event
+XAddr must use the same scheme and canonical hostname or IP address. Ports,
+paths, and query strings may differ. Camera-reported XAddr values remain in
+`services` as evidence, but a mismatched endpoint receives neither WS-Security
+material nor a network request; optional enrichment records a generic warning
+and leaves the corresponding evidence empty or unknown.
+
+ONVIF response headers are limited to 64 KiB and response bodies/XML input to
+1 MiB. Parsed XML is limited to 64 element levels. Event enrichment retains at
+most 1,024 unique topics, with a 4,096-byte UTF-8 path limit, a 2,048-byte
+namespace limit, and a 256 KiB aggregate path-plus-namespace budget. Exceeding
+an optional enrichment budget leaves its result empty/unknown and adds a
+credential-safe warning. SOAP faults expose only canonical authentication and
+protocol codes; unknown camera codes become `Fault` without payload reflection.
+
 Tri-state booleans are deliberate: `true` means a successful response found the
 fact, `false` means a successful response established its absence, and `null`
 means the fact could not be established. Optional object members are omitted
@@ -369,7 +385,13 @@ for manual use, but `ONVIF_PASSWORD` avoids exposing the password in the
 process argument list. `capabilities` accepts repeatable `--device-url` values
 in the supplied order and prints exactly one native camelCase JSON report.
 Omitting `--timeout-ms` uses the client default; when supplied, it must be a
-finite number greater than zero.
+finite number greater than zero and no greater than 86,400,000 milliseconds
+(24 hours), inclusively. Capability argument validation uses fixed diagnostics
+that do not echo option values or credentials, rejects a bare `--`, and accepts
+hyphen-leading passwords through `--pass <value>` when they are not known
+flags or through the unambiguous `--pass=<value>` form. An explicit empty
+password remains distinct from an omitted password; prefer `ONVIF_PASSWORD` so
+secrets do not appear in the process argument list.
 
 ## Playback Behavior
 

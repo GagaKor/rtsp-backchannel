@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
+import http from 'node:http';
 import { test } from 'node:test';
 
 import {
+  getCameraCapabilities,
   getCameraCapabilitiesWithDependencies,
   mergeEventServiceCapabilities,
   parseCapabilitiesResponse,
@@ -118,6 +120,23 @@ test('associates only direct Service children and selects highest versions deter
   });
 });
 
+test('invalidates all of GetServices when any direct Service lacks Namespace or XAddr', () => {
+  const valid = service(MEDIA1_NS, 'http://camera/media');
+  for (const malformed of [
+    '<tds:Service><tds:XAddr>http://camera/missing-namespace</tds:XAddr></tds:Service>',
+    '<tds:Service><tds:Namespace>urn:missing-xaddr</tds:Namespace></tds:Service>',
+    '<tds:Service><tds:Namespace></tds:Namespace><tds:XAddr>http://camera/empty</tds:XAddr></tds:Service>',
+    '<tds:Service><tds:Namespace>urn:empty</tds:Namespace><tds:XAddr></tds:XAddr></tds:Service>',
+  ]) {
+    assert.throws(
+      () => parseServicesResponse(soap(
+        `<tds:GetServicesResponse>${valid}${malformed}</tds:GetServicesResponse>`,
+      )),
+      { name: 'OnvifResponseError', message: 'invalid GetServices response' },
+    );
+  }
+});
+
 test('accepts signed xs:int service versions but omits negative and out-of-range values', () => {
   const parsed = parseServicesResponse(soap(`
     <tds:GetServicesResponse>
@@ -224,6 +243,31 @@ test('maps every legacy GetCapabilities service and retains legacy Event fields'
   });
 });
 
+test('keeps duplicate legacy Event capabilities attached to the selected XAddr', () => {
+  const selectedHasCapabilities = parseCapabilitiesResponse(soap(`
+    <tds:GetCapabilitiesResponse><tds:Capabilities>
+      <tt:Events><tt:XAddr>http://camera/events-a</tt:XAddr>
+        <tt:WSPullPointSupport>false</tt:WSPullPointSupport></tt:Events>
+      <tt:Events><tt:XAddr>http://camera/events-z</tt:XAddr>
+        <tt:WSPullPointSupport>true</tt:WSPullPointSupport></tt:Events>
+    </tds:Capabilities></tds:GetCapabilitiesResponse>
+  `));
+  assert.equal(selectService(selectedHasCapabilities.services, EVENTS_NS)?.xaddr,
+    'http://camera/events-a');
+  assert.deepEqual(selectedHasCapabilities.eventServiceCapabilities, {
+    wsPullPointSupport: false,
+  });
+
+  const selectedHasNoCapabilities = parseCapabilitiesResponse(soap(`
+    <tds:GetCapabilitiesResponse><tds:Capabilities>
+      <tt:Events><tt:XAddr>http://camera/events-a</tt:XAddr></tt:Events>
+      <tt:Events><tt:XAddr>http://camera/events-z</tt:XAddr>
+        <tt:WSPullPointSupport>true</tt:WSPullPointSupport></tt:Events>
+    </tds:Capabilities></tds:GetCapabilitiesResponse>
+  `));
+  assert.equal(selectedHasNoCapabilities.eventServiceCapabilities, undefined);
+});
+
 test('rejects malformed, wrong-operation, empty, and SOAP Fault service responses', () => {
   assert.throws(() => parseServicesResponse('<broken>'), /invalid XML document/);
   assert.throws(
@@ -242,6 +286,95 @@ test('rejects malformed, wrong-operation, empty, and SOAP Fault service response
     `)),
     /ActionNotSupported/,
   );
+});
+
+test('uses a fixed SOAP fault allowlist without reflecting unknown camera payload markers', () => {
+  const unknownFaults = [
+    soap(
+      '<s:Fault><s:Code><s:Value>s:Sender</s:Value><s:Subcode>'
+      + '<s:Value>vendor:camera-password-marker</s:Value></s:Subcode></s:Code>'
+      + '<s:Reason><s:Text>viewer-marker</s:Text></s:Reason>'
+      + '<s:Detail>PasswordDigestABC123</s:Detail></s:Fault>',
+    ),
+    soap11(
+      '<env:Fault><faultcode>vendor:camera-password-marker</faultcode>'
+      + '<faultstring>viewer-marker</faultstring>'
+      + '<detail>PasswordDigestABC123</detail></env:Fault>',
+    ),
+  ];
+
+  for (const xml of unknownFaults) {
+    assert.throws(
+      () => parseServicesResponse(xml),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.equal(error.message, 'SOAP Fault: Fault');
+        assert.equal((error as Error & { faultCode?: string }).faultCode, 'Fault');
+        assert.doesNotMatch(
+          error.message,
+          /camera-password-marker|viewer-marker|PasswordDigestABC123/i,
+        );
+        return true;
+      },
+    );
+  }
+});
+
+test('canonicalizes only known authentication aliases and SOAP protocol fault codes', () => {
+  for (const [reason, expected] of [
+    ['not authorized', 'NotAuthorized'],
+    ['invalid-security', 'InvalidSecurity'],
+    ['failed_authentication', 'FailedAuthentication'],
+    ['UNAUTHORIZED', 'Unauthorized'],
+  ] as const) {
+    assert.throws(
+      () => parseServicesResponse(soap(
+        '<s:Fault><s:Code><s:Value>s:Sender</s:Value></s:Code>'
+        + `<s:Reason><s:Text>${reason}</s:Text></s:Reason></s:Fault>`,
+      )),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.equal(error.message, `SOAP Fault: ${expected}`);
+        assert.equal((error as Error & { faultCode?: string }).faultCode, expected);
+        return true;
+      },
+    );
+  }
+
+  for (const [xml, expected] of [
+    [soap('<s:Fault><s:Code><s:Value>s:VersionMismatch</s:Value></s:Code></s:Fault>'), 'VersionMismatch'],
+    [soap('<s:Fault><s:Code><s:Value>s:MustUnderstand</s:Value></s:Code></s:Fault>'), 'MustUnderstand'],
+    [soap('<s:Fault><s:Code><s:Value>s:DataEncodingUnknown</s:Value></s:Code></s:Fault>'), 'DataEncodingUnknown'],
+    [soap('<s:Fault><s:Code><s:Value>s:Sender</s:Value></s:Code></s:Fault>'), 'Sender'],
+    [soap('<s:Fault><s:Code><s:Value>s:Receiver</s:Value></s:Code></s:Fault>'), 'Receiver'],
+    [soap11('<env:Fault><faultcode>env:Client</faultcode></env:Fault>'), 'Client'],
+    [soap11('<env:Fault><faultcode>env:Server</faultcode></env:Fault>'), 'Server'],
+    [soap11('<env:Fault><faultcode>ter:ActionNotSupported</faultcode></env:Fault>'), 'ActionNotSupported'],
+  ] as const) {
+    assert.throws(
+      () => parseServicesResponse(xml),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.equal(error.message, `SOAP Fault: ${expected}`);
+        return true;
+      },
+    );
+  }
+
+  for (const unknownCode of ['UnauthorizedOperation', 'NotAuthorized2', 'foo.NotAuthorized']) {
+    assert.throws(
+      () => parseServicesResponse(soap(
+        '<s:Fault><s:Code><s:Value>s:Sender</s:Value><s:Subcode>'
+        + `<s:Value>${unknownCode}</s:Value></s:Subcode></s:Code></s:Fault>`,
+      )),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.equal(error.message, 'SOAP Fault: Fault');
+        assert.doesNotMatch(error.message, new RegExp(unknownCode.replace('.', '\\.')));
+        return true;
+      },
+    );
+  }
 });
 
 test('parses Media1 profiles with PTZ bindings without changing audio facts', () => {
@@ -324,6 +457,26 @@ test('parses Media2 Configurations and PTZ references independently from Media1'
       hasAudioSource: false,
     },
   ]);
+});
+
+test('invalidates a whole Media profile response when any direct profile token is missing or empty', () => {
+  for (const [parser, responseName, profilePrefix, operation] of [
+    [parseMedia1ProfilesResponse, 'trt:GetProfilesResponse', 'trt', 'Media1 GetProfiles'],
+    [parseMedia2ProfilesResponse, 'tr2:GetProfilesResponse', 'tr2', 'Media2 GetProfiles'],
+  ] as const) {
+    for (const invalidProfile of [
+      `<${profilePrefix}:Profiles/>`,
+      `<${profilePrefix}:Profiles token=""/>`,
+    ]) {
+      assert.throws(
+        () => parser(soap(
+          `<${responseName}><${profilePrefix}:Profiles token="valid"/>`
+          + `${invalidProfile}</${responseName}>`,
+        )),
+        { name: 'OnvifResponseError', message: `invalid ${operation} response` },
+      );
+    }
+  }
 });
 
 test('parses strict PTZ service booleans and omits invalid values', () => {
@@ -613,21 +766,124 @@ test('uses only the directly associated TopicSet and ignores nested decoys', () 
   );
 });
 
-test('walks a deeply nested TopicSet without recursion limits', () => {
-  const depth = 12_000;
-  const parsed = parseEventPropertiesResponse(soap(
+test('walks TopicSet iteratively within the 64-element XML depth limit', () => {
+  const topicDepth = 60;
+  const withinLimit = parseEventPropertiesResponse(soap(
     '<tev:GetEventPropertiesResponse><wstop:TopicSet>'
-    + '<tns:L>'.repeat(depth)
+    + '<tns:L>'.repeat(topicDepth - 1)
     + '<vendor:Leaf wstop:topic="true"/>'
-    + '</tns:L>'.repeat(depth)
+    + '</tns:L>'.repeat(topicDepth - 1)
     + '</wstop:TopicSet></tev:GetEventPropertiesResponse>',
   ));
 
-  assert.equal(parsed.length, 1);
-  assert.equal(parsed[0].namespace, 'urn:vendor');
-  assert.equal(parsed[0].path.split('/').length, depth + 1);
-  assert.match(parsed[0].path, /^L\/L\//);
-  assert.match(parsed[0].path, /\/Leaf$/);
+  assert.equal(withinLimit.length, 1);
+  assert.equal(withinLimit[0].namespace, 'urn:vendor');
+  assert.equal(withinLimit[0].path.split('/').length, topicDepth);
+  assert.throws(
+    () => parseEventPropertiesResponse(soap(
+      '<tev:GetEventPropertiesResponse><wstop:TopicSet>'
+      + '<tns:L>'.repeat(topicDepth)
+      + '<vendor:Leaf wstop:topic="true"/>'
+      + '</tns:L>'.repeat(topicDepth)
+      + '</wstop:TopicSet></tev:GetEventPropertiesResponse>',
+    )),
+    { name: 'Error', message: 'invalid XML document' },
+  );
+});
+
+test('retains at most 1024 unique Event topics while allowing a duplicate at the limit', () => {
+  const atLimit = Array.from(
+    { length: 1_024 },
+    (_, index) => `<vendor:T${String(index).padStart(4, '0')} wstop:topic="true"/>`,
+  ).join('');
+  const duplicateAtLimit = `${atLimit}<vendor:T0000 wstop:topic="true"/>`;
+
+  assert.equal(parseEventPropertiesResponse(soap(
+    `<tev:GetEventPropertiesResponse><wstop:TopicSet>${duplicateAtLimit}`
+    + '</wstop:TopicSet></tev:GetEventPropertiesResponse>',
+  )).length, 1_024);
+  assert.throws(
+    () => parseEventPropertiesResponse(soap(
+      `<tev:GetEventPropertiesResponse><wstop:TopicSet>${duplicateAtLimit}`
+      + '<vendor:T1024 wstop:topic="true"/>'
+      + '</wstop:TopicSet></tev:GetEventPropertiesResponse>',
+    )),
+    /invalid Events GetEventProperties response/,
+  );
+});
+
+test('enforces the 4096-byte retained Event topic path limit only for marked nodes', () => {
+  const maximumPath = `T${'x'.repeat(4_095)}`;
+  const oversizedPath = `T${'x'.repeat(4_096)}`;
+  assert.equal(Buffer.byteLength(maximumPath), 4_096);
+  assert.equal(Buffer.byteLength(oversizedPath), 4_097);
+
+  const parsed = parseEventPropertiesResponse(soap(
+    '<tev:GetEventPropertiesResponse><wstop:TopicSet>'
+    + `<vendor:${maximumPath} wstop:topic="true"/>`
+    + `<vendor:${oversizedPath}/>`
+    + '</wstop:TopicSet></tev:GetEventPropertiesResponse>',
+  ));
+  assert.equal(Buffer.byteLength(parsed[0].path), 4_096);
+  assert.throws(
+    () => parseEventPropertiesResponse(soap(
+      '<tev:GetEventPropertiesResponse><wstop:TopicSet>'
+      + `<vendor:${oversizedPath} wstop:topic="true"/>`
+      + '</wstop:TopicSet></tev:GetEventPropertiesResponse>',
+    )),
+    /invalid Events GetEventProperties response/,
+  );
+});
+
+test('enforces the 2048-byte retained Event topic namespace limit', () => {
+  const maximumNamespace = `urn:${'n'.repeat(2_044)}`;
+  const oversizedNamespace = `urn:${'n'.repeat(2_045)}`;
+  assert.equal(Buffer.byteLength(maximumNamespace), 2_048);
+  assert.equal(Buffer.byteLength(oversizedNamespace), 2_049);
+
+  const parsed = parseEventPropertiesResponse(soap(
+    '<tev:GetEventPropertiesResponse><wstop:TopicSet>'
+    + `<maximum:Topic xmlns:maximum="${maximumNamespace}" wstop:topic="true"/>`
+    + '</wstop:TopicSet></tev:GetEventPropertiesResponse>',
+  ));
+  assert.equal(Buffer.byteLength(parsed[0].namespace ?? ''), 2_048);
+  assert.throws(
+    () => parseEventPropertiesResponse(soap(
+      '<tev:GetEventPropertiesResponse><wstop:TopicSet>'
+      + `<oversized:Topic xmlns:oversized="${oversizedNamespace}" wstop:topic="true"/>`
+      + '</wstop:TopicSet></tev:GetEventPropertiesResponse>',
+    )),
+    /invalid Events GetEventProperties response/,
+  );
+});
+
+test('enforces the 256 KiB aggregate Event topic retention budget after deduplication', () => {
+  const topics = (lastPathBytes: number) => Array.from({ length: 64 }, (_, index) => {
+    const wantedLength = index === 63 ? lastPathBytes : 4_086;
+    const prefix = `T${String(index).padStart(2, '0')}`;
+    const name = prefix + 'x'.repeat(wantedLength - prefix.length);
+    return `<vendor:${name} wstop:topic="true"/>`;
+  }).join('');
+  const firstName = `T00${'x'.repeat(4_083)}`;
+  const exactlyAtLimit = topics(4_086) + `<vendor:${firstName} wstop:topic="true"/>`;
+
+  const parsed = parseEventPropertiesResponse(soap(
+    `<tev:GetEventPropertiesResponse><wstop:TopicSet>${exactlyAtLimit}`
+    + '</wstop:TopicSet></tev:GetEventPropertiesResponse>',
+  ));
+  assert.equal(parsed.length, 64);
+  assert.equal(
+    parsed.reduce((bytes, topic) =>
+      bytes + Buffer.byteLength(topic.path) + Buffer.byteLength(topic.namespace ?? ''), 0),
+    256 * 1_024,
+  );
+  assert.throws(
+    () => parseEventPropertiesResponse(soap(
+      `<tev:GetEventPropertiesResponse><wstop:TopicSet>${topics(4_087)}`
+      + '</wstop:TopicSet></tev:GetEventPropertiesResponse>',
+    )),
+    /invalid Events GetEventProperties response/,
+  );
 });
 
 test('deduplicates repeated Media2 option encodings from children and compatible attributes', () => {
@@ -849,6 +1105,9 @@ test('keeps Media2 unknown after falling back to legacy GetCapabilities All', as
       + '<s:Value xmlns:ter="http://www.onvif.org/ver10/error">ter:ActionNotSupported</s:Value>'
       + '</s:Subcode></s:Code></s:Fault>', 500),
     response('<tds:GetServicesResponse/>'),
+    response(`<tds:GetServicesResponse>${service(MEDIA1_NS, 'http://camera/ignored-media')}`
+      + '<tds:Service><tds:Namespace>urn:missing-xaddr</tds:Namespace></tds:Service>'
+      + '</tds:GetServicesResponse>'),
   ];
 
   for (const getServicesFailure of getServicesFailures) {
@@ -1068,4 +1327,150 @@ test('continues with Media2 when Media1 and optional PTZ or Event enrichment fai
     'Media1 GetProfiles', 'PTZ GetNodes', 'Events GetServiceCapabilities',
   ]);
   assert.doesNotMatch(JSON.stringify(report.warnings), /operator|camera-pass|@camera/i);
+});
+
+test('keeps Events detected but topics unknown with one warning when topic budgets are exceeded', async () => {
+  const calls: RecordedCapabilityCall[] = [];
+  const oversizedTopics = Array.from(
+    { length: 1_025 },
+    (_, index) => `<vendor:T${String(index).padStart(4, '0')} wstop:topic="true"/>`,
+  ).join('');
+  const dependencies = fakeCapabilityDependencies(calls, async (body, endpoint) => {
+    if (body === GET_SCOPES) return response('<tds:GetScopesResponse/>');
+    if (body === GET_SERVICES) {
+      return response(
+        `<tds:GetServicesResponse>${service(EVENTS_NS, 'http://camera/events')}`
+        + '</tds:GetServicesResponse>',
+      );
+    }
+    if (body === MEDIA1_GET_PROFILES && endpoint === 'http://camera/connected-media') {
+      return response('<trt:GetProfilesResponse/>');
+    }
+    if (body === EVENTS_GET_CAPABILITIES && endpoint === 'http://camera/events') {
+      return response(
+        '<tev:GetServiceCapabilitiesResponse><tev:Capabilities/></tev:GetServiceCapabilitiesResponse>',
+      );
+    }
+    if (body === EVENTS_GET_PROPERTIES && endpoint === 'http://camera/events') {
+      return response(
+        `<tev:GetEventPropertiesResponse><wstop:TopicSet>${oversizedTopics}`
+        + '</wstop:TopicSet></tev:GetEventPropertiesResponse>',
+      );
+    }
+    throw new Error(`unexpected fake operation: ${body} at ${endpoint}`);
+  });
+
+  const report = await getCameraCapabilitiesWithDependencies({ host: 'camera' }, dependencies);
+
+  assert.equal(report.events.detected, true);
+  assert.deepEqual(report.events.topics, []);
+  assert.deepEqual(report.warnings, [{
+    operation: 'Events GetEventProperties',
+    message: 'invalid Events GetEventProperties response',
+  }]);
+});
+
+test('retains cross-host advertised XAddr facts but warns without contacting their server', async () => {
+  let attackerConnections = 0;
+  let attackerRequests = 0;
+  const attacker = http.createServer((_request, response) => {
+    attackerRequests++;
+    response.end();
+  });
+  attacker.on('connection', () => {
+    attackerConnections++;
+  });
+  await new Promise<void>((resolve) => attacker.listen(0, resolve));
+  const attackerAddress = attacker.address();
+  assert.ok(attackerAddress && typeof attackerAddress !== 'string');
+
+  let deviceRequests = 0;
+  const deviceServer = http.createServer((request, response) => {
+    let body = '';
+    request.setEncoding('utf8');
+    request.on('data', (chunk) => {
+      body += chunk;
+    });
+    request.on('end', () => {
+      deviceRequests++;
+      const envelope = (content: string) =>
+        `<s:Envelope xmlns:s="${SOAP_NS}"><s:Body>${content}</s:Body></s:Envelope>`;
+      response.setHeader('Content-Type', 'application/soap+xml');
+      if (body.includes('GetSystemDateAndTime')) {
+        response.end(envelope(
+          '<GetSystemDateAndTimeResponse><SystemDateAndTime><UTCDateTime>'
+          + '<Time><Hour>12</Hour></Time><Date><Year>2026</Year><Month>8</Month><Day>6</Day></Date>'
+          + '</UTCDateTime></SystemDateAndTime></GetSystemDateAndTimeResponse>',
+        ));
+      } else if (body.includes('GetDeviceInformation')) {
+        response.end(envelope(
+          `<tds:GetDeviceInformationResponse xmlns:tds="${DEV_NS}">`
+          + '<tds:Manufacturer> Acme &amp; Co </tds:Manufacturer>'
+          + '</tds:GetDeviceInformationResponse>',
+        ));
+      } else if (body.includes('<Category>Media</Category>')) {
+        const address = deviceServer.address();
+        assert.ok(address && typeof address !== 'string');
+        response.end(envelope(
+          '<GetCapabilitiesResponse><Capabilities><Media><XAddr>'
+          + `http://127.0.0.1:${address.port}/connected/media`
+          + '</XAddr></Media></Capabilities></GetCapabilitiesResponse>',
+        ));
+      } else if (body.includes('<GetScopes ')) {
+        response.end(envelope(`<tds:GetScopesResponse xmlns:tds="${DEV_NS}"/>`));
+      } else if (body.includes('<GetServices ')) {
+        const attackerBase = `http://localhost:${attackerAddress.port}`;
+        response.end(envelope(
+          `<tds:GetServicesResponse xmlns:tds="${DEV_NS}" xmlns:tt="${SCHEMA_NS}">`
+          + service(MEDIA1_NS, `${attackerBase}/media1`)
+          + service(PTZ_NS, `${attackerBase}/ptz`)
+          + service(EVENTS_NS, `${attackerBase}/events`)
+          + service(MEDIA2_NS, `${attackerBase}/media2`)
+          + '</tds:GetServicesResponse>',
+        ));
+      } else {
+        response.statusCode = 500;
+        response.end(envelope('<s:Fault/>'));
+      }
+    });
+  });
+  await new Promise<void>((resolve) => deviceServer.listen(0, '127.0.0.1', resolve));
+  const deviceAddress = deviceServer.address();
+  assert.ok(deviceAddress && typeof deviceAddress !== 'string');
+
+  try {
+    const report = await getCameraCapabilities({
+      host: 'camera',
+      user: 'viewer',
+      pass: 'camera-secret',
+      deviceUrls: [`http://127.0.0.1:${deviceAddress.port}/onvif/device_service`],
+    });
+
+    assert.equal(report.device.manufacturer, 'Acme & Co');
+    assert.equal(report.services.length, 4);
+    assert.ok(report.services.every(({ xaddr }) =>
+      xaddr.startsWith(`http://localhost:${attackerAddress.port}/`)));
+    assert.deepEqual(report.warnings.map(({ operation }) => operation), [
+      'Media1 GetProfiles',
+      'PTZ GetServiceCapabilities',
+      'PTZ GetNodes',
+      'Events GetServiceCapabilities',
+      'Events GetEventProperties',
+      'Media2 GetProfiles',
+      'Media2 GetVideoEncoderConfigurationOptions',
+    ]);
+    assert.ok(report.warnings.every(({ message }) => message === 'request failed'));
+    assert.deepEqual({ deviceRequests, attackerConnections, attackerRequests }, {
+      deviceRequests: 5,
+      attackerConnections: 0,
+      attackerRequests: 0,
+    });
+  } finally {
+    await Promise.all([
+      new Promise<void>((resolve, reject) =>
+        deviceServer.close((error) => (error ? reject(error) : resolve()))),
+      new Promise<void>((resolve, reject) =>
+        attacker.close((error) => (error ? reject(error) : resolve()))),
+    ]);
+  }
 });

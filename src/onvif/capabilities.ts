@@ -23,6 +23,10 @@ const PTZ_NS = 'http://www.onvif.org/ver20/ptz/wsdl';
 const EVENTS_NS = 'http://www.onvif.org/ver10/events/wsdl';
 const WSTOP_NS = 'http://docs.oasis-open.org/wsn/t-1';
 const PROFILE_SCOPE_PREFIX = 'onvif://www.onvif.org/Profile/';
+const MAX_EVENT_TOPICS = 1_024;
+const MAX_EVENT_TOPIC_PATH_BYTES = 4_096;
+const MAX_EVENT_TOPIC_NAMESPACE_BYTES = 2_048;
+const MAX_EVENT_TOPIC_RETAINED_BYTES = 256 * 1_024;
 
 export interface CameraCapabilityOptions {
   host: string;
@@ -188,33 +192,45 @@ function strictNonNegativeInteger(value: string | undefined): number | undefined
   return parsed !== undefined && parsed >= 0 ? parsed : undefined;
 }
 
-const AUTHENTICATION_FAULT_TOKENS = [
-  'NotAuthorized',
-  'InvalidSecurity',
-  'FailedAuthentication',
-  'Unauthorized',
+const AUTHENTICATION_FAULT_TOKENS: ReadonlyArray<readonly [string, string]> = [
+  ['NotAuthorized', 'notauthorized'],
+  ['NotAuthorized', 'not authorized'],
+  ['NotAuthorized', 'not_authorized'],
+  ['NotAuthorized', 'not-authorized'],
+  ['InvalidSecurity', 'invalidsecurity'],
+  ['InvalidSecurity', 'invalid security'],
+  ['InvalidSecurity', 'invalid_security'],
+  ['InvalidSecurity', 'invalid-security'],
+  ['FailedAuthentication', 'failedauthentication'],
+  ['FailedAuthentication', 'failed authentication'],
+  ['FailedAuthentication', 'failed_authentication'],
+  ['FailedAuthentication', 'failed-authentication'],
+  ['Unauthorized', 'unauthorized'],
 ] as const;
 
 function canonicalAuthenticationFault(value: string | undefined): string | undefined {
   if (!value) return undefined;
-  return AUTHENTICATION_FAULT_TOKENS.find((token) =>
-    new RegExp(`(?:^|[^A-Za-z0-9_.-])${token}(?:$|[^A-Za-z0-9_.-])`, 'i').test(value));
-}
-
-function faultReasonAuthenticationCode(
-  fault: XmlElement,
-  soapNamespace: string,
-): string | undefined {
-  if (soapNamespace === SOAP_11_NS) {
-    return canonicalAuthenticationFault(textOf(firstChild(fault, '', 'faultstring')));
-  }
-  const reason = firstChild(fault, soapNamespace, 'Reason');
-  if (!reason) return undefined;
-  for (const text of childElements(reason, soapNamespace, 'Text')) {
-    const token = canonicalAuthenticationFault(textOf(text));
-    if (token) return token;
+  for (const [canonical, token] of AUTHENTICATION_FAULT_TOKENS) {
+    if (new RegExp(`(?:^|[^A-Za-z0-9_.-])${token}(?:$|[^A-Za-z0-9_.-])`, 'i').test(value)) {
+      return canonical;
+    }
   }
   return undefined;
+}
+
+function canonicalProtocolFault(
+  value: string | undefined,
+  soapNamespace: string,
+): string | undefined {
+  const local = value?.trim().split(':').at(-1);
+  if (!local) return undefined;
+  const allowlist = [
+    'ActionNotSupported',
+    ...(soapNamespace === SOAP_11_NS
+      ? ['VersionMismatch', 'MustUnderstand', 'Client', 'Server']
+      : ['VersionMismatch', 'MustUnderstand', 'DataEncodingUnknown', 'Sender', 'Receiver']),
+  ];
+  return allowlist.find((candidate) => candidate.toLowerCase() === local.toLowerCase());
 }
 
 function operationResponse(
@@ -232,16 +248,34 @@ function operationResponse(
   if (!body) throw new OnvifResponseError('invalid', `invalid ${operation} response`);
   const fault = firstChild(body, soapNamespace, 'Fault');
   if (fault) {
-    let rawCode = textOf(firstChild(fault, '', 'faultcode'));
-    let code = firstChild(fault, soapNamespace, 'Code');
-    while (code) {
-      rawCode = textOf(firstChild(code, soapNamespace, 'Value')) ?? rawCode;
-      code = firstChild(code, soapNamespace, 'Subcode');
+    const faultValues: string[] = [];
+    let deepestCode: string | undefined;
+    if (soapNamespace === SOAP_11_NS) {
+      deepestCode = textOf(firstChild(fault, '', 'faultcode'));
+      const reason = textOf(firstChild(fault, '', 'faultstring'));
+      if (deepestCode) faultValues.push(deepestCode);
+      if (reason) faultValues.push(reason);
+    } else {
+      let code = firstChild(fault, soapNamespace, 'Code');
+      while (code) {
+        const value = textOf(firstChild(code, soapNamespace, 'Value'));
+        if (value) {
+          deepestCode = value;
+          faultValues.push(value);
+        }
+        code = firstChild(code, soapNamespace, 'Subcode');
+      }
+      const reason = firstChild(fault, soapNamespace, 'Reason');
+      if (reason) {
+        for (const text of childElements(reason, soapNamespace, 'Text')) {
+          const value = textOf(text);
+          if (value) faultValues.push(value);
+        }
+      }
     }
-    const candidate = rawCode?.split(':').at(-1) ?? '';
-    const shortCode = canonicalAuthenticationFault(rawCode)
-      ?? faultReasonAuthenticationCode(fault, soapNamespace)
-      ?? (/^[A-Za-z0-9_.-]{1,80}$/.test(candidate) ? candidate : 'Fault');
+    const shortCode = canonicalAuthenticationFault(faultValues.join(' '))
+      ?? canonicalProtocolFault(deepestCode, soapNamespace)
+      ?? 'Fault';
     throw new OnvifResponseError('fault', `SOAP Fault: ${shortCode}`, shortCode);
   }
   const response = firstChild(body, namespace, responseName);
@@ -353,7 +387,9 @@ export function parseServicesResponse(xml: string): ParsedServiceDiscovery {
   for (const source of sourceServices) {
     const namespace = textOf(firstChild(source, DEV_NS, 'Namespace'));
     const xaddr = textOf(firstChild(source, DEV_NS, 'XAddr'));
-    if (!namespace || !xaddr) continue;
+    if (!namespace || !xaddr) {
+      throw new OnvifResponseError('invalid', 'invalid GetServices response');
+    }
     const versionNode = firstChild(source, DEV_NS, 'Version');
     const major = strictNonNegativeInteger(
       versionNode ? firstChild(versionNode, SCHEMA_NS, 'Major')?.text : undefined,
@@ -430,21 +466,32 @@ export function parseCapabilitiesResponse(xml: string): ParsedServiceDiscovery {
     ...(extension?.children.filter((node) => node.uri === SCHEMA_NS) ?? []),
   ];
   const services: CameraCapabilityService[] = [];
-  let eventServiceCapabilities: EventServiceCapabilities | undefined;
+  const eventCapabilityCandidates: Array<{
+    service: CameraCapabilityService;
+    capabilities?: EventServiceCapabilities;
+  }> = [];
   for (const candidate of candidates) {
     const namespace = LEGACY_SERVICE_NAMESPACES[candidate.local];
     const xaddr = textOf(firstChild(candidate, SCHEMA_NS, 'XAddr'));
     if (!namespace || !xaddr) continue;
-    services.push({ namespace, xaddr });
+    const service = { namespace, xaddr };
+    services.push(service);
     if (candidate.local === 'Events') {
       const parsed = eventCapabilitiesFromChildren(candidate);
-      if (Object.keys(parsed).length > 0) eventServiceCapabilities = parsed;
+      eventCapabilityCandidates.push({
+        service,
+        ...(Object.keys(parsed).length > 0 ? { capabilities: parsed } : {}),
+      });
     }
   }
   if (services.length === 0) {
     throw new OnvifResponseError('invalid', 'invalid GetCapabilities response: no services');
   }
   services.sort(serviceComparator);
+  const selectedEventService = selectService(services, EVENTS_NS);
+  const eventServiceCapabilities = eventCapabilityCandidates.find(
+    (candidate) => candidate.service === selectedEventService,
+  )?.capabilities;
   return {
     services,
     ...(eventServiceCapabilities ? { eventServiceCapabilities } : {}),
@@ -515,19 +562,29 @@ function profileComparator(
 /** @internal */
 export function parseMedia1ProfilesResponse(xml: string): CameraCapabilityProfile[] {
   const response = operationResponse(xml, MEDIA1_NS, 'GetProfilesResponse', 'Media1 GetProfiles');
-  return childElements(response, MEDIA1_NS, 'Profiles')
-    .map((profile) => parseProfile(profile, 'media1'))
-    .filter((profile): profile is CameraCapabilityProfile => Boolean(profile))
-    .sort(profileComparator);
+  const profiles: CameraCapabilityProfile[] = [];
+  for (const element of childElements(response, MEDIA1_NS, 'Profiles')) {
+    const profile = parseProfile(element, 'media1');
+    if (!profile) {
+      throw new OnvifResponseError('invalid', 'invalid Media1 GetProfiles response');
+    }
+    profiles.push(profile);
+  }
+  return profiles.sort(profileComparator);
 }
 
 /** @internal */
 export function parseMedia2ProfilesResponse(xml: string): CameraCapabilityProfile[] {
   const response = operationResponse(xml, MEDIA2_NS, 'GetProfilesResponse', 'Media2 GetProfiles');
-  return childElements(response, MEDIA2_NS, 'Profiles')
-    .map((profile) => parseProfile(profile, 'media2'))
-    .filter((profile): profile is CameraCapabilityProfile => Boolean(profile))
-    .sort(profileComparator);
+  const profiles: CameraCapabilityProfile[] = [];
+  for (const element of childElements(response, MEDIA2_NS, 'Profiles')) {
+    const profile = parseProfile(element, 'media2');
+    if (!profile) {
+      throw new OnvifResponseError('invalid', 'invalid Media2 GetProfiles response');
+    }
+    profiles.push(profile);
+  }
+  return profiles.sort(profileComparator);
 }
 
 /** @internal */
@@ -658,34 +715,61 @@ export function parseEventPropertiesResponse(xml: string): EventTopic[] {
     throw new OnvifResponseError('invalid', 'invalid Events GetEventProperties response');
   }
 
-  const topics: EventTopic[] = [];
-  const pathParts: string[] = [];
-  const pending: Array<{ node: XmlElement; exiting: boolean }> = [];
+  const invalidResponse = () => new OnvifResponseError(
+    'invalid',
+    'invalid Events GetEventProperties response',
+  );
+  const retained = new Map<string, Map<string, EventTopic>>();
+  let retainedTopicCount = 0;
+  let retainedTopicBytes = 0;
+  let path = '';
+  const pending: Array<{ node: XmlElement; restoreLength?: number }> = [];
   for (let index = topicSet.children.length - 1; index >= 0; index--) {
-    pending.push({ node: topicSet.children[index], exiting: false });
+    pending.push({ node: topicSet.children[index] });
   }
   while (pending.length > 0) {
-    const { node, exiting } = pending.pop()!;
-    if (exiting) {
-      pathParts.pop();
+    const { node, restoreLength } = pending.pop()!;
+    if (restoreLength !== undefined) {
+      path = path.slice(0, restoreLength);
       continue;
     }
-    pathParts.push(node.local);
+    const previousLength = path.length;
+    path += `${path ? '/' : ''}${node.local}`;
     if (strictBoolean(attribute(node, WSTOP_NS, 'topic')) === true) {
-      topics.push({
-        ...(node.uri ? { namespace: node.uri } : {}),
-        path: pathParts.join('/'),
-      });
+      const pathBytes = Buffer.byteLength(path, 'utf8');
+      if (pathBytes > MAX_EVENT_TOPIC_PATH_BYTES) throw invalidResponse();
+      const namespace = node.uri || undefined;
+      const namespaceBytes = Buffer.byteLength(namespace ?? '', 'utf8');
+      if (namespaceBytes > MAX_EVENT_TOPIC_NAMESPACE_BYTES) throw invalidResponse();
+      const namespaceKey = namespace ?? '';
+      const duplicate = retained.get(path)?.has(namespaceKey) ?? false;
+      if (!duplicate) {
+        if (retainedTopicCount >= MAX_EVENT_TOPICS) throw invalidResponse();
+        const topicBytes = pathBytes + namespaceBytes;
+        if (retainedTopicBytes + topicBytes > MAX_EVENT_TOPIC_RETAINED_BYTES) {
+          throw invalidResponse();
+        }
+        retainedTopicBytes += topicBytes;
+        retainedTopicCount++;
+        let namespaces = retained.get(path);
+        if (!namespaces) {
+          namespaces = new Map();
+          retained.set(path, namespaces);
+        }
+        namespaces.set(namespaceKey, {
+          ...(namespace ? { namespace } : {}),
+          path,
+        });
+      }
     }
-    pending.push({ node, exiting: true });
+    pending.push({ node, restoreLength: previousLength });
     for (let index = node.children.length - 1; index >= 0; index--) {
-      pending.push({ node: node.children[index], exiting: false });
+      pending.push({ node: node.children[index] });
     }
   }
 
-  const unique = new Map<string, EventTopic>();
-  for (const topic of topics) unique.set(`${topic.path}\0${topic.namespace ?? ''}`, topic);
-  return [...unique.values()].sort((left, right) =>
+  const topics = [...retained.values()].flatMap((namespaces) => [...namespaces.values()]);
+  return topics.sort((left, right) =>
     compareText(left.path, right.path)
     || compareText(left.namespace ?? '', right.namespace ?? ''));
 }

@@ -18,9 +18,10 @@ async function captureDeviceInformationRequest(
       response.writeHead(200, { 'Content-Type': 'application/soap+xml' });
       response.end(
         '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">' +
-          '<s:Body><GetDeviceInformationResponse>' +
-          '<Manufacturer>Test Camera</Manufacturer>' +
-          '</GetDeviceInformationResponse></s:Body></s:Envelope>',
+          '<s:Body><tds:GetDeviceInformationResponse ' +
+          'xmlns:tds="http://www.onvif.org/ver10/device/wsdl">' +
+          '<tds:Manufacturer>Test Camera</tds:Manufacturer>' +
+          '</tds:GetDeviceInformationResponse></s:Body></s:Envelope>',
       );
     });
   });
@@ -38,6 +39,26 @@ async function captureDeviceInformationRequest(
     );
   }
   return requestBody;
+}
+
+async function getDeviceInformationFromResponse(xml: string) {
+  const server = http.createServer((_request, response) => {
+    response.writeHead(200, { 'Content-Type': 'application/soap+xml' });
+    response.end(xml);
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+
+  try {
+    return await new OnvifDevice('camera').getDeviceInformation(
+      `http://127.0.0.1:${address.port}/onvif/device_service`,
+    );
+  } finally {
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
 }
 
 test('omits WS-Security entirely when both ONVIF credentials are empty', async () => {
@@ -72,6 +93,53 @@ test('builds PasswordDigest from nonce, created time, and the exact password byt
   assert.equal(digest, expected);
   assert.match(body, /<wsse:Username>admin&amp;ops<\/wsse:Username>/);
   assert.match(body, /#PasswordDigest/);
+});
+
+test('XML-decodes and trims only direct strict DeviceInfo fields', async () => {
+  const info = await getDeviceInformationFromResponse(
+    '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"'
+    + ' xmlns:tds="http://www.onvif.org/ver10/device/wsdl" xmlns:vendor="urn:vendor">'
+    + '<s:Body><tds:GetDeviceInformationResponse>'
+    + '<vendor:Manufacturer>wrong-namespace-marker</vendor:Manufacturer>'
+    + '<vendor:Wrapper><tds:Model>nested-decoy-marker</tds:Model></vendor:Wrapper>'
+    + '<tds:Manufacturer> \tAcme &amp; Co\r\n </tds:Manufacturer>'
+    + '<tds:Model> Model &lt;One&gt; </tds:Model>'
+    + '<tds:FirmwareVersion> \r\n\t </tds:FirmwareVersion>'
+    + '<tds:SerialNumber> S&amp;1 </tds:SerialNumber>'
+    + '</tds:GetDeviceInformationResponse></s:Body></s:Envelope>',
+  );
+
+  assert.deepEqual(info, {
+    manufacturer: 'Acme & Co',
+    model: 'Model <One>',
+    serial: 'S&1',
+  });
+});
+
+test('rejects wrong-operation and nested DeviceInfo decoys with payload-free errors', async () => {
+  const soapStart = '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"'
+    + ' xmlns:tds="http://www.onvif.org/ver10/device/wsdl" xmlns:vendor="urn:vendor"><s:Body>';
+  const cases = [
+    soapStart
+      + '<vendor:GetDeviceInformationResponse><vendor:Manufacturer>wrong-operation-marker'
+      + '</vendor:Manufacturer></vendor:GetDeviceInformationResponse></s:Body></s:Envelope>',
+    soapStart
+      + '<vendor:Wrapper><tds:GetDeviceInformationResponse>'
+      + '<tds:Manufacturer>nested-response-marker</tds:Manufacturer>'
+      + '</tds:GetDeviceInformationResponse></vendor:Wrapper></s:Body></s:Envelope>',
+  ];
+
+  for (const xml of cases) {
+    await assert.rejects(
+      getDeviceInformationFromResponse(xml),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.equal(error.message, 'invalid GetDeviceInformation response');
+        assert.doesNotMatch(error.message, /wrong-operation-marker|nested-response-marker/);
+        return true;
+      },
+    );
+  }
 });
 
 test('enforces an absolute wall-clock timeout during a trickle response', async () => {
@@ -175,8 +243,9 @@ test('keeps the three-call connect sequence and exposes selected and explicit re
         ));
       } else if (soapBody.includes('GetDeviceInformation')) {
         response.end(envelope(
-          '<GetDeviceInformationResponse><Manufacturer>Test Camera</Manufacturer>'
-          + '</GetDeviceInformationResponse>',
+          '<tds:GetDeviceInformationResponse xmlns:tds="http://www.onvif.org/ver10/device/wsdl">'
+          + '<tds:Manufacturer>Test Camera</tds:Manufacturer>'
+          + '</tds:GetDeviceInformationResponse>',
         ));
       } else if (soapBody.includes('<Category>Media</Category>')) {
         const address = server.address();
@@ -236,6 +305,162 @@ test('keeps the three-call connect sequence and exposes selected and explicit re
   }
 });
 
+test('rejects an advertised cross-host Media XAddr before connecting to the attacker', async () => {
+  let attackerRequests = 0;
+  const attacker = http.createServer((_request, response) => {
+    attackerRequests++;
+    response.end();
+  });
+  await new Promise<void>((resolve) => attacker.listen(0, resolve));
+  const attackerAddress = attacker.address();
+  assert.ok(attackerAddress && typeof attackerAddress !== 'string');
+
+  let deviceRequests = 0;
+  const deviceServer = http.createServer((request, response) => {
+    let body = '';
+    request.setEncoding('utf8');
+    request.on('data', (chunk) => {
+      body += chunk;
+    });
+    request.on('end', () => {
+      deviceRequests++;
+      const envelope = (content: string) =>
+        `<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body>${content}</s:Body></s:Envelope>`;
+      response.setHeader('Content-Type', 'application/soap+xml');
+      if (body.includes('GetSystemDateAndTime')) {
+        response.end(envelope(
+          '<GetSystemDateAndTimeResponse><SystemDateAndTime><UTCDateTime>'
+          + '<Time><Hour>12</Hour><Minute>30</Minute><Second>0</Second></Time>'
+          + '<Date><Year>2026</Year><Month>8</Month><Day>6</Day></Date>'
+          + '</UTCDateTime></SystemDateAndTime></GetSystemDateAndTimeResponse>',
+        ));
+      } else if (body.includes('GetDeviceInformation')) {
+        response.end(envelope(
+          '<tds:GetDeviceInformationResponse xmlns:tds="http://www.onvif.org/ver10/device/wsdl"/>',
+        ));
+      } else {
+        response.end(envelope(
+          '<GetCapabilitiesResponse><Capabilities><Media><XAddr>'
+          + `http://localhost:${attackerAddress.port}/advertised/media`
+          + '</XAddr></Media></Capabilities></GetCapabilitiesResponse>',
+        ));
+      }
+    });
+  });
+  await new Promise<void>((resolve) => deviceServer.listen(0, '127.0.0.1', resolve));
+  const deviceAddress = deviceServer.address();
+  assert.ok(deviceAddress && typeof deviceAddress !== 'string');
+
+  try {
+    const client = new OnvifDevice('camera', 'viewer', 'camera-secret', {
+      deviceUrls: [`http://127.0.0.1:${deviceAddress.port}/onvif/device_service`],
+    });
+    await assert.rejects(client.connect(), /invalid ONVIF service URL/);
+    assert.equal(deviceRequests, 3);
+    assert.equal(attackerRequests, 0);
+  } finally {
+    await Promise.all([
+      new Promise<void>((resolve, reject) =>
+        deviceServer.close((error) => (error ? reject(error) : resolve()))),
+      new Promise<void>((resolve, reject) =>
+        attacker.close((error) => (error ? reject(error) : resolve()))),
+    ]);
+  }
+});
+
+test('binds explicit authenticated calls by scheme and canonical host while allowing ports and paths', async () => {
+  let peerRequests = 0;
+  let peerConnections = 0;
+  const peer = http.createServer((_request, response) => {
+    peerRequests++;
+    response.setHeader('Content-Type', 'application/soap+xml');
+    response.end(
+      '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">'
+      + '<s:Body><GetScopesResponse/></s:Body></s:Envelope>',
+    );
+  });
+  peer.on('connection', () => {
+    peerConnections++;
+  });
+  await new Promise<void>((resolve) => peer.listen(0, resolve));
+  const peerAddress = peer.address();
+  assert.ok(peerAddress && typeof peerAddress !== 'string');
+
+  const deviceServer = http.createServer((request, response) => {
+    let body = '';
+    request.setEncoding('utf8');
+    request.on('data', (chunk) => {
+      body += chunk;
+    });
+    request.on('end', () => {
+      const envelope = (content: string) =>
+        `<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body>${content}</s:Body></s:Envelope>`;
+      response.setHeader('Content-Type', 'application/soap+xml');
+      if (body.includes('GetSystemDateAndTime')) {
+        response.end(envelope(
+          '<GetSystemDateAndTimeResponse><SystemDateAndTime><UTCDateTime>'
+          + '<Time><Hour>12</Hour></Time><Date><Year>2026</Year><Month>8</Month><Day>6</Day></Date>'
+          + '</UTCDateTime></SystemDateAndTime></GetSystemDateAndTimeResponse>',
+        ));
+      } else if (body.includes('GetDeviceInformation')) {
+        response.end(envelope(
+          '<tds:GetDeviceInformationResponse xmlns:tds="http://www.onvif.org/ver10/device/wsdl"/>',
+        ));
+      } else {
+        response.end(envelope(
+          '<GetCapabilitiesResponse><Capabilities><Media><XAddr>'
+          + `http://127.0.0.1:${peerAddress.port}/trusted/media`
+          + '</XAddr></Media></Capabilities></GetCapabilitiesResponse>',
+        ));
+      }
+    });
+  });
+  await new Promise<void>((resolve) => deviceServer.listen(0, '127.0.0.1', resolve));
+  const deviceAddress = deviceServer.address();
+  assert.ok(deviceAddress && typeof deviceAddress !== 'string');
+
+  try {
+    const client = new OnvifDevice('camera', 'viewer', 'camera-secret', {
+      deviceUrls: [`http://127.1:${deviceAddress.port}/onvif/device_service`],
+    });
+    await client.connect();
+
+    await assert.rejects(
+      client.readOnlyCall(
+        '<GetScopes xmlns="http://www.onvif.org/ver10/device/wsdl"/>',
+        `http://localhost:${peerAddress.port}/attacker`,
+      ),
+      /invalid ONVIF service URL/,
+    );
+    assert.equal(peerRequests, 0);
+    assert.equal(peerConnections, 0);
+
+    await assert.rejects(
+      client.readOnlyCall(
+        '<GetScopes xmlns="http://www.onvif.org/ver10/device/wsdl"/>',
+        `https://127.0.0.1:${peerAddress.port}/wrong-scheme`,
+      ),
+      /invalid ONVIF service URL/,
+    );
+    assert.equal(peerConnections, 0);
+
+    const allowed = await client.readOnlyCall(
+      '<GetScopes xmlns="http://www.onvif.org/ver10/device/wsdl"/>',
+      `http://127.0.0.1:${peerAddress.port}/different/path`,
+    );
+    assert.equal(allowed.statusCode, 200);
+    assert.equal(peerRequests, 1);
+    assert.equal(peerConnections, 1);
+  } finally {
+    await Promise.all([
+      new Promise<void>((resolve, reject) =>
+        deviceServer.close((error) => (error ? reject(error) : resolve()))),
+      new Promise<void>((resolve, reject) =>
+        peer.close((error) => (error ? reject(error) : resolve()))),
+    ]);
+  }
+});
+
 test('rejects unsafe service URLs without transmitting a request or exposing URL contents', async () => {
   let requestCount = 0;
   const server = http.createServer((_request, response) => {
@@ -243,8 +468,9 @@ test('rejects unsafe service URLs without transmitting a request or exposing URL
     response.setHeader('Content-Type', 'application/soap+xml');
     response.end(
       '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body>'
-      + '<GetDeviceInformationResponse><Manufacturer>Unexpected Camera</Manufacturer>'
-      + '</GetDeviceInformationResponse></s:Body></s:Envelope>',
+      + '<tds:GetDeviceInformationResponse xmlns:tds="http://www.onvif.org/ver10/device/wsdl">'
+      + '<tds:Manufacturer>Unexpected Camera</tds:Manufacturer>'
+      + '</tds:GetDeviceInformationResponse></s:Body></s:Envelope>',
     );
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -254,6 +480,10 @@ test('rejects unsafe service URLs without transmitting a request or exposing URL
   const endpoints = [
     `ftp://127.0.0.1:${address.port}/must-not-reach`,
     `http://viewer:url-secret@127.0.0.1:${address.port}/must-not-reach`,
+    `http://127.0.0.1:${address.port}/must-not-reach#fragment-secret`,
+    'http://127.0.0.1:0/must-not-reach',
+    ` http://127.0.0.1:${address.port}/must-not-reach`,
+    `http://127.0.0.1:${address.port}/must-not\nreach`,
     '/relative/onvif/device_service',
   ];
 

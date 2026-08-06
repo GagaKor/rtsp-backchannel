@@ -94,6 +94,16 @@ test('reports malformed XML with an operation-neutral error', () => {
   );
 });
 
+test('accepts at most 64 nested XML elements and rejects depth 65 deterministically', () => {
+  const nested = (depth: number) => '<n>'.repeat(depth) + '</n>'.repeat(depth);
+
+  assert.equal(parseXml(nested(64)).local, 'n');
+  assert.throws(
+    () => parseXml(nested(65)),
+    { name: 'Error', message: 'invalid XML document' },
+  );
+});
+
 test('allows declaration-like text inside an XML comment', () => {
   const root = parseXml('<root><!-- <!DOCTYPE harmless> --><child>ok</child></root>');
 

@@ -8,7 +8,10 @@
 import http from 'node:http';
 import https from 'node:https';
 import crypto from 'node:crypto';
+import { firstChild, parseXml, textOf, type XmlElement } from './xml.ts';
 
+const SOAP_12_NS = 'http://www.w3.org/2003/05/soap-envelope';
+const SOAP_11_NS = 'http://schemas.xmlsoap.org/soap/envelope/';
 const DEV_NS = 'http://www.onvif.org/ver10/device/wsdl';
 const MED_NS = 'http://www.onvif.org/ver10/media/wsdl';
 const SCHEMA_NS = 'http://www.onvif.org/ver10/schema';
@@ -41,6 +44,9 @@ function encodeXml(value: string): string {
 }
 
 function parseServiceUrl(value: string): URL {
+  if (/\p{White_Space}|\p{Cc}/u.test(value)) {
+    throw new Error('invalid ONVIF service URL');
+  }
   let parsed: URL;
   try {
     parsed = new URL(value);
@@ -49,12 +55,31 @@ function parseServiceUrl(value: string): URL {
   }
   if (
     (parsed.protocol !== 'http:' && parsed.protocol !== 'https:')
+    || parsed.hostname === ''
     || parsed.username !== ''
     || parsed.password !== ''
+    || parsed.hash !== ''
+    || parsed.port === '0'
   ) {
     throw new Error('invalid ONVIF service URL');
   }
   return parsed;
+}
+
+function canonicalServiceHostname(url: URL): string {
+  return url.hostname.toLowerCase().replace(/\.$/, '');
+}
+
+function parseServiceUrlAgainstDevice(deviceUrl: string, serviceUrl: string): URL {
+  const device = parseServiceUrl(deviceUrl);
+  const service = parseServiceUrl(serviceUrl);
+  if (
+    device.protocol !== service.protocol
+    || canonicalServiceHostname(device) !== canonicalServiceHostname(service)
+  ) {
+    throw new Error('invalid ONVIF service URL');
+  }
+  return service;
 }
 
 function safeConnectCause(error: unknown): string {
@@ -69,6 +94,49 @@ export interface DeviceInfo {
   model?: string;
   firmware?: string;
   serial?: string;
+}
+
+function invalidDeviceInformationResponse(): Error {
+  return new Error('invalid GetDeviceInformation response');
+}
+
+function deviceInformationResponse(xml: string): XmlElement {
+  let root: XmlElement;
+  try {
+    root = parseXml(xml);
+  } catch {
+    throw invalidDeviceInformationResponse();
+  }
+  if (root.local !== 'Envelope') throw invalidDeviceInformationResponse();
+
+  if (root.uri === SOAP_12_NS || root.uri === SOAP_11_NS) {
+    const body = firstChild(root, root.uri, 'Body');
+    const response = body && firstChild(body, DEV_NS, 'GetDeviceInformationResponse');
+    if (!response) throw invalidDeviceInformationResponse();
+    return response;
+  }
+  if (root.uri === '') {
+    const container = firstChild(root, '', 'Body') ?? root;
+    const response = firstChild(container, '', 'GetDeviceInformationResponse');
+    if (!response) throw invalidDeviceInformationResponse();
+    return response;
+  }
+  throw invalidDeviceInformationResponse();
+}
+
+function parseDeviceInformation(xml: string): DeviceInfo {
+  const response = deviceInformationResponse(xml);
+  const namespace = response.uri;
+  const manufacturer = textOf(firstChild(response, namespace, 'Manufacturer'));
+  const model = textOf(firstChild(response, namespace, 'Model'));
+  const firmware = textOf(firstChild(response, namespace, 'FirmwareVersion'));
+  const serial = textOf(firstChild(response, namespace, 'SerialNumber'));
+  return {
+    ...(manufacturer ? { manufacturer } : {}),
+    ...(model ? { model } : {}),
+    ...(firmware ? { firmware } : {}),
+    ...(serial ? { serial } : {}),
+  };
 }
 
 export interface OnvifProfile {
@@ -151,8 +219,9 @@ export class OnvifDevice {
         const t = await this.getSystemDateAndTime(url);
         this.clockOffsetMs = t.getTime() - Date.now();
         const info = await this.getDeviceInformation(url);
+        const mediaUrl = await this.discoverMediaUrl(url);
         this.deviceUrl = url;
-        this.mediaUrl = await this.discoverMediaUrl(url);
+        this.mediaUrl = mediaUrl;
         return info;
       } catch (err) {
         lastErr = err;
@@ -187,7 +256,9 @@ export class OnvifDevice {
     body: string,
     withAuth: boolean,
   ): Promise<OnvifRawResponse> {
-    const u = parseServiceUrl(url);
+    const u = this.deviceUrl
+      ? parseServiceUrlAgainstDevice(this.deviceUrl, url)
+      : parseServiceUrl(url);
     const header = withAuth ? this.securityHeader() : '';
     const envelope =
       `<?xml version="1.0" encoding="UTF-8"?>` +
@@ -298,27 +369,24 @@ export class OnvifDevice {
         /ter:(\w+)/.exec(xml)?.[0] ?? 'auth failed';
       throw new Error(`GetDeviceInformation rejected: ${fault.trim()}`);
     }
-    return {
-      manufacturer: firstTag(xml, 'Manufacturer'),
-      model: firstTag(xml, 'Model'),
-      firmware: firstTag(xml, 'FirmwareVersion'),
-      serial: firstTag(xml, 'SerialNumber'),
-    };
+    return parseDeviceInformation(xml);
   }
 
   private async discoverMediaUrl(deviceUrl: string): Promise<string> {
+    let advertisedUrl: string | undefined;
     try {
       const cap = await this.soap(
         deviceUrl,
         `<GetCapabilities xmlns="${DEV_NS}"><Category>Media</Category></GetCapabilities>`,
         true,
       );
-      const xaddr = /<[^>]*:?XAddr>(https?:\/\/[^<]*[Mm]edia[^<]*)<\/[^>]*:?XAddr>/.exec(cap)?.[1];
-      if (xaddr) return xaddr;
+      advertisedUrl = /<[^>]*:?XAddr>(https?:\/\/[^<]*[Mm]edia[^<]*)<\/[^>]*:?XAddr>/.exec(cap)?.[1];
     } catch {
       /* fall through to derived URL */
     }
-    return deviceUrl.replace('device_service', 'media_service');
+    const mediaUrl = advertisedUrl ?? deviceUrl.replace('device_service', 'media_service');
+    parseServiceUrlAgainstDevice(deviceUrl, mediaUrl);
+    return mediaUrl;
   }
 
   private requireDeviceUrl(): string {

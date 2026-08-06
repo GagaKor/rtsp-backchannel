@@ -217,6 +217,20 @@ console.log(report.declaredProfiles, report.media2.h265Supported);
   URL userinfo, raw or real camera response payload를 포함하지 않습니다. 최초 연결 또는
   인증 실패는 치명적이며 Promise를 reject하므로 warning으로 바뀌지 않습니다.
 
+인증된 서비스 요청의 신뢰 기준은 선택된 Device Service URL입니다. 연결된 Media
+endpoint와 광고된 모든 Media1, Media2, PTZ, Event XAddr는 같은 scheme과 canonical
+hostname 또는 IP 주소를 사용해야 합니다. 포트, path, query string은 달라도 됩니다.
+카메라가 보고한 XAddr는 근거로 `services`에 그대로 남지만, 기준과 다른 endpoint에는
+WS-Security material과 network request를 모두 보내지 않습니다. 선택적 보강에서는
+generic warning을 추가하고 관련 근거를 비어 있거나 알 수 없는 상태로 남깁니다.
+
+ONVIF 응답 header는 64 KiB, 응답 body/XML 입력은 1 MiB로 제한하며 XML element
+깊이는 최대 64입니다. Event 보강은 고유 topic을 최대 1,024개 보존하고, UTF-8 기준
+path 4,096 byte, namespace 2,048 byte, path와 namespace 합계 256 KiB를 넘을 수
+없습니다. 선택적 보강이 이 예산을 넘으면 결과를 비어 있거나 알 수 없는 상태로 두고
+자격 증명에 안전한 warning을 추가합니다. SOAP Fault는 canonical 인증 및 protocol
+code만 노출하며 알 수 없는 카메라 code는 payload를 반영하지 않고 `Fault`가 됩니다.
+
 3상 boolean에는 의도가 있습니다. `true`는 성공한 응답에서 해당 사실을 찾았다는
 뜻이고, `false`는 성공한 응답이 부재를 확인했다는 뜻이며, `null`은 사실을 확인할
 수 없었다는 뜻입니다. 장치가 보고하지 않은 선택적 object member는 생략됩니다.
@@ -318,6 +332,12 @@ rtsp-backchannel play \
 노출되지 않습니다. `capabilities`는 반복된 `--device-url`을 입력 순서대로 받고
 native camelCase JSON 보고서를 정확히 한 줄 출력합니다. `--timeout-ms`를 생략하면
 client 기본값을 사용하며, 지정할 때는 0보다 큰 유한한 숫자여야 합니다.
+최댓값 86,400,000ms(24시간)는 포함됩니다. 기능 인자 검증은 option 값이나 자격
+증명을 되풀이하지 않는 고정 진단을 사용하고 bare `--`를 거부합니다. 알려진 flag가
+아닌 하이픈 시작 비밀번호는 `--pass <값>`으로, 모호하지 않은 형태는
+`--pass=<값>`으로 전달할 수 있습니다. 명시적인 빈 비밀번호와 생략된 비밀번호의
+구분은 유지됩니다. 비밀이 프로세스 인자 목록에 남지 않도록 `ONVIF_PASSWORD` 사용을
+권장합니다.
 
 ## 재생 동작
 
