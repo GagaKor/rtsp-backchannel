@@ -124,6 +124,7 @@ console.log({ packetsSent });
 | --- | --- | --- |
 | `discoverDevices(options?)` | `timeoutMs?`, `interfaces?`, `cidrs?`, `ports?`, `concurrency?` | `Promise<DiscoveredDevice[]>` |
 | `getStreamUris(options)` | `host`, `user`, `pass`, `deviceUrls?`, `timeoutMs?` | `Promise<StreamUri[]>` |
+| `getCameraCapabilities(options)` | `host`, `user?`, `pass?`, `deviceUrls?`, `timeoutMs?` | `Promise<CameraCapabilityReport>` |
 | `playFile(options)` | `host`, `user`, `pass`, `file`, `volume`, `codec` | RTP 패킷 수 `Promise<number>` |
 
 `DiscoveredDevice`에는 `ip`, `xaddrs`, `scopes`와 선택적인 `name`, `hardware`,
@@ -164,6 +165,63 @@ CIDR 검색 결과의 `xaddrs`에는 응답한 서비스 URL이 들어갑니다.
 `getStreamUris`는 ONVIF Device 및 Media 서비스에 인증하고 모든 Media Profile의
 RTSP URI를 반환합니다. 네트워크, 인증 및 프로토콜 오류는 Promise rejection으로
 전달됩니다.
+
+### 카메라 기능 보고서
+
+`getCameraCapabilities`는 장치 식별 정보, scope, 광고된 서비스, Media profile,
+PTZ 사실, event topic, Media2 encoder 근거를 하나의 보고서로 수집합니다. 비밀번호는
+소스 코드에 넣지 말고 `ONVIF_PASSWORD`로 전달하십시오.
+
+```typescript
+import {
+  getCameraCapabilities,
+  type CameraCapabilityReport,
+} from 'rtsp-backchannel';
+
+const password = process.env.ONVIF_PASSWORD;
+if (!password) throw new Error('ONVIF_PASSWORD is required');
+
+const report: CameraCapabilityReport = await getCameraCapabilities({
+  host: 'camera.local',
+  user: 'operator',
+  pass: password,
+  deviceUrls: ['http://camera.local/onvif/device_service'],
+  timeoutMs: 8000,
+});
+
+console.log(report.declaredProfiles, report.media2.h265Supported);
+```
+
+공개 보고서 필드의 의미는 다음과 같습니다.
+
+- `device`는 카메라가 보고한 제조사, 모델, 펌웨어, 일련번호이고, `scopes`는
+  중복을 제거한 원본 ONVIF scope 값입니다.
+- `declaredProfiles`는 장치 scope에서 정규화한 profile 이름입니다. 장치의 자기
+  보고일 뿐 독립적인 ONVIF 인증 결과가 아닙니다.
+- `serviceDiscovery`는 서비스 목록을 `GetServices`, 기존 `GetCapabilities`
+  fallback 중 어디에서 얻었는지 또는 얻지 못했는지를 나타냅니다. `services`에는
+  namespace, XAddr, 선택적인 version 정보가 있습니다.
+- `profiles`는 Media1/Media2 profile binding, audio 유무, 선택적인 PTZ
+  configuration/node token을 설명합니다.
+- `ptz`에서는 광고된 PTZ 서비스(`detected`), profile과 PTZ의 연결
+  (`profileTokens`), 실제 movement space(`panTiltSupported`, `zoomSupported`,
+  `nodes`)를 서로 다른 사실로 취급합니다. 어느 하나가 나머지를 보장하지 않습니다.
+- `events`는 Event 서비스, 선택적인 서비스 기능, 표시된 WS-Topics path를
+  보고합니다. `media2`는 Media2 접근 가능 여부와 encoder option을 보고합니다.
+- `warnings`에는 선택적인 보강 요청의 실패를 인증정보 없이 정리해 담습니다. 최초
+  연결 또는 인증 실패는 warning으로 바꾸지 않고 Promise를 reject합니다.
+
+3상 boolean에는 의도가 있습니다. `true`는 성공한 응답에서 해당 사실을 찾았다는
+뜻이고, `false`는 성공한 응답이 부재를 확인했다는 뜻이며, `null`은 사실을 확인할
+수 없었다는 뜻입니다. 장치가 보고하지 않은 선택적 object member는 생략됩니다.
+특히 기존 `GetCapabilities`만 사용한 결과에서는 `media2.detected`와
+`h265Supported`가 `null`로 남습니다. Media2 및 H.265 option은 유용한 근거이지만
+Profile T 인증의 증명은 아닙니다.
+
+`timeoutMs`는 요청 하나마다 적용되는 timeout입니다. 기능 보고서는 여러 요청을
+수행하므로 전체 소요 시간은 timeout 한 구간보다 길 수 있습니다. 선택적인 보강
+요청은 실패 시 warning을 추가하고 계속할 수 있지만 단일 요청의 timeout을 늘리지는
+않습니다.
 
 ### 저수준 백채널 API
 
@@ -234,6 +292,13 @@ rtsp-backchannel streams \
   --host camera.local \
   --user admin
 
+# camelCase 카메라 기능 보고서 하나를 JSON 한 줄로 출력합니다.
+rtsp-backchannel capabilities \
+  --host camera.local \
+  --user operator \
+  --device-url http://camera.local/onvif/device_service \
+  --timeout-ms 8000
+
 # 음원 한 파일을 재생하고 RTSP 세션을 종료합니다.
 rtsp-backchannel play \
   --host camera.local \
@@ -244,7 +309,9 @@ rtsp-backchannel play \
 
 하위 호환성을 위해 `play` 단어는 생략할 수 있습니다. 수동 실행에서는 `--pass`도
 사용할 수 있지만, `ONVIF_PASSWORD`를 사용하면 비밀번호가 프로세스 인자 목록에
-노출되지 않습니다.
+노출되지 않습니다. `capabilities`는 반복된 `--device-url`을 입력 순서대로 받고
+native camelCase JSON 보고서를 정확히 한 줄 출력합니다. `--timeout-ms`를 생략하면
+client 기본값을 사용하며, 지정할 때는 0보다 큰 유한한 숫자여야 합니다.
 
 ## 재생 동작
 

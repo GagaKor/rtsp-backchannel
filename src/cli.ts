@@ -15,6 +15,7 @@ import {
 } from './backchannel.ts';
 import { fileToG711, fileToRtpAudio } from './audio/transcode.ts';
 import { pathToFileURL } from 'node:url';
+import { getCameraCapabilities } from './onvif/capabilities.ts';
 import { discoverDevices } from './onvif/discovery.ts';
 import { getStreamUris } from './onvif/streams.ts';
 import type { CodecPreference } from './rtsp/sdp.ts';
@@ -24,6 +25,8 @@ const HELP = `Usage: rtsp-backchannel --host <camera> --user <user> --pass <pass
                             [--cidr <IPv4/CIDR> ...] [--port <number> ...]
                             [--concurrency <1..256>]
   rtsp-backchannel streams --host <camera> [--user <user>] [--pass <password>]
+  rtsp-backchannel capabilities --host <camera> [--user <user>] [--pass <password>]
+                                [--device-url <url> ...] [--timeout-ms <ms>]
 
 Options:
   --file <path>       audio file to play once
@@ -39,6 +42,10 @@ Discovery options:
   --port <number>     ONVIF Device Service port (repeatable)
   --concurrency <n>   concurrent CIDR hosts (default: 64)
   --timeout-ms <ms>   discovery timeout (default: 3000)
+
+Capability options:
+  --device-url <url>  ONVIF Device Service URL (repeatable)
+  --timeout-ms <ms>   per-request timeout; must be greater than 0
 
 Playback profile: SDP codec negotiation, TCP interleaved RTP, real-time pacing.
 `;
@@ -86,6 +93,7 @@ export interface PlaybackDependencies {
 export interface CommandDependencies extends PlaybackDependencies {
   discoverDevices: typeof discoverDevices;
   getStreamUris: typeof getStreamUris;
+  getCameraCapabilities: typeof getCameraCapabilities;
 }
 
 const playbackDependencies: PlaybackDependencies = {
@@ -99,6 +107,7 @@ const commandDependencies: CommandDependencies = {
   ...playbackDependencies,
   discoverDevices,
   getStreamUris,
+  getCameraCapabilities,
 };
 
 function args(argv: string[], name: string): string[] {
@@ -245,6 +254,29 @@ export async function main(
       ...(concurrency !== undefined ? { concurrency } : {}),
     });
     for (const device of devices) dependencies.log(JSON.stringify(device));
+    return;
+  }
+  if (argv[0] === 'capabilities') {
+    const commandArgs = argv.slice(1);
+    const deviceUrls = args(commandArgs, 'device-url');
+    const passIndex = commandArgs.indexOf('--pass');
+    const pass = passIndex >= 0 && commandArgs[passIndex + 1] !== undefined
+      ? commandArgs[passIndex + 1]
+      : process.env.ONVIF_PASSWORD ?? '';
+    const timeoutMs = commandArgs.includes('--timeout-ms')
+      ? Number(arg(commandArgs, 'timeout-ms'))
+      : undefined;
+    if (timeoutMs !== undefined && (!Number.isFinite(timeoutMs) || timeoutMs <= 0)) {
+      throw new RangeError('timeout-ms must be finite and greater than 0');
+    }
+    const report = await dependencies.getCameraCapabilities({
+      host: arg(commandArgs, 'host'),
+      user: arg(commandArgs, 'user', ''),
+      pass,
+      ...(deviceUrls.length > 0 ? { deviceUrls } : {}),
+      ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+    });
+    dependencies.log(JSON.stringify(report));
     return;
   }
   if (argv[0] === 'streams') {

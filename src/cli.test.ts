@@ -28,6 +28,28 @@ test('prints TypeScript playback help without opening a camera connection', () =
   assert.match(result.stdout, /real-time pacing/);
 });
 
+test('documents the capabilities command in global and command help without exposing values', () => {
+  for (const argv of [
+    ['--help'],
+    ['capabilities', '--help', '--pass', 'help-only-secret'],
+  ]) {
+    const result = spawnSync(
+      process.execPath,
+      ['--experimental-transform-types', 'src/cli.ts', ...argv],
+      { encoding: 'utf8' },
+    );
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /rtsp-backchannel capabilities/);
+    assert.match(result.stdout, /--host <camera>/);
+    assert.match(result.stdout, /--user <user>/);
+    assert.match(result.stdout, /--pass <password>/);
+    assert.match(result.stdout, /--device-url <url>/);
+    assert.match(result.stdout, /--timeout-ms <ms>/);
+    assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /help-only-secret/);
+  }
+});
+
 test('runs the dedicated npm binary entry point', () => {
   const result = spawnSync(
     process.execPath,
@@ -491,6 +513,9 @@ test('keeps credential-bearing RTSP targets out of playback and stream logs', as
       profileToken: 'main',
       uri: 'rtsp://stream-user:p%40ss@camera.test/live',
     }],
+    getCameraCapabilities: async () => {
+      throw new Error('capabilities should not run');
+    },
   };
 
   await cli.playFile({ host: rawTarget, file: 'tone.wav' }, dependencies);
@@ -584,6 +609,7 @@ test('preserves playback and cleanup errors when both fail', async () => {
 interface CommandDependencies extends PlaybackDependencies {
   discoverDevices(options: unknown): Promise<unknown[]>;
   getStreamUris(options: unknown): Promise<unknown[]>;
+  getCameraCapabilities(options: unknown): Promise<unknown>;
 }
 
 type CommandMain = (
@@ -608,6 +634,9 @@ function commandDependencies(logs: string[]): CommandDependencies {
     log: (message) => logs.push(message),
     discoverDevices: async () => [],
     getStreamUris: async () => [],
+    getCameraCapabilities: async () => {
+      throw new Error('capabilities should not run');
+    },
   };
 }
 
@@ -670,4 +699,148 @@ test('dispatches discover and streams commands as JSON Lines', async () => {
     profileName: 'Main',
     uri: 'rtsp://camera/live',
   });
+});
+
+test('invokes capabilities exactly once and logs the native report as one JSON line', async () => {
+  const logs: string[] = [];
+  const dependencies = commandDependencies(logs);
+  const report = {
+    device: { manufacturer: 'Example Camera Vendor', model: 'Model A' },
+    scopes: ['onvif://www.onvif.org/Profile/Streaming'],
+    declaredProfiles: ['S'],
+    serviceDiscovery: 'getServices',
+    services: [],
+    profiles: [],
+    ptz: {
+      detected: null,
+      panTiltSupported: null,
+      zoomSupported: null,
+      profileTokens: [],
+      nodes: [],
+    },
+    events: { detected: false, topics: [] },
+    media2: { detected: true, encodings: ['H265'], h265Supported: true },
+    warnings: [],
+  };
+  let calls = 0;
+  dependencies.getCameraCapabilities = async (options) => {
+    calls++;
+    assert.deepEqual(options, {
+      host: 'camera.local',
+      user: 'operator',
+      pass: 'command-only-secret',
+      deviceUrls: [
+        'http://camera.local/onvif/device_service',
+        'http://camera.local:8000/onvif/device_service',
+      ],
+      timeoutMs: 2_500,
+    });
+    return report;
+  };
+
+  await commandMain()(
+    [
+      'capabilities',
+      '--host', 'camera.local',
+      '--user', 'operator',
+      '--pass', 'command-only-secret',
+      '--device-url', 'http://camera.local/onvif/device_service',
+      '--device-url', 'http://camera.local:8000/onvif/device_service',
+      '--timeout-ms', '2500',
+    ],
+    dependencies,
+  );
+
+  assert.equal(calls, 1);
+  assert.deepEqual(logs, [JSON.stringify(report)]);
+  assert.doesNotMatch(logs[0] ?? '', /command-only-secret/);
+});
+
+test('applies capability credential defaults and omits absent optional client settings', async () => {
+  const previous = process.env.ONVIF_PASSWORD;
+  const logs: string[] = [];
+  const dependencies = commandDependencies(logs);
+  const calls: unknown[] = [];
+  dependencies.getCameraCapabilities = async (options) => {
+    calls.push(options);
+    return {
+      device: {}, scopes: [], declaredProfiles: [], serviceDiscovery: 'unavailable',
+      services: [], profiles: [],
+      ptz: {
+        detected: null, panTiltSupported: null, zoomSupported: null,
+        profileTokens: [], nodes: [],
+      },
+      events: { detected: null, topics: [] },
+      media2: { detected: null, encodings: [], h265Supported: null },
+      warnings: [],
+    };
+  };
+
+  try {
+    process.env.ONVIF_PASSWORD = 'environment-only-secret';
+    await commandMain()(['capabilities', '--host', 'camera.local'], dependencies);
+    await commandMain()(
+      ['capabilities', '--host', 'camera.local', '--pass', 'explicit-secret'],
+      dependencies,
+    );
+    await commandMain()(
+      ['capabilities', '--host', 'camera.local', '--pass', ''],
+      dependencies,
+    );
+    delete process.env.ONVIF_PASSWORD;
+    await commandMain()(['capabilities', '--host', 'camera.local'], dependencies);
+  } finally {
+    if (previous === undefined) delete process.env.ONVIF_PASSWORD;
+    else process.env.ONVIF_PASSWORD = previous;
+  }
+
+  assert.deepEqual(calls, [
+    { host: 'camera.local', user: '', pass: 'environment-only-secret' },
+    { host: 'camera.local', user: '', pass: 'explicit-secret' },
+    { host: 'camera.local', user: '', pass: '' },
+    { host: 'camera.local', user: '', pass: '' },
+  ]);
+  assert.equal(logs.length, 4);
+  assert.ok(logs.every((line) => !/environment-only-secret|explicit-secret/.test(line)));
+});
+
+test('rejects missing capability hosts and non-positive or non-finite timeouts safely', async () => {
+  const logs: string[] = [];
+  const dependencies = commandDependencies(logs);
+  let calls = 0;
+  dependencies.getCameraCapabilities = async () => {
+    calls++;
+    throw new Error('capabilities should not run');
+  };
+
+  await assert.rejects(
+    commandMain()(
+      ['capabilities', '--pass', 'validation-only-secret'],
+      dependencies,
+    ),
+    (error: unknown) => {
+      assert.match(String(error), /missing --host/);
+      assert.doesNotMatch(String(error), /validation-only-secret/);
+      return true;
+    },
+  );
+  for (const timeout of ['0', '-1', 'NaN', 'Infinity']) {
+    await assert.rejects(
+      commandMain()(
+        [
+          'capabilities', '--host', 'camera.local',
+          '--pass', 'validation-only-secret', '--timeout-ms', timeout,
+        ],
+        dependencies,
+      ),
+      (error: unknown) => {
+        assert.match(String(error), /timeout-ms must be finite and greater than 0/);
+        assert.doesNotMatch(String(error), /validation-only-secret/);
+        return true;
+      },
+    );
+  }
+
+  assert.equal(calls, 0);
+  assert.deepEqual(logs, []);
 });

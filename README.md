@@ -126,6 +126,7 @@ console.log({ packetsSent });
 | --- | --- | --- |
 | `discoverDevices(options?)` | `timeoutMs?`, `interfaces?`, `cidrs?`, `ports?`, `concurrency?` | `Promise<DiscoveredDevice[]>` |
 | `getStreamUris(options)` | `host`, `user`, `pass`, `deviceUrls?`, `timeoutMs?` | `Promise<StreamUri[]>` |
+| `getCameraCapabilities(options)` | `host`, `user?`, `pass?`, `deviceUrls?`, `timeoutMs?` | `Promise<CameraCapabilityReport>` |
 | `playFile(options)` | `host`, `user`, `pass`, `file`, `volume`, `codec` | RTP packet count as `Promise<number>` |
 
 `DiscoveredDevice` contains `ip`, `xaddrs`, `scopes`, and optional `name`,
@@ -176,6 +177,67 @@ PasswordDigest, while RTSP authentication is sent only after a server
 challenge. WS-Security digest authenticates the request but does not encrypt
 transport. HTTP and HTTPS cameras, including self-signed TLS endpoints, are
 supported for compatibility; use a trusted network or VPN.
+
+### Camera Capability Reports
+
+`getCameraCapabilities` collects the device identity, scopes, advertised
+services, Media profiles, PTZ facts, event topics, and Media2 encoder evidence
+in one report. Supply passwords through `ONVIF_PASSWORD` rather than source
+code:
+
+```typescript
+import {
+  getCameraCapabilities,
+  type CameraCapabilityReport,
+} from 'rtsp-backchannel';
+
+const password = process.env.ONVIF_PASSWORD;
+if (!password) throw new Error('ONVIF_PASSWORD is required');
+
+const report: CameraCapabilityReport = await getCameraCapabilities({
+  host: 'camera.local',
+  user: 'operator',
+  pass: password,
+  deviceUrls: ['http://camera.local/onvif/device_service'],
+  timeoutMs: 8000,
+});
+
+console.log(report.declaredProfiles, report.media2.h265Supported);
+```
+
+The public report fields have these meanings:
+
+- `device` is the reported manufacturer, model, firmware, and serial identity;
+  `scopes` preserves the deduplicated raw ONVIF scope values.
+- `declaredProfiles` contains normalized profile names from device scopes. These
+  are device self-reports, not independent ONVIF certification results.
+- `serviceDiscovery` says whether the inventory came from `GetServices`, the
+  legacy `GetCapabilities` fallback, or was unavailable. `services` contains
+  namespace, XAddr, and optional version facts.
+- `profiles` describes Media1/Media2 profile bindings, including audio presence
+  and optional PTZ configuration/node tokens.
+- `ptz` separates three different facts: an advertised PTZ service
+  (`detected`), profile-to-PTZ bindings (`profileTokens`), and actual movement
+  spaces (`panTiltSupported`, `zoomSupported`, and `nodes`). One does not imply
+  the others.
+- `events` reports the Event service, optional service capabilities, and marked
+  WS-Topics paths. `media2` reports Media2 reachability and encoder options.
+- `warnings` contains sanitized failures from optional enrichment requests.
+  Initial connection and authentication failures reject the promise instead of
+  becoming warnings.
+
+Tri-state booleans are deliberate: `true` means a successful response found the
+fact, `false` means a successful response established its absence, and `null`
+means the fact could not be established. Optional object members are omitted
+when the device did not report them. In particular, a legacy
+`GetCapabilities`-only result leaves `media2.detected` and `h265Supported` as
+`null`. Media2 availability and H.265 options are useful evidence, but are not
+proof of Profile T certification.
+
+`timeoutMs` is a per-request timeout. Capability reporting performs multiple
+requests, so total elapsed time can exceed one timeout interval. Optional
+enrichment failures can add warnings and continue; they do not extend a single
+request's timeout.
 
 ### Low-Level Backchannel API
 
@@ -269,6 +331,13 @@ rtsp-backchannel streams \
   --host camera.local \
   --user admin
 
+# Print one camelCase camera capability report as one JSON line.
+rtsp-backchannel capabilities \
+  --host camera.local \
+  --user operator \
+  --device-url http://camera.local/onvif/device_service \
+  --timeout-ms 8000
+
 # Play one file and close the RTSP session.
 rtsp-backchannel play \
   --host camera.local \
@@ -289,7 +358,10 @@ rtsp-backchannel play \
 
 The `play` word is optional for backward compatibility. `--pass` is available
 for manual use, but `ONVIF_PASSWORD` avoids exposing the password in the
-process argument list.
+process argument list. `capabilities` accepts repeatable `--device-url` values
+in the supplied order and prints exactly one native camelCase JSON report.
+Omitting `--timeout-ms` uses the client default; when supplied, it must be a
+finite number greater than zero.
 
 ## Playback Behavior
 
