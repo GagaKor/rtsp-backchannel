@@ -207,16 +207,22 @@ console.log(report.declaredProfiles, report.media2.h265Supported);
   (`profileTokens`), 실제 movement space(`panTiltSupported`, `zoomSupported`,
   `nodes`)를 서로 다른 사실로 취급합니다. 어느 하나가 나머지를 보장하지 않습니다.
 - `events`는 Event 서비스, 선택적인 서비스 기능, 표시된 WS-Topics path를
-  보고합니다. `media2`는 Media2 접근 가능 여부와 encoder option을 보고합니다.
-- `warnings`에는 선택적인 보강 요청의 실패를 인증정보 없이 정리해 담습니다. 최초
-  연결 또는 인증 실패는 warning으로 바꾸지 않고 Promise를 reject합니다.
+  보고합니다.
+- `media2.detected`는 성공한 `GetServices` 응답이 Media2 서비스를 광고했는지만 나타냅니다.
+  접근 가능 여부를 뜻하지 않으며 Media2 보강 요청이 실패해도 `true`로 유지될 수 있습니다.
+  기존 `GetCapabilities` fallback 또는 서비스 검색 실패에서는 `null`입니다.
+  `media2.encodings`와 `media2.h265Supported`는 성공한 encoder option 보강 결과입니다.
+- `warnings`에는 선택적인 보강 요청의 실패가 들어갑니다. 각 `warning.message`는
+  generic canonical message만 사용하며 credentials, WSSE digest material,
+  URL userinfo, raw or real camera response payload를 포함하지 않습니다. 최초 연결 또는
+  인증 실패는 치명적이며 Promise를 reject하므로 warning으로 바뀌지 않습니다.
 
 3상 boolean에는 의도가 있습니다. `true`는 성공한 응답에서 해당 사실을 찾았다는
 뜻이고, `false`는 성공한 응답이 부재를 확인했다는 뜻이며, `null`은 사실을 확인할
 수 없었다는 뜻입니다. 장치가 보고하지 않은 선택적 object member는 생략됩니다.
 특히 기존 `GetCapabilities`만 사용한 결과에서는 `media2.detected`와
-`h265Supported`가 `null`로 남습니다. Media2 및 H.265 option은 유용한 근거이지만
-Profile T 인증의 증명은 아닙니다.
+`media2.h265Supported`가 `null`로 남습니다. Media2 서비스 광고와 성공한 H.265
+option 보강은 유용한 근거이지만 Profile T 인증의 증명은 아닙니다.
 
 `timeoutMs`는 요청 하나마다 적용되는 timeout입니다. 기능 보고서는 여러 요청을
 수행하므로 전체 소요 시간은 timeout 한 구간보다 길 수 있습니다. 선택적인 보강

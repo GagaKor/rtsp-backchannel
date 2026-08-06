@@ -228,6 +228,51 @@ test('ships separate English and Korean TypeScript documentation', () => {
   }
 });
 
+test('documents exact Media2 discovery and warning guarantees in both languages', () => {
+  const english = readFileSync('README.md', 'utf8');
+  const korean = readFileSync('README.ko.md', 'utf8');
+
+  assert.match(
+    english,
+    /`media2\.detected` reports only whether a successful `GetServices` response advertised a Media2 service/,
+  );
+  assert.match(
+    english,
+    /can remain `true` when Media2 enrichment\s+requests fail/,
+  );
+  assert.match(
+    korean,
+    /`media2\.detected`는 성공한 `GetServices` 응답이 Media2 서비스를 광고했는지만 나타냅니다/,
+  );
+  assert.match(
+    korean,
+    /Media2 보강 요청이 실패해도 `true`로 유지될 수 있습니다/,
+  );
+
+  for (const readme of [english, korean]) {
+    assert.match(readme, /`media2\.h265Supported`/);
+    assert.doesNotMatch(readme, /`h265Supported`/);
+    assert.match(
+      readme,
+      /`GetCapabilities`[\s\S]{0,300}`media2\.detected`[\s\S]{0,120}`media2\.h265Supported`[\s\S]{0,120}`null`/,
+    );
+    assert.match(readme, /`warning\.message`[\s\S]{0,300}generic canonical/);
+    assert.match(readme, /`warning\.message`[\s\S]{0,300}credentials/);
+    assert.match(readme, /`warning\.message`[\s\S]{0,300}WSSE digest material/);
+    assert.match(readme, /`warning\.message`[\s\S]{0,300}URL userinfo/);
+    assert.match(readme, /`warning\.message`[\s\S]{0,300}raw or real camera response payload/);
+  }
+
+  assert.match(
+    english,
+    /Initial connection and authentication failures are fatal[\s\S]{0,100}reject/,
+  );
+  assert.match(
+    korean,
+    /최초 연결 또는\s+인증 실패는 치명적이며[\s\S]{0,100}reject/,
+  );
+});
+
 test('ships clean public declarations without capability parser or injection seams', () => {
   const build = spawnSync('npm', ['run', 'build'], { encoding: 'utf8' });
   assert.equal(build.status, 0, build.stderr || build.stdout);

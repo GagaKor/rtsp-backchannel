@@ -221,18 +221,26 @@ The public report fields have these meanings:
   spaces (`panTiltSupported`, `zoomSupported`, and `nodes`). One does not imply
   the others.
 - `events` reports the Event service, optional service capabilities, and marked
-  WS-Topics paths. `media2` reports Media2 reachability and encoder options.
-- `warnings` contains sanitized failures from optional enrichment requests.
-  Initial connection and authentication failures reject the promise instead of
-  becoming warnings.
+  WS-Topics paths.
+- `media2.detected` reports only whether a successful `GetServices` response advertised a Media2 service.
+  It is not a reachability result and can remain `true` when Media2 enrichment
+  requests fail. It is `null` after the legacy `GetCapabilities` fallback or
+  unavailable service discovery. `media2.encodings` and
+  `media2.h265Supported` come from encoder-option enrichment when available.
+- `warnings` contains failures from optional enrichment requests. Each
+  `warning.message` uses generic canonical text and contains no credentials,
+  WSSE digest material, URL userinfo, or raw or real camera response payload.
+  Initial connection and authentication failures are fatal; they reject the
+  promise instead of becoming warnings.
 
 Tri-state booleans are deliberate: `true` means a successful response found the
 fact, `false` means a successful response established its absence, and `null`
 means the fact could not be established. Optional object members are omitted
 when the device did not report them. In particular, a legacy
-`GetCapabilities`-only result leaves `media2.detected` and `h265Supported` as
-`null`. Media2 availability and H.265 options are useful evidence, but are not
-proof of Profile T certification.
+`GetCapabilities`-only result leaves `media2.detected` and
+`media2.h265Supported` as `null`. A Media2 service advertisement and successful
+H.265 option enrichment are useful evidence, but are not proof of Profile T
+certification.
 
 `timeoutMs` is a per-request timeout. Capability reporting performs multiple
 requests, so total elapsed time can exceed one timeout interval. Optional
