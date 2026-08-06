@@ -3,8 +3,10 @@
 import argparse
 import json
 import math
+import os
 import sys
 
+from .capabilities import CameraCapabilityReport, get_camera_capabilities
 from .onvif import discover_devices, get_stream_uris
 from .playback import play_file
 
@@ -27,7 +29,7 @@ def _parser():
         description="Play one audio file through an ONVIF RTSP backchannel",
         epilog=(
             "Other commands: rtsp-backchannel discover; "
-            "rtsp-backchannel streams"
+            "rtsp-backchannel streams; rtsp-backchannel capabilities"
         ),
     )
     parser.add_argument("--host", required=True)
@@ -141,6 +143,70 @@ def _streams_parser():
     return parser
 
 
+def _nonempty_text(value):
+    if value == "":
+        raise argparse.ArgumentTypeError("must not be empty")
+    return value
+
+
+class _NonemptyTextAction(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        if values == "":
+            raise argparse.ArgumentError(self, "must not be empty")
+        setattr(namespace, self.dest, values)
+
+
+def _positive_finite_number(value):
+    try:
+        parsed = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "timeout-ms must be finite and greater than 0"
+        ) from error
+    if (
+        not math.isfinite(parsed)
+        or parsed <= 0
+        or parsed / 1000.0 <= 0
+    ):
+        raise argparse.ArgumentTypeError(
+            "timeout-ms must be finite and greater than 0"
+        )
+    return parsed
+
+
+def _capabilities_parser():
+    parser = argparse.ArgumentParser(
+        prog="rtsp-backchannel capabilities",
+        description="Report read-only ONVIF camera capability evidence",
+    )
+    parser.add_argument("--host", required=True, type=_nonempty_text)
+    parser.add_argument(
+        "--user",
+        default="",
+        action=_NonemptyTextAction,
+    )
+    parser.add_argument(
+        "--pass",
+        dest="password",
+        default=None,
+        help="password; defaults to ONVIF_PASSWORD when omitted",
+    )
+    parser.add_argument(
+        "--device-url",
+        action="append",
+        dest="device_urls",
+        type=_nonempty_text,
+        help="ONVIF Device service URL (repeatable; supplied order is kept)",
+    )
+    parser.add_argument(
+        "--timeout-ms",
+        type=_positive_finite_number,
+        default=None,
+        help="finite positive per-request timeout in milliseconds",
+    )
+    return parser
+
+
 def _device_json(device):
     result = {
         "ip": device.ip,
@@ -162,6 +228,157 @@ def _stream_json(stream):
         result["profileName"] = stream.profile_name
     result["uri"] = stream.uri
     return result
+
+
+def _camera_capability_json(report: CameraCapabilityReport):
+    device = {}
+    if report.device.manufacturer is not None:
+        device["manufacturer"] = report.device.manufacturer
+    if report.device.model is not None:
+        device["model"] = report.device.model
+    if report.device.firmware is not None:
+        device["firmware"] = report.device.firmware
+    if report.device.serial is not None:
+        device["serial"] = report.device.serial
+
+    services = []
+    for service in report.services:
+        item = {
+            "namespace": service.namespace,
+            "xaddr": service.xaddr,
+        }
+        if service.version is not None:
+            item["version"] = {
+                "major": service.version.major,
+                "minor": service.version.minor,
+            }
+        services.append(item)
+
+    profiles = []
+    for profile in report.profiles:
+        item = {
+            "token": profile.token,
+            "source": profile.source,
+            "hasAudioEncoder": profile.has_audio_encoder,
+            "hasAudioOutput": profile.has_audio_output,
+            "hasAudioSource": profile.has_audio_source,
+        }
+        if profile.name is not None:
+            item["name"] = profile.name
+        if profile.ptz_configuration_token is not None:
+            item["ptzConfigurationToken"] = (
+                profile.ptz_configuration_token
+            )
+        if profile.ptz_node_token is not None:
+            item["ptzNodeToken"] = profile.ptz_node_token
+        profiles.append(item)
+
+    ptz = {
+        "detected": report.ptz.detected,
+        "panTiltSupported": report.ptz.pan_tilt_supported,
+        "zoomSupported": report.ptz.zoom_supported,
+        "profileTokens": list(report.ptz.profile_tokens),
+    }
+    if report.ptz.service_capabilities is not None:
+        capabilities = {}
+        source = report.ptz.service_capabilities
+        if source.e_flip is not None:
+            capabilities["eFlip"] = source.e_flip
+        if source.reverse is not None:
+            capabilities["reverse"] = source.reverse
+        if source.get_compatible_configurations is not None:
+            capabilities["getCompatibleConfigurations"] = (
+                source.get_compatible_configurations
+            )
+        if source.move_status is not None:
+            capabilities["moveStatus"] = source.move_status
+        if source.status_position is not None:
+            capabilities["statusPosition"] = source.status_position
+        ptz["serviceCapabilities"] = capabilities
+    nodes = []
+    for node in report.ptz.nodes:
+        item = {
+            "token": node.token,
+            "spaces": {
+                "absolutePanTilt": node.spaces.absolute_pan_tilt,
+                "absoluteZoom": node.spaces.absolute_zoom,
+                "relativePanTilt": node.spaces.relative_pan_tilt,
+                "relativeZoom": node.spaces.relative_zoom,
+                "continuousPanTilt": node.spaces.continuous_pan_tilt,
+                "continuousZoom": node.spaces.continuous_zoom,
+            },
+        }
+        if node.name is not None:
+            item["name"] = node.name
+        if node.maximum_presets is not None:
+            item["maximumPresets"] = node.maximum_presets
+        if node.home_supported is not None:
+            item["homeSupported"] = node.home_supported
+        item["auxiliaryCommands"] = list(node.auxiliary_commands)
+        nodes.append(item)
+    ptz["nodes"] = nodes
+
+    events = {"detected": report.events.detected}
+    if report.events.service_capabilities is not None:
+        capabilities = {}
+        source = report.events.service_capabilities
+        if source.ws_subscription_policy_support is not None:
+            capabilities["wsSubscriptionPolicySupport"] = (
+                source.ws_subscription_policy_support
+            )
+        if source.ws_pull_point_support is not None:
+            capabilities["wsPullPointSupport"] = source.ws_pull_point_support
+        if (
+            source.ws_pausable_subscription_manager_interface_support
+            is not None
+        ):
+            capabilities[
+                "wsPausableSubscriptionManagerInterfaceSupport"
+            ] = source.ws_pausable_subscription_manager_interface_support
+        if source.persistent_notification_storage is not None:
+            capabilities["persistentNotificationStorage"] = (
+                source.persistent_notification_storage
+            )
+        if source.max_notification_producers is not None:
+            capabilities["maxNotificationProducers"] = (
+                source.max_notification_producers
+            )
+        if source.max_pull_points is not None:
+            capabilities["maxPullPoints"] = source.max_pull_points
+        if source.event_broker_protocols is not None:
+            capabilities["eventBrokerProtocols"] = list(
+                source.event_broker_protocols
+            )
+        if source.max_event_brokers is not None:
+            capabilities["maxEventBrokers"] = source.max_event_brokers
+        events["serviceCapabilities"] = capabilities
+    topics = []
+    for topic in report.events.topics:
+        item = {"path": topic.path}
+        if topic.namespace is not None:
+            item["namespace"] = topic.namespace
+        topics.append(item)
+    events["topics"] = topics
+
+    return {
+        "device": device,
+        "scopes": list(report.scopes),
+        "declaredProfiles": list(report.declared_profiles),
+        "serviceDiscovery": report.service_discovery,
+        "services": services,
+        "profiles": profiles,
+        "ptz": ptz,
+        "events": events,
+        "media2": {
+            "detected": report.media2.detected,
+            "encodings": list(report.media2.encodings),
+            "h265Supported": report.media2.h265_supported,
+        },
+        "warnings": [
+            {"operation": warning.operation, "message": warning.message}
+            for warning in report.warnings
+        ],
+    }
 
 
 def main(argv=None):
@@ -192,6 +409,29 @@ def main(argv=None):
         )
         for stream in streams:
             print(json.dumps(_stream_json(stream), ensure_ascii=False))
+        return
+    if arguments[:1] == ["capabilities"]:
+        args = _capabilities_parser().parse_args(arguments[1:])
+        capability_options = dict(
+            host=args.host,
+            user=args.user,
+            password=(
+                os.environ.get("ONVIF_PASSWORD", "")
+                if args.password is None
+                else args.password
+            ),
+        )
+        if args.device_urls is not None:
+            capability_options["device_urls"] = args.device_urls
+        if args.timeout_ms is not None:
+            capability_options["timeout"] = args.timeout_ms / 1000.0
+        report = get_camera_capabilities(**capability_options)
+        print(
+            json.dumps(
+                _camera_capability_json(report),
+                ensure_ascii=False,
+            )
+        )
         return
     if arguments[:1] == ["play"]:
         arguments = arguments[1:]
