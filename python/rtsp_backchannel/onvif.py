@@ -30,6 +30,8 @@ _MAX_CIDR_HOSTS = 4096
 _MAX_DISCOVERY_RESPONSE_BYTES = 1024 * 1024
 _MAX_SOAP_RESPONSE_BYTES = 1024 * 1024
 _DISCOVERY_READ_CHUNK_BYTES = 64 * 1024
+_SOAP11_NS = "http://schemas.xmlsoap.org/soap/envelope/"
+_SOAP12_NS = "http://www.w3.org/2003/05/soap-envelope"
 _DEVICE_NS = "http://www.onvif.org/ver10/device/wsdl"
 _MEDIA_NS = "http://www.onvif.org/ver10/media/wsdl"
 _SCHEMA_NS = "http://www.onvif.org/ver10/schema"
@@ -73,10 +75,24 @@ class OnvifProfile:
 
 
 @dataclass(frozen=True)
+class DeviceInfo:
+    manufacturer: str | None = None
+    model: str | None = None
+    firmware: str | None = None
+    serial: str | None = None
+
+
+@dataclass(frozen=True)
 class StreamUri:
     profile_token: str
     profile_name: str | None
     uri: str
+
+
+@dataclass(frozen=True)
+class _SoapResponse:
+    status_code: int
+    xml: str
 
 
 def _local_name(tag: str) -> str:
@@ -88,6 +104,55 @@ def _first_text(element: ElementTree.Element, name: str) -> str | None:
         if _local_name(candidate.tag) == name and candidate.text is not None:
             return candidate.text.strip()
     return None
+
+
+def _tag_parts(tag: str) -> tuple[str, str]:
+    if tag.startswith("{"):
+        namespace, local = tag[1:].split("}", 1)
+        return namespace, local
+    return "", tag
+
+
+def _direct_child(
+    element: ElementTree.Element, namespace: str, name: str
+) -> ElementTree.Element | None:
+    expected = (namespace, name)
+    return next(
+        (child for child in list(element) if _tag_parts(child.tag) == expected),
+        None,
+    )
+
+
+def _parse_device_information(xml: bytes | str) -> DeviceInfo:
+    root = ElementTree.fromstring(xml)
+    soap_namespace, root_name = _tag_parts(root.tag)
+    if root_name != "Envelope" or soap_namespace not in (
+        _SOAP11_NS,
+        _SOAP12_NS,
+    ):
+        raise RuntimeError("ONVIF authentication failed")
+    body = _direct_child(root, soap_namespace, "Body")
+    response = (
+        _direct_child(body, _DEVICE_NS, "GetDeviceInformationResponse")
+        if body is not None
+        else None
+    )
+    if response is None:
+        raise RuntimeError("ONVIF authentication failed")
+
+    def value(name: str) -> str | None:
+        child = _direct_child(response, _DEVICE_NS, name)
+        if child is None or child.text is None:
+            return None
+        parsed = child.text.strip()
+        return parsed or None
+
+    return DeviceInfo(
+        manufacturer=value("Manufacturer"),
+        model=value("Model"),
+        firmware=value("FirmwareVersion"),
+        serial=value("SerialNumber"),
+    )
 
 
 def _sanitize_stream_uri(uri: str) -> str:
@@ -562,7 +627,37 @@ def parse_profiles(xml: bytes | str) -> list[OnvifProfile]:
     return profiles
 
 
-def _soap_request(url: str, body: str, header: str, timeout: float) -> str:
+def _validate_service_url(value: str) -> None:
+    if not isinstance(value, str) or any(
+        ord(character) <= 0x20 or ord(character) == 0x7F
+        for character in value
+    ):
+        raise RuntimeError("invalid ONVIF service URL")
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except (AttributeError, TypeError, ValueError):
+        raise RuntimeError("invalid ONVIF service URL") from None
+    if (
+        parsed.scheme.lower() not in ("http", "https")
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+        or port == 0
+    ):
+        raise RuntimeError("invalid ONVIF service URL")
+
+
+def _soap_response(
+    url: str,
+    body: str,
+    header: str,
+    timeout: float,
+    *,
+    stop_on_auth_error: bool = False,
+) -> _SoapResponse:
+    _validate_service_url(url)
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("timeout must be finite and greater than 0")
     deadline = time.monotonic() + timeout
@@ -585,26 +680,45 @@ def _soap_request(url: str, body: str, header: str, timeout: float) -> str:
             request, timeout=remaining, context=_TLS_CONTEXT
         )
     except urllib.error.HTTPError as error:
+        if stop_on_auth_error and error.code in (401, 403):
+            error.close()
+            return _SoapResponse(error.code, "")
         with error:
-            return _bounded_response_body(
+            xml = _bounded_response_body(
                 error,
                 deadline,
                 max_bytes=_MAX_SOAP_RESPONSE_BYTES,
                 context="ONVIF SOAP",
             ).decode("utf-8", "replace")
+        return _SoapResponse(error.code, xml)
     except urllib.error.URLError as error:
         if isinstance(error.reason, TimeoutError):
             raise TimeoutError("ONVIF SOAP deadline exceeded") from error
         raise
     except TimeoutError as error:
         raise TimeoutError("ONVIF SOAP deadline exceeded") from error
+    getcode = getattr(response, "getcode", None)
+    status = (
+        getcode()
+        if callable(getcode)
+        else getattr(response, "status", 200)
+    )
+    status = status if isinstance(status, int) else 200
+    if stop_on_auth_error and status in (401, 403):
+        response.close()
+        return _SoapResponse(status, "")
     with response:
-        return _bounded_response_body(
+        xml = _bounded_response_body(
             response,
             deadline,
             max_bytes=_MAX_SOAP_RESPONSE_BYTES,
             context="ONVIF SOAP",
         ).decode("utf-8", "replace")
+    return _SoapResponse(status, xml)
+
+
+def _soap_request(url: str, body: str, header: str, timeout: float) -> str:
+    return _soap_response(url, body, header, timeout).xml
 
 
 def _wsse_header(user: str, password: str, when: datetime.datetime) -> str:
@@ -655,12 +769,38 @@ class OnvifDevice:
             f"http://{self.host}:8000/onvif/device_service",
         ]
 
-    def _call(self, url: str, body: str, *, authenticated: bool = True) -> str:
+    def _request(
+        self,
+        url: str,
+        body: str,
+        *,
+        authenticated: bool,
+        include_status: bool,
+    ) -> str | _SoapResponse:
+        _validate_service_url(url)
         header = ""
         if authenticated and (self.user or self.password):
             now = datetime.datetime.now(datetime.timezone.utc) + self.clock_offset
             header = _wsse_header(self.user, self.password, now)
+        if include_status:
+            return _soap_response(
+                url,
+                body,
+                header,
+                self.timeout,
+                stop_on_auth_error=True,
+            )
         return _soap_request(url, body, header, self.timeout)
+
+    def _call(self, url: str, body: str, *, authenticated: bool = True) -> str:
+        response = self._request(
+            url,
+            body,
+            authenticated=authenticated,
+            include_status=False,
+        )
+        assert isinstance(response, str)
+        return response
 
     def _system_time(self, url: str) -> datetime.datetime:
         xml = self._call(
@@ -699,8 +839,7 @@ class OnvifDevice:
             tzinfo=datetime.timezone.utc,
         )
 
-    def connect(self) -> None:
-        last_error = None
+    def connect(self) -> DeviceInfo:
         for url in self._candidates():
             try:
                 camera_time = self._system_time(url)
@@ -710,19 +849,13 @@ class OnvifDevice:
                     url,
                     f'<GetDeviceInformation xmlns="{_DEVICE_NS}"/>',
                 )
-                info_root = ElementTree.fromstring(info)
-                if not any(
-                    _local_name(candidate.tag)
-                    == "GetDeviceInformationResponse"
-                    for candidate in info_root.iter()
-                ):
-                    raise RuntimeError("ONVIF authentication failed")
+                device_info = _parse_device_information(info)
                 self.device_url = url
                 self.media_url = self._media_service_url(url)
-                return
-            except Exception as error:
-                last_error = error
-        raise RuntimeError("ONVIF connect failed") from last_error
+                return device_info
+            except Exception:
+                continue
+        raise RuntimeError("ONVIF connect failed") from None
 
     def _media_service_url(self, device_url: str) -> str:
         xml = self._call(
@@ -743,6 +876,24 @@ class OnvifDevice:
         if self.media_url is None:
             raise RuntimeError("call connect() first")
         return self.media_url
+
+    def _required_device_url(self) -> str:
+        if self.device_url is None:
+            raise RuntimeError("call connect() first")
+        return self.device_url
+
+    def read_only_call(
+        self, body: str, endpoint: str | None = None
+    ) -> _SoapResponse:
+        device_url = self._required_device_url()
+        response = self._request(
+            endpoint or device_url,
+            body,
+            authenticated=True,
+            include_status=True,
+        )
+        assert isinstance(response, _SoapResponse)
+        return response
 
     def get_profiles(self) -> list[OnvifProfile]:
         xml = self._call(
@@ -799,6 +950,7 @@ def get_stream_uris(
 
 
 __all__ = [
+    "DeviceInfo",
     "DiscoveredDevice",
     "OnvifDevice",
     "OnvifProfile",
