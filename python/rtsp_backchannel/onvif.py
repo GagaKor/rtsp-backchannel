@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import codecs
 import datetime
 import hashlib
 import ipaddress
@@ -106,10 +107,44 @@ def _local_name(tag: str) -> str:
     return tag.rsplit("}", 1)[-1].rsplit(":", 1)[-1]
 
 
+def _has_wide_xml_markup_prefix(
+    xml: bytes, unit_size: int, byte_order: str
+) -> bool:
+    offset = 0
+    while offset + unit_size <= len(xml):
+        value = int.from_bytes(
+            xml[offset : offset + unit_size], byte_order
+        )
+        if value in (0x09, 0x0A, 0x0D, 0x20):
+            offset += unit_size
+            continue
+        return value == ord("<")
+    return False
+
+
 def _declaration_scan_text(xml: bytes | str) -> str:
-    if isinstance(xml, bytes):
-        return xml.replace(b"\x00", b"").decode("latin-1")
-    return xml
+    if not isinstance(xml, bytes):
+        return xml
+    if xml.startswith((codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)):
+        encoding = "utf-32"
+    elif xml.startswith(codecs.BOM_UTF8):
+        encoding = "utf-8-sig"
+    elif xml.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        encoding = "utf-16"
+    elif _has_wide_xml_markup_prefix(xml, 4, "big"):
+        encoding = "utf-32-be"
+    elif _has_wide_xml_markup_prefix(xml, 4, "little"):
+        encoding = "utf-32-le"
+    elif _has_wide_xml_markup_prefix(xml, 2, "big"):
+        encoding = "utf-16-be"
+    elif _has_wide_xml_markup_prefix(xml, 2, "little"):
+        encoding = "utf-16-le"
+    else:
+        encoding = "latin-1"
+    try:
+        return xml.decode(encoding)
+    except UnicodeDecodeError:
+        raise ElementTree.ParseError("invalid XML document") from None
 
 
 def _contains_forbidden_declaration(xml: bytes | str) -> bool:

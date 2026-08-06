@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import codecs
 import dataclasses
 import http.server
 import io
@@ -865,6 +866,71 @@ class OnvifDeviceInformationTests(unittest.TestCase):
 
 
 class OnvifLegacyXmlParserTests(unittest.TestCase):
+    def test_safe_xml_scanner_respects_utf16_code_unit_boundaries(self):
+        false_marker_text = {
+            "utf-16-le": "\u213c\u4f44\u5443\u5059E",
+            "utf-16-be": "\u3c21\u444f\u4354\u5950\u4500",
+        }
+        byte_order_marks = {
+            "utf-16-le": codecs.BOM_UTF16_LE,
+            "utf-16-be": codecs.BOM_UTF16_BE,
+        }
+        forbidden = (
+            '<!DOCTYPE root [<!ENTITY injected "entity-payload-marker">]>'
+            "<root>&injected;</root>"
+        )
+
+        for encoding, text in false_marker_text.items():
+            valid = f"<root>{text}</root>".encode(encoding)
+            flattened = valid.replace(b"\x00", b"").decode("latin-1")
+            self.assertIn("<!DOCTYPE", flattened)
+            for kind, prefix in (
+                ("valid-bom", byte_order_marks[encoding]),
+                ("valid-bomless", b""),
+            ):
+                with self.subTest(encoding=encoding, kind=kind):
+                    parsed = onvif._safe_xml_fromstring(prefix + valid)
+                    self.assertEqual(parsed.text, text)
+
+            with self.subTest(encoding=encoding, kind="forbidden"):
+                xml = byte_order_marks[encoding] + forbidden.encode(encoding)
+                with self.assertRaises(ElementTree.ParseError) as caught:
+                    onvif._safe_xml_fromstring(xml)
+                self.assertNotIn(
+                    "entity-payload-marker", str(caught.exception)
+                )
+
+            with self.subTest(
+                encoding=encoding, kind="forbidden-bomless"
+            ):
+                xml = (" \n" + forbidden).encode(encoding)
+                with self.assertRaises(ElementTree.ParseError) as caught:
+                    onvif._safe_xml_fromstring(xml)
+                self.assertNotIn(
+                    "entity-payload-marker", str(caught.exception)
+                )
+
+        single_byte = (
+            '<?xml version="1.0" encoding="iso-8859-1"?>' + forbidden
+        ).encode("iso-8859-1")
+        with self.assertRaises(ElementTree.ParseError) as caught:
+            onvif._safe_xml_fromstring(single_byte)
+        self.assertNotIn("entity-payload-marker", str(caught.exception))
+
+    def test_safe_xml_scanner_sanitizes_known_encoding_decode_errors(self):
+        malformed = (
+            codecs.BOM_UTF8 + b"<root>\xff</root>",
+            codecs.BOM_UTF16_LE + b"<\x00r",
+            codecs.BOM_UTF32_BE + b"\x00\x00\x00<\x00",
+        )
+
+        for xml in malformed:
+            with self.subTest(signature=xml[:4]):
+                with self.assertRaisesRegex(
+                    ElementTree.ParseError, "^invalid XML document$"
+                ):
+                    onvif._safe_xml_fromstring(xml)
+
     def test_probe_profile_and_stream_parsers_reject_dtd_entities(self):
         payload_marker = "entity-payload-marker"
         profile_xml = (
