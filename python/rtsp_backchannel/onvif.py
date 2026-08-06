@@ -802,12 +802,26 @@ class OnvifDevice:
         assert isinstance(response, str)
         return response
 
+    def _call_response(
+        self, url: str, body: str, *, authenticated: bool = True
+    ) -> _SoapResponse:
+        response = self._request(
+            url,
+            body,
+            authenticated=authenticated,
+            include_status=True,
+        )
+        assert isinstance(response, _SoapResponse)
+        if response.status_code in (401, 403):
+            raise RuntimeError("ONVIF authentication failed")
+        return response
+
     def _system_time(self, url: str) -> datetime.datetime:
-        xml = self._call(
+        xml = self._call_response(
             url,
             f'<GetSystemDateAndTime xmlns="{_DEVICE_NS}"/>',
             authenticated=False,
-        )
+        ).xml
         root = ElementTree.fromstring(xml)
         utc = next(
             (
@@ -845,10 +859,10 @@ class OnvifDevice:
                 camera_time = self._system_time(url)
                 local_time = datetime.datetime.now(datetime.timezone.utc)
                 self.clock_offset = camera_time - local_time
-                info = self._call(
+                info = self._call_response(
                     url,
                     f'<GetDeviceInformation xmlns="{_DEVICE_NS}"/>',
-                )
+                ).xml
                 device_info = _parse_device_information(info)
                 self.device_url = url
                 self.media_url = self._media_service_url(url)
@@ -858,11 +872,11 @@ class OnvifDevice:
         raise RuntimeError("ONVIF connect failed") from None
 
     def _media_service_url(self, device_url: str) -> str:
-        xml = self._call(
+        xml = self._call_response(
             device_url,
             f'<GetCapabilities xmlns="{_DEVICE_NS}">'
             "<Category>Media</Category></GetCapabilities>",
-        )
+        ).xml
         root = ElementTree.fromstring(xml)
         for candidate in root.iter():
             if _local_name(candidate.tag) != "Media":

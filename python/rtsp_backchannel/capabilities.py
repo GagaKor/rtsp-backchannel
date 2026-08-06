@@ -349,9 +349,65 @@ def _raise_fault(fault: ElementTree.Element, soap_ns: str) -> None:
     )
 
 
+def _declaration_scan_text(xml: bytes | str) -> str:
+    if isinstance(xml, bytes):
+        return xml.replace(b"\x00", b"").decode("latin-1")
+    return xml
+
+
+def _contains_forbidden_declaration(xml: bytes | str) -> bool:
+    text = _declaration_scan_text(xml)
+    cursor = 0
+    while True:
+        markup = text.find("<", cursor)
+        if markup < 0:
+            return False
+        if text.startswith("<!--", markup):
+            end = text.find("-->", markup + 4)
+            if end < 0:
+                return False
+            cursor = end + 3
+            continue
+        if text.startswith("<![CDATA[", markup):
+            end = text.find("]]>", markup + 9)
+            if end < 0:
+                return False
+            cursor = end + 3
+            continue
+        if text.startswith("<?", markup):
+            end = text.find("?>", markup + 2)
+            if end < 0:
+                return False
+            cursor = end + 2
+            continue
+        if text.startswith("<!", markup):
+            name_start = markup + 2
+            while (
+                name_start < len(text)
+                and text[name_start] in " \t\r\n"
+            ):
+                name_start += 1
+            name_end = name_start
+            while name_end < len(text):
+                character = text[name_end]
+                if not (
+                    "0" <= character <= "9"
+                    or "A" <= character <= "Z"
+                    or character == "_"
+                    or "a" <= character <= "z"
+                ):
+                    break
+                name_end += 1
+            if text[name_start:name_end].upper() in ("DOCTYPE", "ENTITY"):
+                return True
+        cursor = markup + 1
+
+
 def _soap_operation(
     xml: bytes | str, namespace: str, operation: str, description: str
 ) -> ElementTree.Element:
+    if _contains_forbidden_declaration(xml):
+        raise _OnvifResponseError("invalid", "invalid XML document")
     try:
         root = ElementTree.fromstring(xml)
     except (ElementTree.ParseError, TypeError, ValueError) as error:

@@ -737,8 +737,12 @@ class OnvifDeviceInformationTests(unittest.TestCase):
 
         with patch.object(
             onvif,
-            "_soap_request",
-            side_effect=[self._system_time_response(), information, media],
+            "_soap_response",
+            side_effect=[
+                onvif._SoapResponse(200, self._system_time_response()),
+                onvif._SoapResponse(200, information),
+                onvif._SoapResponse(200, media),
+            ],
         ):
             info = device.connect()
 
@@ -759,8 +763,11 @@ class OnvifDeviceInformationTests(unittest.TestCase):
 
         with patch.object(
             onvif,
-            "_soap_request",
-            side_effect=[self._system_time_response(), vendor_response],
+            "_soap_response",
+            side_effect=[
+                onvif._SoapResponse(200, self._system_time_response()),
+                onvif._SoapResponse(200, vendor_response),
+            ],
         ) as request:
             with self.assertRaisesRegex(RuntimeError, "ONVIF connect failed"):
                 device.connect()
@@ -770,6 +777,7 @@ class OnvifDeviceInformationTests(unittest.TestCase):
 
 class _OnvifFixtureHandler(http.server.BaseHTTPRequestHandler):
     requests = []
+    device_information_status = 200
 
     def log_message(self, format, *args):
         return
@@ -794,7 +802,7 @@ class _OnvifFixtureHandler(http.server.BaseHTTPRequestHandler):
                 "<tds:SerialNumber>serial-1</tds:SerialNumber>"
                 "</tds:GetDeviceInformationResponse>"
             )
-            status = 200
+            status = type(self).device_information_status
         elif "<Category>Media</Category>" in body:
             port = self.server.server_port
             payload = soap(
@@ -823,6 +831,7 @@ class _OnvifFixtureHandler(http.server.BaseHTTPRequestHandler):
 class OnvifCapabilityTransportTests(unittest.TestCase):
     def setUp(self):
         _OnvifFixtureHandler.requests = []
+        _OnvifFixtureHandler.device_information_status = 200
         self.server = http.server.ThreadingHTTPServer(
             ("127.0.0.1", 0), _OnvifFixtureHandler
         )
@@ -887,6 +896,26 @@ class OnvifCapabilityTransportTests(unittest.TestCase):
         self.assertEqual(auth_fault.xml, "")
         self.assertRegex(requests[3][1], "wsse:Security")
         self.assertRegex(requests[4][1], "wsse:Security")
+
+    def test_connect_rejects_a_success_shaped_http_auth_response(self):
+        _OnvifFixtureHandler.device_information_status = 401
+        selected_url = (
+            f"http://127.0.0.1:{self.server.server_port}/selected/device"
+        )
+        device = OnvifDevice(
+            "camera",
+            "admin",
+            "password",
+            device_urls=[selected_url],
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "ONVIF connect failed"):
+            device.connect()
+
+        self.assertEqual(
+            [path for path, _ in _OnvifFixtureHandler.requests],
+            ["/selected/device", "/selected/device"],
+        )
 
     def test_rejects_unsafe_service_urls_before_wsse_or_network(self):
         device = OnvifDevice("camera", "viewer", "camera-secret")
@@ -955,6 +984,46 @@ class OnvifCapabilityTransportTests(unittest.TestCase):
 
 
 class CapabilityProtocolParserTests(unittest.TestCase):
+
+    def test_rejects_dtd_and_entity_declarations_without_payload_leakage(self):
+        payload_marker = "entity-payload-marker"
+        forbidden = (
+            "<!DOCTYPE s:Envelope ["
+            f'<!ENTITY camera "{payload_marker}">]>'
+            + soap(
+                "<tds:GetServicesResponse><tds:Service>"
+                "<tds:Namespace>urn:test</tds:Namespace>"
+                "<tds:XAddr>&camera;</tds:XAddr>"
+                "</tds:Service></tds:GetServicesResponse>"
+            )
+        )
+
+        for forbidden_input in (forbidden, forbidden.encode("utf-16")):
+            with self.subTest(input_type=type(forbidden_input).__name__):
+                with self.assertRaisesRegex(
+                    _OnvifResponseError, "invalid XML document"
+                ) as caught:
+                    _parse_services_response(forbidden_input)
+                self.assertNotIn(payload_marker, str(caught.exception))
+
+    def test_declaration_words_in_comments_cdata_and_pi_are_not_rejected(self):
+        parsed = _parse_services_response(
+            soap(
+                "<tds:GetServicesResponse>"
+                "<!-- <!DOCTYPE decoy> -->"
+                '<?probe <!ENTITY decoy "value">?>'
+                "<vendor:Ignored><![CDATA[<!DOCTYPE cdata-decoy>]]>"
+                "</vendor:Ignored><tds:Service>"
+                "<tds:Namespace>urn:test</tds:Namespace>"
+                "<tds:XAddr>http://camera/service</tds:XAddr>"
+                "</tds:Service></tds:GetServicesResponse>"
+            )
+        )
+
+        self.assertEqual(
+            parsed.services,
+            (CameraCapabilityService("urn:test", "http://camera/service"),),
+        )
 
     def test_extremely_large_integer_lexemes_are_treated_as_out_of_range(self):
         huge = "9" * 5000
