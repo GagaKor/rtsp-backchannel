@@ -151,3 +151,87 @@ test('rejects responses whose body exceeds the ONVIF limit', async () => {
     );
   }
 });
+
+test('keeps the three-call connect sequence and exposes selected and explicit read-only endpoints', async () => {
+  const requests: Array<{ path: string; body: string }> = [];
+  const server = http.createServer((request, response) => {
+    let body = '';
+    request.setEncoding('utf8');
+    request.on('data', (chunk) => {
+      body += chunk;
+    });
+    request.on('end', () => {
+      requests.push({ path: request.url ?? '', body });
+      const soapBody = /<s:Body>([\s\S]*?)<\/s:Body>/.exec(body)?.[1] ?? '';
+      const envelope = (content: string) =>
+        `<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body>${content}</s:Body></s:Envelope>`;
+      response.setHeader('Content-Type', 'application/soap+xml');
+      if (soapBody.includes('GetSystemDateAndTime')) {
+        response.end(envelope(
+          '<GetSystemDateAndTimeResponse><SystemDateAndTime><UTCDateTime>'
+          + '<Time><Hour>12</Hour><Minute>30</Minute><Second>0</Second></Time>'
+          + '<Date><Year>2026</Year><Month>8</Month><Day>6</Day></Date>'
+          + '</UTCDateTime></SystemDateAndTime></GetSystemDateAndTimeResponse>',
+        ));
+      } else if (soapBody.includes('GetDeviceInformation')) {
+        response.end(envelope(
+          '<GetDeviceInformationResponse><Manufacturer>Test Camera</Manufacturer>'
+          + '</GetDeviceInformationResponse>',
+        ));
+      } else if (soapBody.includes('<Category>Media</Category>')) {
+        const address = server.address();
+        assert.ok(address && typeof address !== 'string');
+        response.end(envelope(
+          '<GetCapabilitiesResponse><Capabilities><Media><XAddr>'
+          + `http://127.0.0.1:${address.port}/advertised/media`
+          + '</XAddr></Media></Capabilities></GetCapabilitiesResponse>',
+        ));
+      } else if (request.url === '/auth-fault') {
+        response.statusCode = 401;
+        response.end(envelope('<s:Fault><s:Reason><s:Text>Not authorized</s:Text></s:Reason></s:Fault>'));
+      } else {
+        response.end(envelope('<GetScopesResponse/>'));
+      }
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+  const selectedDeviceUrl = `http://127.0.0.1:${address.port}/selected/device`;
+  const device = new OnvifDevice('camera', 'admin', 'password', {
+    deviceUrls: [selectedDeviceUrl],
+  });
+
+  try {
+    await device.connect();
+    const connectBodies = requests.map(({ body }) =>
+      /<s:Body>([\s\S]*?)<\/s:Body>/.exec(body)?.[1]);
+    assert.deepEqual(connectBodies, [
+      `<GetSystemDateAndTime xmlns="http://www.onvif.org/ver10/device/wsdl"/>`,
+      `<GetDeviceInformation xmlns="http://www.onvif.org/ver10/device/wsdl"/>`,
+      `<GetCapabilities xmlns="http://www.onvif.org/ver10/device/wsdl"><Category>Media</Category></GetCapabilities>`,
+    ]);
+
+    const selected = await device.readOnlyCall(
+      `<GetScopes xmlns="http://www.onvif.org/ver10/device/wsdl"/>`,
+    );
+    const authFault = await device.readOnlyCall(
+      `<GetScopes xmlns="http://www.onvif.org/ver10/device/wsdl"/>`,
+      `http://127.0.0.1:${address.port}/auth-fault`,
+    );
+
+    assert.equal(requests[3].path, '/selected/device');
+    assert.equal(selected.statusCode, 200);
+    assert.match(selected.xml, /GetScopesResponse/);
+    assert.equal(requests[4].path, '/auth-fault');
+    assert.equal(authFault.statusCode, 401);
+    assert.match(authFault.xml, /Not authorized/);
+    assert.match(requests[3].body, /wsse:Security/);
+    assert.match(requests[4].body, /wsse:Security/);
+    assert.equal(device.connectedMediaUrl(), `http://127.0.0.1:${address.port}/advertised/media`);
+  } finally {
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
+});

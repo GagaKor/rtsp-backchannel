@@ -81,6 +81,12 @@ export interface OnvifOptions {
   timeoutMs?: number;
 }
 
+/** @internal */
+export interface OnvifRawResponse {
+  readonly statusCode: number;
+  readonly xml: string;
+}
+
 function firstTag(xml: string, name: string): string | undefined {
   const m =
     new RegExp(`<[^>]*:${name}>([^<]*)</[^>]*:${name}>`).exec(xml) ??
@@ -154,7 +160,7 @@ export class OnvifDevice {
     );
   }
 
-  private soap(url: string, body: string, withAuth: boolean): Promise<string> {
+  private soapResponse(url: string, body: string, withAuth: boolean): Promise<OnvifRawResponse> {
     const header = withAuth ? this.securityHeader() : '';
     const envelope =
       `<?xml version="1.0" encoding="UTF-8"?>` +
@@ -183,7 +189,7 @@ export class OnvifDevice {
       let req: http.ClientRequest | undefined;
       let res: http.IncomingMessage | undefined;
       let timer: NodeJS.Timeout | undefined;
-      const settle = (error?: Error, text?: string) => {
+      const settle = (error?: Error, result?: OnvifRawResponse) => {
         if (settled) return;
         settled = true;
         if (timer) clearTimeout(timer);
@@ -192,7 +198,7 @@ export class OnvifDevice {
           res?.destroy(error);
           reject(error);
         } else {
-          resolve(text ?? '');
+          resolve(result ?? { statusCode: 0, xml: '' });
         }
       };
       timer = setTimeout(() => settle(new Error('request timeout')), timeoutMs);
@@ -222,12 +228,7 @@ export class OnvifDevice {
           response.once('end', () => {
             if (settled) return;
             const text = Buffer.concat(chunks).toString('utf8');
-            // ONVIF returns 200 on success, 4xx (with SOAP Fault) on auth errors.
-            if ((response.statusCode ?? 0) >= 500 && !text.includes('Envelope')) {
-              settle(new Error(`HTTP ${response.statusCode} from ${url}`));
-            } else {
-              settle(undefined, text);
-            }
+            settle(undefined, { statusCode: response.statusCode ?? 0, xml: text });
           });
         });
         req.once('error', (error) => settle(error));
@@ -236,6 +237,15 @@ export class OnvifDevice {
         settle(error instanceof Error ? error : new Error(String(error)));
       }
     });
+  }
+
+  private async soap(url: string, body: string, withAuth: boolean): Promise<string> {
+    const response = await this.soapResponse(url, body, withAuth);
+    // Preserve the legacy behavior: ONVIF may return a SOAP Fault envelope on 5xx.
+    if (response.statusCode >= 500 && !response.xml.includes('Envelope')) {
+      throw new Error(`HTTP ${response.statusCode} from ${url}`);
+    }
+    return response.xml;
   }
 
   async getSystemDateAndTime(url: string): Promise<Date> {
@@ -293,6 +303,17 @@ export class OnvifDevice {
   private requireMediaUrl(): string {
     if (!this.mediaUrl) throw new Error('call connect() first');
     return this.mediaUrl;
+  }
+
+  /** @internal */
+  connectedMediaUrl(): string {
+    return this.requireMediaUrl();
+  }
+
+  /** @internal */
+  readOnlyCall(body: string, endpoint?: string): Promise<OnvifRawResponse> {
+    const deviceUrl = this.requireDeviceUrl();
+    return this.soapResponse(endpoint ?? deviceUrl, body, true);
   }
 
   /** Returns profiles plus their audio configuration presence. */
