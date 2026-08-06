@@ -48,6 +48,13 @@ _PASSWORD_DIGEST = (
     "oasis-200401-wss-username-token-profile-1.0#PasswordDigest"
 )
 _TLS_CONTEXT = ssl._create_unverified_context()
+_EXPECTED_OPERATION_ERRORS = (
+    OSError,
+    RuntimeError,
+    ValueError,
+    OverflowError,
+    ElementTree.ParseError,
+)
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -99,6 +106,65 @@ def _local_name(tag: str) -> str:
     return tag.rsplit("}", 1)[-1].rsplit(":", 1)[-1]
 
 
+def _declaration_scan_text(xml: bytes | str) -> str:
+    if isinstance(xml, bytes):
+        return xml.replace(b"\x00", b"").decode("latin-1")
+    return xml
+
+
+def _contains_forbidden_declaration(xml: bytes | str) -> bool:
+    text = _declaration_scan_text(xml)
+    cursor = 0
+    while True:
+        markup = text.find("<", cursor)
+        if markup < 0:
+            return False
+        if text.startswith("<!--", markup):
+            end = text.find("-->", markup + 4)
+            if end < 0:
+                return False
+            cursor = end + 3
+            continue
+        if text.startswith("<![CDATA[", markup):
+            end = text.find("]]>", markup + 9)
+            if end < 0:
+                return False
+            cursor = end + 3
+            continue
+        if text.startswith("<?", markup):
+            end = text.find("?>", markup + 2)
+            if end < 0:
+                return False
+            cursor = end + 2
+            continue
+        if text.startswith("<!", markup):
+            name_start = markup + 2
+            while name_start < len(text) and text[name_start] in " \t\r\n":
+                name_start += 1
+            name_end = name_start
+            while name_end < len(text):
+                character = text[name_end]
+                if not (
+                    "0" <= character <= "9"
+                    or "A" <= character <= "Z"
+                    or character == "_"
+                    or "a" <= character <= "z"
+                ):
+                    break
+                name_end += 1
+            if text[name_start:name_end].upper() in ("DOCTYPE", "ENTITY"):
+                return True
+        cursor = markup + 1
+
+
+def _safe_xml_fromstring(xml: bytes | str) -> ElementTree.Element:
+    if _contains_forbidden_declaration(xml):
+        raise ElementTree.ParseError(
+            "DTD and entity declarations are not allowed"
+        )
+    return ElementTree.fromstring(xml)
+
+
 def _first_text(element: ElementTree.Element, name: str) -> str | None:
     for candidate in element.iter():
         if _local_name(candidate.tag) == name and candidate.text is not None:
@@ -124,7 +190,7 @@ def _direct_child(
 
 
 def _parse_device_information(xml: bytes | str) -> DeviceInfo:
-    root = ElementTree.fromstring(xml)
+    root = _safe_xml_fromstring(xml)
     soap_namespace, root_name = _tag_parts(root.tag)
     if root_name != "Envelope" or soap_namespace not in (
         _SOAP11_NS,
@@ -190,7 +256,7 @@ def parse_probe_matches(
 ) -> list[DiscoveredDevice]:
     """Parse every ONVIF ProbeMatch in a WS-Discovery datagram."""
 
-    root = ElementTree.fromstring(xml)
+    root = _safe_xml_fromstring(xml)
     devices = []
     for match in root.iter():
         if _local_name(match.tag) != "ProbeMatch":
@@ -484,7 +550,7 @@ def _probe_device_service(url: str, deadline: float) -> None:
         status = response.getcode()
         if not 200 <= status < 300:
             raise RuntimeError(f"ONVIF discovery returned HTTP {status}")
-        root = ElementTree.fromstring(_bounded_response_body(response, deadline))
+        root = _safe_xml_fromstring(_bounded_response_body(response, deadline))
     if not any(
         _local_name(candidate.tag) == "UTCDateTime" for candidate in root.iter()
     ):
@@ -502,7 +568,7 @@ def _probe_cidr_host(
         try:
             _probe_device_service(url, deadline)
             xaddrs.append(url)
-        except Exception:
+        except _EXPECTED_OPERATION_ERRORS:
             continue
     if not xaddrs:
         return None
@@ -606,7 +672,7 @@ def discover_devices(
 
 
 def parse_profiles(xml: bytes | str) -> list[OnvifProfile]:
-    root = ElementTree.fromstring(xml)
+    root = _safe_xml_fromstring(xml)
     profiles = []
     for candidate in root.iter():
         if _local_name(candidate.tag) != "Profiles":
@@ -824,7 +890,7 @@ class OnvifDevice:
             f'<GetSystemDateAndTime xmlns="{_DEVICE_NS}"/>',
             authenticated=False,
         ).xml
-        root = ElementTree.fromstring(xml)
+        root = _safe_xml_fromstring(xml)
         utc = next(
             (
                 candidate
@@ -869,7 +935,7 @@ class OnvifDevice:
                 self.device_url = url
                 self.media_url = self._media_service_url(url)
                 return device_info
-            except Exception:
+            except _EXPECTED_OPERATION_ERRORS:
                 continue
         raise RuntimeError("ONVIF connect failed") from None
 
@@ -879,7 +945,7 @@ class OnvifDevice:
             f'<GetCapabilities xmlns="{_DEVICE_NS}">'
             "<Category>Media</Category></GetCapabilities>",
         ).xml
-        root = ElementTree.fromstring(xml)
+        root = _safe_xml_fromstring(xml)
         for candidate in root.iter():
             if _local_name(candidate.tag) != "Media":
                 continue
@@ -928,7 +994,7 @@ class OnvifDevice:
             "</GetStreamUri>"
         )
         xml = self._call(self._required_media_url(), body)
-        root = ElementTree.fromstring(xml)
+        root = _safe_xml_fromstring(xml)
         for candidate in root.iter():
             if _local_name(candidate.tag) == "Uri" and candidate.text:
                 return _sanitize_stream_uri(candidate.text)

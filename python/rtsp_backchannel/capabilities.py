@@ -9,7 +9,12 @@ from typing import Literal
 from urllib.parse import unquote
 from xml.etree import ElementTree
 
-from .onvif import DeviceInfo, OnvifDevice, _SoapResponse
+from .onvif import (
+    DeviceInfo,
+    OnvifDevice,
+    _SoapResponse,
+    _safe_xml_fromstring,
+)
 
 
 _SOAP11_NS = "http://schemas.xmlsoap.org/soap/envelope/"
@@ -349,67 +354,11 @@ def _raise_fault(fault: ElementTree.Element, soap_ns: str) -> None:
     )
 
 
-def _declaration_scan_text(xml: bytes | str) -> str:
-    if isinstance(xml, bytes):
-        return xml.replace(b"\x00", b"").decode("latin-1")
-    return xml
-
-
-def _contains_forbidden_declaration(xml: bytes | str) -> bool:
-    text = _declaration_scan_text(xml)
-    cursor = 0
-    while True:
-        markup = text.find("<", cursor)
-        if markup < 0:
-            return False
-        if text.startswith("<!--", markup):
-            end = text.find("-->", markup + 4)
-            if end < 0:
-                return False
-            cursor = end + 3
-            continue
-        if text.startswith("<![CDATA[", markup):
-            end = text.find("]]>", markup + 9)
-            if end < 0:
-                return False
-            cursor = end + 3
-            continue
-        if text.startswith("<?", markup):
-            end = text.find("?>", markup + 2)
-            if end < 0:
-                return False
-            cursor = end + 2
-            continue
-        if text.startswith("<!", markup):
-            name_start = markup + 2
-            while (
-                name_start < len(text)
-                and text[name_start] in " \t\r\n"
-            ):
-                name_start += 1
-            name_end = name_start
-            while name_end < len(text):
-                character = text[name_end]
-                if not (
-                    "0" <= character <= "9"
-                    or "A" <= character <= "Z"
-                    or character == "_"
-                    or "a" <= character <= "z"
-                ):
-                    break
-                name_end += 1
-            if text[name_start:name_end].upper() in ("DOCTYPE", "ENTITY"):
-                return True
-        cursor = markup + 1
-
-
 def _soap_operation(
     xml: bytes | str, namespace: str, operation: str, description: str
 ) -> ElementTree.Element:
-    if _contains_forbidden_declaration(xml):
-        raise _OnvifResponseError("invalid", "invalid XML document")
     try:
-        root = ElementTree.fromstring(xml)
+        root = _safe_xml_fromstring(xml)
     except (ElementTree.ParseError, TypeError, ValueError) as error:
         raise _OnvifResponseError("invalid", "invalid XML document") from error
     soap_ns, root_name = _tag_parts(root.tag)
@@ -960,18 +909,22 @@ class _OnvifHttpError(RuntimeError):
         self.status_code = status_code
 
 
+_EXPECTED_OPERATION_ERRORS = (
+    OSError,
+    RuntimeError,
+    ElementTree.ParseError,
+    _OnvifResponseError,
+)
+
+
 def _parse_read_only_response(response: _SoapResponse, parser):
     if response.status_code in (401, 403):
         raise _OnvifHttpError(response.status_code)
     try:
         result = parser(response.xml)
-    except _OnvifResponseError as error:
-        if error.kind == "fault":
+    except _EXPECTED_OPERATION_ERRORS as error:
+        if isinstance(error, _OnvifResponseError) and error.kind == "fault":
             raise
-        if not 200 <= response.status_code < 300:
-            raise _OnvifHttpError(response.status_code) from None
-        raise
-    except Exception:
         if not 200 <= response.status_code < 300:
             raise _OnvifHttpError(response.status_code) from None
         raise
@@ -1071,7 +1024,7 @@ def get_camera_capabilities(
         parsed_scopes = call(_GET_SCOPES, _parse_scopes_response)
         scopes = parsed_scopes.scopes
         declared_profiles = parsed_scopes.declared_profiles
-    except Exception as error:
+    except _EXPECTED_OPERATION_ERRORS as error:
         warn("GetScopes", error)
 
     service_discovery = "unavailable"
@@ -1084,7 +1037,7 @@ def get_camera_capabilities(
         discovered_event_capabilities = (
             parsed_services.event_service_capabilities
         )
-    except Exception as get_services_error:
+    except _EXPECTED_OPERATION_ERRORS as get_services_error:
         warn("GetServices", get_services_error)
         try:
             parsed_services = call(
@@ -1095,7 +1048,7 @@ def get_camera_capabilities(
             discovered_event_capabilities = (
                 parsed_services.event_service_capabilities
             )
-        except Exception as get_capabilities_error:
+        except _EXPECTED_OPERATION_ERRORS as get_capabilities_error:
             warn("GetCapabilities", get_capabilities_error)
 
     profiles: list[CameraCapabilityProfile] = []
@@ -1113,7 +1066,7 @@ def get_camera_capabilities(
                 media1_endpoint,
             )
         )
-    except Exception as error:
+    except _EXPECTED_OPERATION_ERRORS as error:
         warn("Media1 GetProfiles", error)
 
     discovery_available = service_discovery != "unavailable"
@@ -1132,7 +1085,7 @@ def get_camera_capabilities(
             )
             if _has_reported_fields(parsed_ptz_capabilities):
                 ptz_service_capabilities = parsed_ptz_capabilities
-        except Exception as error:
+        except _EXPECTED_OPERATION_ERRORS as error:
             warn("PTZ GetServiceCapabilities", error)
         try:
             parsed_nodes = call(
@@ -1143,7 +1096,7 @@ def get_camera_capabilities(
             ptz_nodes = parsed_nodes.nodes
             pan_tilt_supported = parsed_nodes.pan_tilt_supported
             zoom_supported = parsed_nodes.zoom_supported
-        except Exception as error:
+        except _EXPECTED_OPERATION_ERRORS as error:
             warn("PTZ GetNodes", error)
 
     event_service = _select_service(services, _EVENTS_NS)
@@ -1157,7 +1110,7 @@ def get_camera_capabilities(
                 _parse_event_service_capabilities_response,
                 event_service.xaddr,
             )
-        except Exception as error:
+        except _EXPECTED_OPERATION_ERRORS as error:
             warn("Events GetServiceCapabilities", error)
         try:
             topics = call(
@@ -1165,7 +1118,7 @@ def get_camera_capabilities(
                 _parse_event_properties_response,
                 event_service.xaddr,
             )
-        except Exception as error:
+        except _EXPECTED_OPERATION_ERRORS as error:
             warn("Events GetEventProperties", error)
     event_service_capabilities = _merge_event_service_capabilities(
         discovered_event_capabilities, current_event_capabilities
@@ -1188,7 +1141,7 @@ def get_camera_capabilities(
                     media2_service.xaddr,
                 )
             )
-        except Exception as error:
+        except _EXPECTED_OPERATION_ERRORS as error:
             warn("Media2 GetProfiles", error)
         try:
             encodings = call(
@@ -1199,7 +1152,7 @@ def get_camera_capabilities(
             h265_supported = "H265" in {
                 encoding.upper() for encoding in encodings
             }
-        except Exception as error:
+        except _EXPECTED_OPERATION_ERRORS as error:
             warn("Media2 GetVideoEncoderConfigurationOptions", error)
 
     profiles.sort(key=lambda profile: (profile.token, profile.source))

@@ -9,6 +9,7 @@ import unittest
 import urllib.error
 from types import SimpleNamespace
 from unittest.mock import patch
+from xml.etree import ElementTree
 
 from rtsp_backchannel.capabilities import (
     CameraCapabilityProfile,
@@ -703,6 +704,54 @@ class CapabilityOrchestrationTests(unittest.TestCase):
         self.assertEqual(fake.connect_count, 1)
         self.assertEqual(fake.calls, [])
 
+    def test_programming_errors_in_optional_enrichment_propagate(self):
+        for error_type in (AssertionError, TypeError, AttributeError):
+            with self.subTest(error_type=error_type.__name__):
+                def respond(body, endpoint):
+                    if body == GET_SCOPES:
+                        raise error_type("optional programming defect")
+                    raise AssertionError("optional enrichment must stop")
+
+                fake = FakeCapabilityDevice(respond)
+                with self.assertRaisesRegex(
+                    error_type, "optional programming defect"
+                ):
+                    self._run_with_fake(fake, host="camera")
+
+                self.assertEqual(fake.calls, [(GET_SCOPES, None)])
+
+    def test_operational_optional_errors_remain_sanitized_warnings(self):
+        def respond(body, endpoint):
+            if body == GET_SCOPES:
+                raise RuntimeError("runtime payload-secret")
+            if body == GET_SERVICES:
+                raise TimeoutError("deadline payload-secret")
+            if body == GET_ALL_CAPABILITIES:
+                return raw_response(
+                    "<tds:GetCapabilitiesResponse><tds:Capabilities>"
+                    "<tt:Media><tt:XAddr>http://camera/media</tt:XAddr>"
+                    "</tt:Media></tds:Capabilities></tds:GetCapabilitiesResponse>"
+                )
+            if body == MEDIA1_GET_PROFILES:
+                return raw_response("<trt:GetProfilesResponse/>")
+            raise AssertionError("unexpected optional operation")
+
+        report, _ = self._run_with_fake(
+            FakeCapabilityDevice(respond), host="camera"
+        )
+
+        self.assertEqual(
+            tuple(
+                (warning.operation, warning.message)
+                for warning in report.warnings
+            ),
+            (
+                ("GetScopes", "request failed"),
+                ("GetServices", "request timeout"),
+            ),
+        )
+        self.assertNotIn("payload-secret", repr(report.warnings))
+
 
 class OnvifDeviceInformationTests(unittest.TestCase):
     @staticmethod
@@ -774,10 +823,101 @@ class OnvifDeviceInformationTests(unittest.TestCase):
 
         self.assertEqual(request.call_count, 2)
 
+    def test_connect_programming_errors_propagate_without_candidate_retry(self):
+        for error_type in (AssertionError, TypeError, AttributeError):
+            with self.subTest(error_type=error_type.__name__):
+                candidates = [
+                    "http://camera/first/device_service",
+                    "http://camera/second/device_service",
+                ]
+                device = OnvifDevice(
+                    "camera",
+                    device_urls=candidates,
+                )
+                with patch.object(
+                    device,
+                    "_system_time",
+                    side_effect=error_type("connect programming defect"),
+                ) as system_time:
+                    with self.assertRaisesRegex(
+                        error_type, "connect programming defect"
+                    ):
+                        device.connect()
+
+                system_time.assert_called_once_with(candidates[0])
+
+    def test_connect_operational_error_remains_sanitized(self):
+        device = OnvifDevice(
+            "camera",
+            device_urls=["http://camera/onvif/device_service"],
+        )
+        with patch.object(
+            device,
+            "_system_time",
+            side_effect=RuntimeError("connect payload-secret"),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "^ONVIF connect failed$"
+            ) as caught:
+                device.connect()
+
+        self.assertNotIn("payload-secret", str(caught.exception))
+
+
+class OnvifLegacyXmlParserTests(unittest.TestCase):
+    def test_probe_profile_and_stream_parsers_reject_dtd_entities(self):
+        payload_marker = "entity-payload-marker"
+        profile_xml = (
+            "<!DOCTYPE s:Envelope ["
+            f'<!ENTITY injected "{payload_marker}">]>'
+            + soap(
+                '<trt:GetProfilesResponse><trt:Profiles token="main">'
+                "<tt:Name>&injected;</tt:Name>"
+                "</trt:Profiles></trt:GetProfilesResponse>"
+            )
+        )
+        probe_xml = (
+            "<!DOCTYPE s:Envelope ["
+            '<!ENTITY injected "http://camera/entity-payload-marker">]>'
+            + soap(
+                "<vendor:ProbeMatch>"
+                "<vendor:Types>NetworkVideoTransmitter</vendor:Types>"
+                "<vendor:XAddrs>&injected;</vendor:XAddrs>"
+                "</vendor:ProbeMatch>"
+            )
+        )
+        stream_xml = (
+            "<!DOCTYPE s:Envelope ["
+            '<!ENTITY injected "rtsp://camera/entity-payload-marker">]>'
+            + soap(
+                "<trt:GetStreamUriResponse><trt:MediaUri>"
+                "<tt:Uri>&injected;</tt:Uri>"
+                "</trt:MediaUri></trt:GetStreamUriResponse>"
+            )
+        )
+
+        cases = (
+            ("profiles", lambda: onvif.parse_profiles(profile_xml.encode("utf-16"))),
+            ("probe", lambda: onvif.parse_probe_matches(probe_xml, "192.0.2.1")),
+        )
+        for name, parse in cases:
+            with self.subTest(parser=name):
+                with self.assertRaises(ElementTree.ParseError) as caught:
+                    parse()
+                self.assertNotIn(payload_marker, str(caught.exception))
+
+        device = OnvifDevice("camera")
+        device.media_url = "http://camera/onvif/media_service"
+        with patch.object(device, "_call", return_value=stream_xml):
+            with self.assertRaises(ElementTree.ParseError) as caught:
+                device.get_stream_uri("main")
+        self.assertNotIn(payload_marker, str(caught.exception))
+
 
 class _OnvifFixtureHandler(http.server.BaseHTTPRequestHandler):
     requests = []
     device_information_status = 200
+    forbidden_declaration_stage = None
 
     def log_message(self, format, *args):
         return
@@ -787,6 +927,7 @@ class _OnvifFixtureHandler(http.server.BaseHTTPRequestHandler):
         body = self.rfile.read(length).decode("utf-8")
         type(self).requests.append((self.path, body))
         if "GetSystemDateAndTime" in body:
+            stage = "system-time"
             payload = soap(
                 "<tds:GetSystemDateAndTimeResponse><tds:SystemDateAndTime>"
                 "<tt:UTCDateTime><tt:Time><tt:Hour>12</tt:Hour><tt:Minute>30</tt:Minute>"
@@ -796,6 +937,7 @@ class _OnvifFixtureHandler(http.server.BaseHTTPRequestHandler):
             )
             status = 200
         elif "GetDeviceInformation" in body:
+            stage = "device-info"
             payload = soap(
                 "<tds:GetDeviceInformationResponse><tds:Manufacturer>Test Camera</tds:Manufacturer>"
                 "<tds:Model>C1</tds:Model><tds:FirmwareVersion>1.2.3</tds:FirmwareVersion>"
@@ -804,6 +946,7 @@ class _OnvifFixtureHandler(http.server.BaseHTTPRequestHandler):
             )
             status = type(self).device_information_status
         elif "<Category>Media</Category>" in body:
+            stage = "media-capabilities"
             port = self.server.server_port
             payload = soap(
                 "<tds:GetCapabilitiesResponse><tds:Capabilities><tt:Media><tt:XAddr>"
@@ -812,14 +955,44 @@ class _OnvifFixtureHandler(http.server.BaseHTTPRequestHandler):
             )
             status = 200
         elif self.path == "/auth-fault":
+            stage = None
             payload = soap(
                 "<s:Fault><s:Reason><s:Text>Not authorized payload-secret</s:Text>"
                 "</s:Reason></s:Fault>"
             )
             status = 401
         else:
+            stage = None
             payload = soap("<tds:GetScopesResponse/>")
             status = 200
+        forbidden_stage = type(self).forbidden_declaration_stage
+        if forbidden_stage is not None and forbidden_stage == stage:
+            entity_value, original = {
+                "system-time": ("2026", "<tt:Year>2026</tt:Year>"),
+                "device-info": (
+                    "entity-payload-marker",
+                    "<tds:Manufacturer>Test Camera</tds:Manufacturer>",
+                ),
+                "media-capabilities": (
+                    f"http://127.0.0.1:{self.server.server_port}/"
+                    "entity-payload-marker",
+                    f"http://127.0.0.1:{self.server.server_port}/"
+                    "advertised/media",
+                ),
+            }[stage]
+            replacement = {
+                "system-time": "<tt:Year>&injected;</tt:Year>",
+                "device-info": (
+                    "<tds:Manufacturer>&injected;</tds:Manufacturer>"
+                ),
+                "media-capabilities": "&injected;",
+            }[stage]
+            payload = (
+                "<!DOCTYPE s:Envelope ["
+                f'<!ENTITY injected "{entity_value}">'
+                '<!ENTITY secret "entity-payload-marker">]>'
+                + payload.replace(original, replacement, 1)
+            )
         encoded = payload.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/soap+xml")
@@ -832,6 +1005,7 @@ class OnvifCapabilityTransportTests(unittest.TestCase):
     def setUp(self):
         _OnvifFixtureHandler.requests = []
         _OnvifFixtureHandler.device_information_status = 200
+        _OnvifFixtureHandler.forbidden_declaration_stage = None
         self.server = http.server.ThreadingHTTPServer(
             ("127.0.0.1", 0), _OnvifFixtureHandler
         )
@@ -918,6 +1092,36 @@ class OnvifCapabilityTransportTests(unittest.TestCase):
                 self.assertEqual(
                     [path for path, _ in _OnvifFixtureHandler.requests],
                     ["/selected/device", "/selected/device"],
+                )
+
+    def test_connect_rejects_dtd_entities_at_every_mandatory_parse_stage(self):
+        expected_request_count = {
+            "system-time": 1,
+            "device-info": 2,
+            "media-capabilities": 3,
+        }
+        for stage, request_count in expected_request_count.items():
+            with self.subTest(stage=stage):
+                _OnvifFixtureHandler.requests = []
+                _OnvifFixtureHandler.forbidden_declaration_stage = stage
+                selected_url = (
+                    f"http://127.0.0.1:{self.server.server_port}/selected/device"
+                )
+                device = OnvifDevice(
+                    "camera",
+                    device_urls=[selected_url],
+                )
+
+                with self.assertRaisesRegex(
+                    RuntimeError, "^ONVIF connect failed$"
+                ) as caught:
+                    device.connect()
+
+                self.assertNotIn(
+                    "entity-payload-marker", str(caught.exception)
+                )
+                self.assertEqual(
+                    len(_OnvifFixtureHandler.requests), request_count
                 )
 
     def test_rejects_unsafe_service_urls_before_wsse_or_network(self):
