@@ -3,9 +3,10 @@
 [English](https://github.com/GagaKor/rtsp-backchannel/blob/master/rust/README.md) |
 [한국어](https://github.com/GagaKor/rtsp-backchannel/blob/master/rust/README.ko.md)
 
-Rust library and CLI for discovering ONVIF cameras, resolving profile RTSP
-URIs, and playing one audio file through an ONVIF RTSP backchannel. FFmpeg is
-required only for file playback; GStreamer is not used.
+Rust library and CLI for discovering ONVIF cameras, reporting read-only camera
+capability evidence, resolving profile RTSP URIs, and playing one audio file
+through an ONVIF RTSP backchannel. FFmpeg is required only for file playback;
+GStreamer is not used.
 
 Other implementations:
 
@@ -23,7 +24,7 @@ are implemented in Rust. FFmpeg is not bundled or installed by this crate.
 - `ffmpeg` on `PATH` for file playback
 - A camera that exposes an ONVIF `sendonly` audio backchannel
 
-Discovery and stream URI lookup do not require FFmpeg.
+Discovery, capability reporting, and stream URI lookup do not require FFmpeg.
 
 ## Installation
 
@@ -142,8 +143,75 @@ fn main() -> Result<()> {
 | --- | --- | --- |
 | `discover_devices(&options)` | `DiscoveryOptions { timeout, interfaces }` | `Vec<DiscoveredDevice>` |
 | `discover_devices_in_cidrs(&options)` | `CidrDiscoveryOptions` | `Result<Vec<DiscoveredDevice>, String>` |
+| `get_camera_capabilities(&options)` | `CameraCapabilityOptions` | `Result<CameraCapabilityReport, String>` |
 | `get_stream_uris(&options)` | `StreamUriOptions` | `Result<Vec<StreamUri>, String>` |
 | `play_file(&config)` | `PlaybackConfig` | `anyhow::Result<PlaybackResult>` |
+
+### Camera Capability Evidence
+
+`get_camera_capabilities`, `CameraCapabilityOptions`,
+`CameraCapabilityReport`, and the report's public nested types are exported
+from `rtsp_backchannel::onvif`. The operation is read-only: it connects once,
+reads scopes and service inventory, then requests available Media, PTZ, Events,
+and Media2 evidence.
+
+```rust
+use std::time::Duration;
+
+use rtsp_backchannel::onvif::{
+    CameraCapabilityOptions, CameraCapabilityReport, get_camera_capabilities,
+};
+
+let password = std::env::var("ONVIF_PASSWORD").unwrap_or_default();
+let mut options = CameraCapabilityOptions::new("camera.local", "admin", password);
+options.device_urls = vec![
+    "http://camera.local/onvif/device_service".to_owned(),
+];
+options.timeout = Duration::from_secs(8);
+let report: CameraCapabilityReport = get_camera_capabilities(&options)?;
+
+println!("{:?}", report.declared_profiles);
+# Ok::<(), String>(())
+```
+
+Interpret the report as evidence, not certification:
+
+- `scopes` preserves the camera's raw scopes. `declared_profiles` (JSON
+  `declaredProfiles`) is a declared profile self-report derived from those
+  scopes; it is not an ONVIF certification or a claim of Profile T conformance.
+- `service_discovery` (JSON `serviceDiscovery`) says whether inventory came
+  from `GetServices`, the legacy `GetCapabilities` fallback, or neither.
+  `services` is the advertised service inventory. A PTZ service advertisement,
+  a media-profile PTZ binding in `profile_tokens`, PTZ service capabilities,
+  and movement evidence in `pan_tilt_supported`/`zoom_supported` are separate
+  facts. A zoom-only node does not establish pan/tilt support.
+- For tri-state fields, `true` means a successful response established
+  support, `false` means it established absence, and `null` means the fact
+  could not be established. Optional object members not supplied by the camera
+  are omitted from native Rust serialization and camelCase JSON.
+- `media2.detected` is non-null only after `GetServices`: `true`/`false` records
+  whether Media2 was advertised. It is `null` after legacy `GetCapabilities`
+  or unavailable discovery. Advertisement, endpoint reachability, and
+  `media2.h265Supported` codec evidence are separate; none alone certifies
+  Profile T.
+- Optional enrichment failures append sanitized `warnings` whose
+  `warning.message` is generic and contains no credentials, WSSE digest
+  material, URL userinfo, or raw response payload.
+  Initial connection and authentication failures are fatal instead of being
+  downgraded to warnings.
+- Following the official ONVIF returned-XAddr rule, every advertised endpoint
+  must satisfy a same-origin check against the selected Device request before
+  WSSE construction or network dispatch: scheme and canonical host/IP must
+  match; different ports and paths remain allowed, and the advertised `XAddr`
+  is still retained in `services`. See the
+  [ONVIF Core specifications](https://www.onvif.org/specs/).
+- XML depth is capped at 64. Retained Event topics are capped at 1,024, with a
+  4,096-byte path, 2,048-byte namespace, and 256 KiB aggregate budget.
+  Exceeding a depth/topic response budget during optional Events enrichment
+  yields a sanitized warning and leaves that enrichment unknown or empty; the
+  rest of the report can continue.
+- `timeout` is a per-request limit. One report performs several requests, so
+  its total elapsed time can exceed one per-request timeout interval.
 
 ### Device Discovery
 
@@ -268,6 +336,14 @@ rtsp-backchannel streams \
   --host camera.local \
   --user admin
 
+# Print exactly one native camelCase camera capability report.
+rtsp-backchannel capabilities \
+  --host camera.local \
+  --user admin \
+  --device-url http://camera.local/onvif/device_service \
+  --device-url http://camera.local:8000/vendor/device \
+  --timeout-ms 8000
+
 # Play one file and close the RTSP session.
 rtsp-backchannel play \
   --host camera.local \
@@ -284,6 +360,15 @@ rtsp-backchannel play --host camera.local --file '/absolute/path/to/event.mp3'
 rtsp-backchannel play --host 'rtsp://admin:p%40ss@camera.local/backchannel' \
   --file '/absolute/path/to/event.mp3'
 ```
+
+The `capabilities` command prints exactly one camelCase JSON object followed by
+one newline and no status line. Omit `--pass` to use `ONVIF_PASSWORD`; an
+explicit `--pass ""` overrides the environment with an empty password.
+Repeated non-empty `--device-url` values are tried in supplied order.
+`--timeout-ms` accepts a finite positive decimal number of milliseconds and is
+converted to a nonzero per-request `Duration`; omitting it keeps the API's
+eight-second default. Help and validation failures do not open the network or
+echo credential/environment values.
 
 The `play` word is optional for backward compatibility. `--pass` is available
 for manual use, but `ONVIF_PASSWORD` avoids exposing the password in the

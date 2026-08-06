@@ -1,6 +1,7 @@
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::Parser;
 
@@ -10,7 +11,8 @@ use crate::audio::CodecPreference;
 #[command(
     name = "rtsp-backchannel",
     about = "Play one audio file through an ONVIF or direct RTSP backchannel",
-    after_help = "Commands: rtsp-backchannel discover; rtsp-backchannel streams\n\
+    after_help = "Commands: rtsp-backchannel discover; rtsp-backchannel streams; \
+                  rtsp-backchannel capabilities\n\
                   Codec: auto|pcma|pcmu|g726-16|g726-24|g726-32|g726-40|aac; TCP interleaved RTP, real-time pacing."
 )]
 pub struct Cli {
@@ -88,11 +90,44 @@ pub struct StreamsCli {
     pub device_urls: Vec<String>,
 }
 
+#[derive(Debug, Parser)]
+#[command(
+    name = "rtsp-backchannel capabilities",
+    about = "Report read-only ONVIF camera capability evidence"
+)]
+pub struct CapabilitiesCli {
+    #[arg(long, value_parser = parse_nonempty_text)]
+    pub host: String,
+
+    #[arg(long, value_parser = parse_nonempty_text)]
+    pub user: Option<String>,
+
+    #[arg(long = "pass", env = "ONVIF_PASSWORD", hide_env_values = true)]
+    pub password: Option<String>,
+
+    #[arg(
+        long = "device-url",
+        value_parser = parse_nonempty_text,
+        help = "ONVIF Device Service URL (repeatable; supplied order is kept)"
+    )]
+    pub device_urls: Vec<String>,
+
+    #[arg(
+        long = "timeout-ms",
+        value_name = "MILLISECONDS",
+        value_parser = parse_positive_timeout_ms,
+        allow_hyphen_values = true,
+        help = "Finite positive per-request timeout in milliseconds"
+    )]
+    pub timeout: Option<Duration>,
+}
+
 #[derive(Debug)]
 pub enum Invocation {
     Play(Cli),
     Discover(DiscoveryCli),
     Streams(StreamsCli),
+    Capabilities(CapabilitiesCli),
 }
 
 pub fn parse_invocation_from<I, T>(arguments: I) -> Result<Invocation, clap::Error>
@@ -114,9 +149,110 @@ where
     match command {
         Some("discover") => DiscoveryCli::try_parse_from(delegated(2)).map(Invocation::Discover),
         Some("streams") => StreamsCli::try_parse_from(delegated(2)).map(Invocation::Streams),
+        Some("capabilities") => normalize_capability_arguments(&arguments)
+            .and_then(CapabilitiesCli::try_parse_from)
+            .map(Invocation::Capabilities),
         Some("play") => Cli::try_parse_from(delegated(2)).map(Invocation::Play),
         _ => Cli::try_parse_from(arguments).map(Invocation::Play),
     }
+}
+
+fn exact_capability_option_name(value: &OsStr) -> Option<&'static str> {
+    match value.to_str()? {
+        "--host" => Some("host"),
+        "--user" => Some("user"),
+        "--pass" => Some("pass"),
+        "--device-url" => Some("device-url"),
+        "--timeout-ms" => Some("timeout-ms"),
+        _ => None,
+    }
+}
+
+fn attached_capability_option(value: &OsStr) -> Option<(&'static str, &str)> {
+    let value = value.to_str()?;
+    [
+        ("host", "--host="),
+        ("user", "--user="),
+        ("pass", "--pass="),
+        ("device-url", "--device-url="),
+        ("timeout-ms", "--timeout-ms="),
+    ]
+    .into_iter()
+    .find_map(|(name, prefix)| value.strip_prefix(prefix).map(|value| (name, value)))
+}
+
+fn is_known_capability_flag(value: &OsStr) -> bool {
+    matches!(value.to_str(), Some("-h" | "--help"))
+        || exact_capability_option_name(value).is_some()
+        || attached_capability_option(value).is_some()
+}
+
+fn missing_capability_value(option: &str) -> clap::Error {
+    clap::Error::raw(
+        clap::error::ErrorKind::InvalidValue,
+        format!("missing value for --{option}"),
+    )
+}
+
+fn normalize_capability_arguments(arguments: &[OsString]) -> Result<Vec<OsString>, clap::Error> {
+    let mut normalized = vec![OsString::from("rtsp-backchannel capabilities")];
+    let mut index = 2;
+    while index < arguments.len() {
+        let argument = &arguments[index];
+        if let Some((option, value)) = attached_capability_option(argument) {
+            if option != "pass" && value.starts_with('-') {
+                return Err(missing_capability_value(option));
+            }
+            normalized.push(argument.clone());
+            index += 1;
+            continue;
+        }
+        let Some(option) = exact_capability_option_name(argument) else {
+            normalized.push(argument.clone());
+            index += 1;
+            continue;
+        };
+        let Some(value) = arguments.get(index + 1) else {
+            return Err(missing_capability_value(option));
+        };
+        if option == "pass" {
+            if is_known_capability_flag(value) {
+                return Err(missing_capability_value(option));
+            }
+            if value.to_string_lossy().starts_with('-') {
+                let mut attached = OsString::from("--pass=");
+                attached.push(value);
+                normalized.push(attached);
+                index += 2;
+                continue;
+            }
+        } else if value.to_string_lossy().starts_with('-') {
+            return Err(missing_capability_value(option));
+        }
+        normalized.push(argument.clone());
+        index += 1;
+    }
+    Ok(normalized)
+}
+
+fn parse_nonempty_text(value: &str) -> Result<String, String> {
+    if value.trim().is_empty() {
+        return Err("value must not be empty".to_owned());
+    }
+    Ok(value.to_owned())
+}
+
+fn parse_positive_timeout_ms(value: &str) -> Result<Duration, String> {
+    let invalid = || "timeout-ms must be finite and greater than 0".to_owned();
+    let milliseconds = value.parse::<f64>().map_err(|_| invalid())?;
+    if !milliseconds.is_finite() || milliseconds <= 0.0 {
+        return Err(invalid());
+    }
+    let timeout = Duration::try_from_secs_f64(milliseconds / 1000.0).map_err(|_| invalid())?;
+    if timeout.is_zero() {
+        return Err(invalid());
+    }
+    Ok(timeout)
 }
 
 fn parse_volume(value: &str) -> Result<f64, String> {

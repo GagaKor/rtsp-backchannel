@@ -3,9 +3,9 @@
 [English](https://github.com/GagaKor/rtsp-backchannel/blob/master/rust/README.md) |
 [한국어](https://github.com/GagaKor/rtsp-backchannel/blob/master/rust/README.ko.md)
 
-ONVIF 카메라 검색, 프로필별 RTSP URI 조회, ONVIF RTSP 백채널을 통한 음원 파일
-재생을 지원하는 Rust 라이브러리 및 CLI입니다. 파일 재생에만 별도 설치한 FFmpeg가
-필요하며 GStreamer는 사용하지 않습니다.
+ONVIF 카메라 검색, 읽기 전용 카메라 기능 근거 보고, 프로필별 RTSP URI 조회,
+ONVIF RTSP 백채널을 통한 음원 파일 재생을 지원하는 Rust 라이브러리 및 CLI입니다.
+파일 재생에만 별도 설치한 FFmpeg가 필요하며 GStreamer는 사용하지 않습니다.
 
 다른 구현체:
 
@@ -23,7 +23,7 @@ crate는 백채널 세션을 열고 음원 파일 전체를 실시간 속도로 
 - 파일 재생 시 `PATH`에서 실행할 수 있는 `ffmpeg`
 - ONVIF `sendonly` 오디오 백채널을 제공하는 카메라
 
-카메라 검색과 스트림 URI 조회에는 FFmpeg가 필요하지 않습니다.
+카메라 검색, 기능 보고, 스트림 URI 조회에는 FFmpeg가 필요하지 않습니다.
 
 ## 설치
 
@@ -140,8 +140,70 @@ fn main() -> Result<()> {
 | --- | --- | --- |
 | `discover_devices(&options)` | `DiscoveryOptions { timeout, interfaces }` | `Vec<DiscoveredDevice>` |
 | `discover_devices_in_cidrs(&options)` | `CidrDiscoveryOptions` | `Result<Vec<DiscoveredDevice>, String>` |
+| `get_camera_capabilities(&options)` | `CameraCapabilityOptions` | `Result<CameraCapabilityReport, String>` |
 | `get_stream_uris(&options)` | `StreamUriOptions` | `Result<Vec<StreamUri>, String>` |
 | `play_file(&config)` | `PlaybackConfig` | `anyhow::Result<PlaybackResult>` |
+
+### 카메라 기능 근거
+
+`get_camera_capabilities`, `CameraCapabilityOptions`,
+`CameraCapabilityReport`와 보고서의 공개 하위 타입은
+`rtsp_backchannel::onvif`에서 export됩니다. 이 작업은 읽기 전용이며 한 번 연결한 뒤
+scope와 서비스 인벤토리를 읽고, 사용할 수 있는 Media, PTZ, Events, Media2 근거를
+조회합니다.
+
+```rust
+use std::time::Duration;
+
+use rtsp_backchannel::onvif::{
+    CameraCapabilityOptions, CameraCapabilityReport, get_camera_capabilities,
+};
+
+let password = std::env::var("ONVIF_PASSWORD").unwrap_or_default();
+let mut options = CameraCapabilityOptions::new("camera.local", "admin", password);
+options.device_urls = vec![
+    "http://camera.local/onvif/device_service".to_owned(),
+];
+options.timeout = Duration::from_secs(8);
+let report: CameraCapabilityReport = get_camera_capabilities(&options)?;
+
+println!("{:?}", report.declared_profiles);
+# Ok::<(), String>(())
+```
+
+보고서는 인증 판정이 아니라 관측 근거로 해석해야 합니다.
+
+- `scopes`는 카메라의 원본 scope를 보존합니다. `declared_profiles`(JSON
+  `declaredProfiles`)는 scope에서 얻은 선언 프로필 자체 보고이며 ONVIF 인증 또는
+  Profile T 적합성 주장이 아닙니다.
+- `service_discovery`(JSON `serviceDiscovery`)는 인벤토리가 `GetServices`, 기존
+  `GetCapabilities` fallback, 또는 어느 쪽에서도 오지 못했는지를 나타냅니다.
+  `services`는 광고된 서비스 인벤토리입니다. PTZ 서비스 광고, media profile의
+  `profile_tokens` PTZ binding, PTZ service capability,
+  `pan_tilt_supported`/`zoom_supported` movement 공간은 서로 다른 사실입니다.
+  zoom-only node만으로 pan/tilt 지원이 확인되지는 않습니다.
+- tri-state 필드에서 `true`는 성공한 응답으로 지원을 확인한 값, `false`는 성공한
+  응답으로 부재를 확인한 값, `null`은 확인할 수 없었던 값입니다. 카메라가 보고하지
+  않은 선택적 객체 멤버는 native Rust 직렬화와 camelCase JSON에서 생략됩니다.
+- `media2.detected`는 `GetServices` 이후에만 null이 아닌 값입니다. `true`/`false`는
+  Media2 광고 여부이고, 기존 `GetCapabilities` fallback 또는 서비스 검색 실패에서는
+  `null`입니다. 광고, endpoint reachability, `media2.h265Supported` codec 근거는
+  별개의 사실이며 어느 하나도 Profile T를 인증하지 않습니다.
+- 선택적 enrichment 실패는 sanitized `warnings`를 추가합니다. 그
+  `warning.message`는 generic 값이며 credentials, WSSE digest material, URL userinfo,
+  raw response payload를 포함하지 않습니다. 초기 연결 및 인증 실패는 치명적 오류로
+  처리하며 warning으로 낮추지 않습니다.
+- 공식 ONVIF returned-XAddr 규칙에 따라 광고된 endpoint는 WSSE 생성이나 네트워크
+  전송 전에 선택한 Device 요청과 same-origin 검사를 통과해야 합니다. scheme과
+  canonical host/IP가 같아야 하지만 서로 다른 포트와 경로는 허용됩니다. 광고된
+  `XAddr` 자체는 `services` 보고서에 유지됩니다.
+  [ONVIF Core 명세](https://www.onvif.org/specs/)를 참고하십시오.
+- XML depth 한도는 64입니다. 유지하는 Event topic은 1,024개, path는 4,096 byte,
+  namespace는 2,048 byte, 합계는 256 KiB로 제한합니다. 선택적 Events enrichment에서
+  depth/topic response budget을 넘으면 sanitized warning을 남기고 해당 근거를
+  unknown 또는 빈 값으로 두며 나머지 보고서는 계속할 수 있습니다.
+- `timeout`은 per-request 한도입니다. 한 보고서는 여러 요청을 사용하므로 총 소요
+  시간은 per-request timeout 한 번보다 길 수 있습니다.
 
 ### 장치 검색
 
@@ -233,6 +295,14 @@ rtsp-backchannel streams \
   --host camera.local \
   --user admin
 
+# native camelCase 카메라 기능 보고서 하나를 출력합니다.
+rtsp-backchannel capabilities \
+  --host camera.local \
+  --user admin \
+  --device-url http://camera.local/onvif/device_service \
+  --device-url http://camera.local:8000/vendor/device \
+  --timeout-ms 8000
+
 # 음원 한 파일을 재생하고 RTSP 세션을 종료합니다.
 rtsp-backchannel play \
   --host camera.local \
@@ -240,6 +310,14 @@ rtsp-backchannel play \
   --file '/absolute/path/to/event.mp3' \
   --volume 0.05
 ```
+
+`capabilities` 명령은 상태 줄 없이 camelCase JSON 객체를 정확히 한 줄 출력하고 newline
+하나를 덧붙입니다. `--pass`를 생략하면 `ONVIF_PASSWORD`를 사용하며, 명시적인
+`--pass ""`는 환경변수를 빈 비밀번호로 덮어씁니다. 비어 있지 않은 `--device-url`을
+반복하면 입력 순서대로 시도합니다. `--timeout-ms`는 유한한 양의 decimal 밀리초를
+받아 0이 아닌 per-request `Duration`으로 변환하며, 생략하면 API 기본값 8초를
+유지합니다. 도움말과 입력 검증 실패는 네트워크를 열거나 credentials/environment
+값을 출력하지 않습니다.
 
 하위 호환성을 위해 `play` 단어는 생략할 수 있습니다. 수동 실행에서는 `--pass`도
 사용할 수 있지만, `ONVIF_PASSWORD`를 사용하면 비밀번호가 프로세스 인자 목록에

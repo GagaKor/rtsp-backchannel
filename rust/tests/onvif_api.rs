@@ -1,11 +1,11 @@
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, TcpListener};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rtsp_backchannel::cli::{Invocation, parse_invocation_from};
+use rtsp_backchannel::cli::{CapabilitiesCli, Invocation, parse_invocation_from};
 use rtsp_backchannel::discovery::{DiscoveryOptions, parse_probe_matches};
 use rtsp_backchannel::onvif::{
     CameraCapabilityOptions, OnvifDevice, StreamUriOptions, get_camera_capabilities,
@@ -188,6 +188,559 @@ fn parses_discover_and_streams_without_breaking_direct_playback_flags() {
         .unwrap(),
         Invocation::Play(_)
     ));
+}
+
+#[test]
+fn capabilities_cli_parses_defaults_repeated_values_and_exact_command_dispatch() {
+    match parse_invocation_from([
+        "rtsp-backchannel",
+        "capabilities",
+        "--host",
+        "camera.local",
+        "--user",
+        "operator",
+        "--pass",
+        "",
+        "--device-url",
+        "http://camera.local/onvif/device_service",
+        "--device-url",
+        "http://camera.local:8000/vendor/device",
+        "--timeout-ms",
+        "2500.5",
+    ])
+    .unwrap()
+    {
+        Invocation::Capabilities(cli) => {
+            let cli: CapabilitiesCli = cli;
+            assert_eq!(cli.host, "camera.local");
+            assert_eq!(cli.user.as_deref(), Some("operator"));
+            assert_eq!(cli.password.as_deref(), Some(""));
+            assert_eq!(
+                cli.device_urls,
+                [
+                    "http://camera.local/onvif/device_service",
+                    "http://camera.local:8000/vendor/device",
+                ]
+            );
+            assert_eq!(cli.timeout, Some(Duration::from_micros(2_500_500)));
+        }
+        _ => panic!("expected capabilities invocation"),
+    }
+
+    match parse_invocation_from([
+        "rtsp-backchannel",
+        "capabilities",
+        "--host",
+        "camera.local",
+        "--pass",
+        "",
+    ])
+    .unwrap()
+    {
+        Invocation::Capabilities(cli) => {
+            assert_eq!(cli.user, None);
+            assert_eq!(cli.password.as_deref(), Some(""));
+            assert!(cli.device_urls.is_empty());
+            assert_eq!(cli.timeout, None);
+        }
+        _ => panic!("expected capabilities invocation"),
+    }
+
+    for arguments in [
+        vec![
+            "rtsp-backchannel",
+            "--host",
+            "capabilities",
+            "--file",
+            "event.mp3",
+        ],
+        vec![
+            "rtsp-backchannel",
+            "play",
+            "--host",
+            "capabilities",
+            "--file",
+            "event.mp3",
+        ],
+    ] {
+        assert!(matches!(
+            parse_invocation_from(arguments).unwrap(),
+            Invocation::Play(_)
+        ));
+    }
+}
+
+#[test]
+fn capabilities_cli_rejects_unsafe_values_and_timeout_underflow_before_dispatch() {
+    let cases = [
+        vec!["rtsp-backchannel", "capabilities"],
+        vec!["rtsp-backchannel", "capabilities", "--host", ""],
+        vec![
+            "rtsp-backchannel",
+            "capabilities",
+            "--host",
+            "--timeout-ms",
+            "50",
+        ],
+        vec![
+            "rtsp-backchannel",
+            "capabilities",
+            "--host",
+            "camera.local",
+            "--user",
+            "",
+        ],
+        vec![
+            "rtsp-backchannel",
+            "capabilities",
+            "--host",
+            "camera.local",
+            "--user",
+            "--timeout-ms",
+            "50",
+        ],
+        vec![
+            "rtsp-backchannel",
+            "capabilities",
+            "--host",
+            "camera.local",
+            "--pass",
+        ],
+        vec![
+            "rtsp-backchannel",
+            "capabilities",
+            "--host",
+            "camera.local",
+            "--pass",
+            "--timeout-ms",
+            "50",
+        ],
+        vec![
+            "rtsp-backchannel",
+            "capabilities",
+            "--host",
+            "camera.local",
+            "--device-url",
+            "",
+        ],
+        vec![
+            "rtsp-backchannel",
+            "capabilities",
+            "--host",
+            "camera.local",
+            "--device-url",
+            "--timeout-ms",
+            "50",
+        ],
+        vec![
+            "rtsp-backchannel",
+            "capabilities",
+            "--host",
+            "camera.local",
+            "--timeout-ms",
+        ],
+        vec![
+            "rtsp-backchannel",
+            "capabilities",
+            "--host",
+            "camera.local",
+            "--timeout-ms",
+            "",
+        ],
+        vec![
+            "rtsp-backchannel",
+            "capabilities",
+            "--host",
+            "camera.local",
+            "--timeout-ms",
+            "--user",
+            "operator",
+        ],
+    ];
+    for arguments in cases {
+        let diagnostic = parse_invocation_from(arguments).unwrap_err().to_string();
+        assert!(!diagnostic.contains("validation-only-secret"));
+        assert!(!diagnostic.contains("environment-only-secret"));
+    }
+
+    for timeout in ["0", "-1", "5e-324", "NaN", "inf", "1e309"] {
+        let diagnostic = parse_invocation_from([
+            "rtsp-backchannel",
+            "capabilities",
+            "--host",
+            "camera.local",
+            "--pass",
+            "validation-only-secret",
+            "--timeout-ms",
+            timeout,
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(!diagnostic.contains("validation-only-secret"));
+        assert!(!diagnostic.contains("environment-only-secret"));
+    }
+
+    for (arguments, option, secret) in [
+        (
+            vec![
+                "rtsp-backchannel",
+                "capabilities",
+                "--host",
+                "--host-secret-marker",
+            ],
+            "host",
+            "--host-secret-marker",
+        ),
+        (
+            vec![
+                "rtsp-backchannel",
+                "capabilities",
+                "--host",
+                "camera.local",
+                "--user",
+                "--user-secret-marker",
+            ],
+            "user",
+            "--user-secret-marker",
+        ),
+        (
+            vec![
+                "rtsp-backchannel",
+                "capabilities",
+                "--host",
+                "camera.local",
+                "--device-url",
+                "--device-url-secret-marker",
+            ],
+            "device-url",
+            "--device-url-secret-marker",
+        ),
+        (
+            vec![
+                "rtsp-backchannel",
+                "capabilities",
+                "--host",
+                "camera.local",
+                "--timeout-ms",
+                "--timeout-secret-marker",
+            ],
+            "timeout-ms",
+            "--timeout-secret-marker",
+        ),
+    ] {
+        let diagnostic = parse_invocation_from(arguments).unwrap_err().to_string();
+        assert!(
+            diagnostic.contains(&format!("missing value for --{option}")),
+            "unexpected diagnostic: {diagnostic}"
+        );
+        assert!(!diagnostic.contains(secret));
+    }
+
+    for (arguments, option, secret) in [
+        (
+            vec![
+                "rtsp-backchannel",
+                "capabilities",
+                "--host=--host-equals-secret-marker",
+            ],
+            "host",
+            "--host-equals-secret-marker",
+        ),
+        (
+            vec![
+                "rtsp-backchannel",
+                "capabilities",
+                "--host",
+                "camera.local",
+                "--user=--user-equals-secret-marker",
+            ],
+            "user",
+            "--user-equals-secret-marker",
+        ),
+        (
+            vec![
+                "rtsp-backchannel",
+                "capabilities",
+                "--host",
+                "camera.local",
+                "--device-url=--device-url-equals-secret-marker",
+            ],
+            "device-url",
+            "--device-url-equals-secret-marker",
+        ),
+        (
+            vec![
+                "rtsp-backchannel",
+                "capabilities",
+                "--host",
+                "camera.local",
+                "--timeout-ms=--timeout-equals-secret-marker",
+            ],
+            "timeout-ms",
+            "--timeout-equals-secret-marker",
+        ),
+    ] {
+        let diagnostic = parse_invocation_from(arguments).unwrap_err().to_string();
+        assert!(
+            diagnostic.contains(&format!("missing value for --{option}")),
+            "unexpected diagnostic: {diagnostic}"
+        );
+        assert!(!diagnostic.contains(secret));
+    }
+
+    for (arguments, expected_password) in [
+        (
+            vec![
+                "rtsp-backchannel",
+                "capabilities",
+                "--host",
+                "camera.local",
+                "--pass",
+                "--separate-password-secret",
+            ],
+            "--separate-password-secret",
+        ),
+        (
+            vec![
+                "rtsp-backchannel",
+                "capabilities",
+                "--host",
+                "camera.local",
+                "--pass=--equals-password-secret",
+            ],
+            "--equals-password-secret",
+        ),
+    ] {
+        match parse_invocation_from(arguments).unwrap() {
+            Invocation::Capabilities(cli) => {
+                assert_eq!(cli.password.as_deref(), Some(expected_password));
+            }
+            _ => panic!("expected capabilities invocation"),
+        }
+    }
+
+    for (password_arguments, secret) in [
+        (
+            vec!["--pass", "--separate-password-secret"],
+            "--separate-password-secret",
+        ),
+        (
+            vec!["--pass=--equals-password-secret"],
+            "--equals-password-secret",
+        ),
+    ] {
+        let mut arguments = vec!["rtsp-backchannel", "capabilities", "--host", "camera.local"];
+        arguments.extend(password_arguments);
+        arguments.extend(["--timeout-ms", "0"]);
+        let diagnostic = parse_invocation_from(arguments).unwrap_err().to_string();
+        assert!(!diagnostic.contains(secret));
+    }
+
+    let known_flag = parse_invocation_from([
+        "rtsp-backchannel",
+        "capabilities",
+        "--host",
+        "camera.local",
+        "--pass",
+        "--timeout-ms",
+        "50",
+    ])
+    .unwrap_err()
+    .to_string();
+    assert!(known_flag.contains("missing value for --pass"));
+}
+
+#[test]
+fn capabilities_cli_help_lists_options_without_network_or_secret_values() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let device_url = format!("http://127.0.0.1:{port}/must-not-reach");
+
+    let mut root_command = Command::new(env!("CARGO_BIN_EXE_rtsp-backchannel"));
+    root_command
+        .arg("--help")
+        .env("ONVIF_PASSWORD", "help-environment-secret");
+    let root = command_output_with_timeout(&mut root_command, Duration::from_secs(10));
+    assert!(root.status.success());
+    assert!(String::from_utf8_lossy(&root.stdout).contains("capabilities"));
+
+    let mut subcommand_command = Command::new(env!("CARGO_BIN_EXE_rtsp-backchannel"));
+    subcommand_command
+        .args([
+            "capabilities",
+            "--host",
+            "camera.local",
+            "--device-url",
+            &device_url,
+            "--pass",
+            "help-command-secret",
+            "--help",
+        ])
+        .env("ONVIF_PASSWORD", "help-environment-secret");
+    let subcommand = command_output_with_timeout(&mut subcommand_command, Duration::from_secs(10));
+    assert!(subcommand.status.success());
+    let help = String::from_utf8_lossy(&subcommand.stdout);
+    for expected in [
+        "rtsp-backchannel capabilities",
+        "--host",
+        "--user",
+        "--pass",
+        "--device-url",
+        "--timeout-ms",
+        "per-request",
+        "repeat",
+    ] {
+        assert!(help.contains(expected), "missing {expected:?} in {help}");
+    }
+    let combined = format!(
+        "{}{}{}{}",
+        String::from_utf8_lossy(&root.stdout),
+        String::from_utf8_lossy(&root.stderr),
+        help,
+        String::from_utf8_lossy(&subcommand.stderr),
+    );
+    for secret in ["help-command-secret", "help-environment-secret"] {
+        assert!(!combined.contains(secret));
+    }
+    assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+}
+
+#[test]
+fn capabilities_cli_outputs_one_native_json_line_and_explicit_empty_overrides_environment() {
+    let (environment_output, environment_requests, environment_media) =
+        run_capabilities_cli_fixture(None, "environment-only-secret");
+    assert!(
+        environment_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&environment_output.stderr)
+    );
+    assert!(environment_output.stderr.is_empty());
+    let stdout = String::from_utf8(environment_output.stdout).unwrap();
+    assert!(stdout.ends_with('\n'));
+    assert_eq!(stdout.lines().count(), 1);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(stdout.trim_end()).unwrap(),
+        serde_json::json!({
+            "device": {
+                "manufacturer": "Fixture Camera",
+                "model": "C1",
+                "firmware": "1.2.3",
+                "serial": "serial-1"
+            },
+            "scopes": [],
+            "declaredProfiles": [],
+            "serviceDiscovery": "getCapabilities",
+            "services": [{"namespace": MEDIA1_NS, "xaddr": environment_media}],
+            "profiles": [],
+            "ptz": {
+                "detected": false,
+                "panTiltSupported": null,
+                "zoomSupported": null,
+                "profileTokens": [],
+                "nodes": []
+            },
+            "events": {"detected": false, "topics": []},
+            "media2": {"detected": null, "encodings": [], "h265Supported": null},
+            "warnings": [{
+                "operation": "GetServices",
+                "message": "no services in GetServices response"
+            }]
+        })
+    );
+    assert_eq!(environment_requests.len(), 7);
+    assert!(
+        environment_requests[1..]
+            .iter()
+            .all(|request| request.contains("<wsse:Security"))
+    );
+
+    let (empty_output, empty_requests, _) =
+        run_capabilities_cli_fixture(Some(""), "environment-only-secret");
+    assert!(
+        empty_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&empty_output.stderr)
+    );
+    assert!(empty_output.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&empty_output.stdout)
+            .lines()
+            .count(),
+        1
+    );
+    assert_eq!(empty_requests.len(), 7);
+    assert!(
+        empty_requests
+            .iter()
+            .all(|request| !request.contains("<wsse:Security"))
+    );
+
+    for content in [
+        stdout.as_bytes(),
+        &environment_output.stderr,
+        &empty_output.stdout,
+        &empty_output.stderr,
+    ] {
+        let content = String::from_utf8_lossy(content);
+        assert!(!content.contains("environment-only-secret"));
+    }
+    for request in environment_requests.iter().chain(&empty_requests) {
+        assert!(!request.contains("environment-only-secret"));
+    }
+}
+
+#[test]
+fn capabilities_cli_documentation_covers_native_report_and_hardened_semantics() {
+    let english = include_str!("../README.md");
+    let korean = include_str!("../README.ko.md");
+
+    for readme in [english, korean] {
+        for expected in [
+            "get_camera_capabilities",
+            "CameraCapabilityOptions",
+            "CameraCapabilityReport",
+            "declared_profiles",
+            "declaredProfiles",
+            "service_discovery",
+            "profile_tokens",
+            "pan_tilt_supported",
+            "Profile T",
+            "media2.detected",
+            "media2.h265Supported",
+            "true",
+            "false",
+            "null",
+            "GetServices",
+            "GetCapabilities",
+            "warning.message",
+            "same-origin",
+            "canonical host",
+            "XAddr",
+            "WSSE",
+            "64",
+            "1,024",
+            "256 KiB",
+            "per-request",
+            "ONVIF_PASSWORD",
+            "`--pass \"\"`",
+            "rtsp-backchannel capabilities",
+            "--device-url",
+            "--timeout-ms",
+            "https://www.onvif.org/specs/",
+        ] {
+            assert!(readme.contains(expected), "missing {expected:?}");
+        }
+    }
+
+    assert!(english.contains("declared profile self-report"));
+    assert!(english.contains("Initial connection and authentication failures are fatal"));
+    assert!(english.contains("exactly one camelCase JSON object"));
+    assert!(english.contains("different ports and paths remain allowed"));
+    assert!(korean.contains("선언 프로필 자체 보고"));
+    assert!(korean.contains("초기 연결 및 인증 실패는 치명적 오류"));
+    assert!(korean.contains("camelCase JSON 객체를 정확히 한 줄"));
+    assert!(korean.contains("서로 다른 포트와 경로는 허용"));
 }
 
 #[test]
@@ -897,6 +1450,70 @@ struct CapabilityHttpResponse {
     body: String,
 }
 
+fn run_capabilities_cli_fixture(
+    explicit_password: Option<&str>,
+    environment_password: &str,
+) -> (std::process::Output, Vec<String>, String) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let device_url = format!("http://127.0.0.1:{port}/selected/device");
+    let connected_media = format!("http://127.0.0.1:{port}/connected/media");
+    let unused_device_url = format!("http://127.0.0.1:{port}/unused/device");
+    let mut responses = capability_connect_responses(&connected_media);
+    responses.extend([
+        ok(capability_soap("<tds:GetScopesResponse/>")),
+        ok(capability_soap("<tds:GetServicesResponse/>")),
+        ok(capability_soap(&format!(
+            "<tds:GetCapabilitiesResponse><tds:Capabilities><tt:Media><tt:XAddr>{connected_media}</tt:XAddr></tt:Media></tds:Capabilities></tds:GetCapabilitiesResponse>"
+        ))),
+        ok(capability_soap("<trt:GetProfilesResponse/>")),
+    ]);
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let server = serve_capability_responses(listener, responses, Arc::clone(&requests));
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rtsp-backchannel"));
+    command
+        .args([
+            "capabilities",
+            "--host",
+            "camera.local",
+            "--device-url",
+            &device_url,
+            "--device-url",
+            &unused_device_url,
+            "--timeout-ms",
+            "2500.5",
+        ])
+        .env("ONVIF_PASSWORD", environment_password);
+    if let Some(password) = explicit_password {
+        command.arg("--pass").arg(password);
+    }
+    let output = command_output_with_timeout(&mut command, Duration::from_secs(10));
+    server.join().unwrap();
+    let requests = requests.lock().unwrap().clone();
+    (output, requests, connected_media)
+}
+
+fn command_output_with_timeout(command: &mut Command, timeout: Duration) -> std::process::Output {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            return child.wait_with_output().unwrap();
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            let _ = child.wait_with_output();
+            panic!("CLI child process timed out");
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
 fn ok(body: String) -> CapabilityHttpResponse {
     status(200, body)
 }
@@ -958,6 +1575,9 @@ fn serve_capability_responses(
                 }
             };
             stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(4)))
+                .unwrap();
             requests
                 .lock()
                 .unwrap()
@@ -1007,6 +1627,7 @@ fn read_http_request(stream: &mut impl Read) -> String {
     let header_end;
     loop {
         let read = stream.read(&mut chunk).unwrap();
+        assert!(read > 0, "unexpected EOF while reading HTTP headers");
         request.extend_from_slice(&chunk[..read]);
         if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
             header_end = end;
@@ -1025,6 +1646,7 @@ fn read_http_request(stream: &mut impl Read) -> String {
     let body_start = header_end + 4;
     while request.len() < body_start + content_length {
         let read = stream.read(&mut chunk).unwrap();
+        assert!(read > 0, "unexpected EOF while reading HTTP body");
         request.extend_from_slice(&chunk[..read]);
     }
     String::from_utf8_lossy(&request).into_owned()

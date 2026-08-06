@@ -5,7 +5,9 @@ use rtsp_backchannel::cli::{Cli, Invocation, parse_invocation_from};
 use rtsp_backchannel::discovery::{
     CidrDiscoveryOptions, DiscoveryOptions, discover_devices, discover_devices_in_cidrs,
 };
-use rtsp_backchannel::onvif::{StreamUriOptions, get_stream_uris};
+use rtsp_backchannel::onvif::{
+    CameraCapabilityOptions, StreamUriOptions, get_camera_capabilities, get_stream_uris,
+};
 use rtsp_backchannel::playback::{PlaybackConfig, play_file_with_codec};
 use rtsp_backchannel::rtsp::has_rtsp_scheme;
 use std::time::Duration;
@@ -59,6 +61,21 @@ fn run(invocation: Invocation) -> Result<()> {
             for stream in streams {
                 println!("{}", serde_json::to_string(&stream)?);
             }
+            Ok(())
+        }
+        Invocation::Capabilities(cli) => {
+            let mut options = CameraCapabilityOptions::new(
+                cli.host,
+                cli.user.unwrap_or_default(),
+                cli.password.unwrap_or_default(),
+            );
+            options.device_urls = cli.device_urls;
+            if let Some(timeout) = cli.timeout {
+                options.timeout = timeout;
+            }
+            let report = get_camera_capabilities(&options).map_err(anyhow::Error::msg)?;
+            let json = serde_json::to_string(&report)?;
+            println!("{json}");
             Ok(())
         }
     }
