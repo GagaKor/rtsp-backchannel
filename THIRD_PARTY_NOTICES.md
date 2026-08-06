@@ -14,6 +14,20 @@ build.
 
 See <https://ffmpeg.org/legal.html>.
 
+## saxes
+
+The TypeScript package uses `saxes` to parse namespace-aware ONVIF XML.
+`saxes` is licensed under the ISC License.
+
+Upstream: <https://github.com/lddubeau/saxes>
+
+## xmlchars
+
+`xmlchars` is a transitive dependency of `saxes` and is licensed under the MIT
+License.
+
+Upstream: <https://github.com/lddubeau/xmlchars>
+
 ## ONVIF implementation and trademark
 
 The ONVIF, WS-Discovery, RTP, and RTSP support in this repository is an
