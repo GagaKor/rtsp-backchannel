@@ -279,3 +279,31 @@ test('rejects unsafe service URLs without transmitting a request or exposing URL
     );
   }
 });
+
+test('keeps credential-like hosts and service URLs out of final connect errors', async () => {
+  const devices = [
+    new OnvifDevice('viewer:top-secret@camera'),
+    new OnvifDevice('camera', '', '', {
+      deviceUrls: ['http://viewer:url-secret@camera/onvif/device_service'],
+    }),
+  ];
+  const messages: string[] = [];
+
+  for (const device of devices) {
+    try {
+      await device.connect();
+      messages.push('resolved');
+    } catch (error) {
+      messages.push(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  assert.deepEqual(messages, [
+    'ONVIF connect failed: invalid ONVIF service URL',
+    'ONVIF connect failed: invalid ONVIF service URL',
+  ]);
+  assert.doesNotMatch(
+    JSON.stringify(messages),
+    /viewer|secret|@camera/,
+  );
+});

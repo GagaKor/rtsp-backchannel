@@ -57,6 +57,13 @@ function parseServiceUrl(value: string): URL {
   return parsed;
 }
 
+function safeConnectCause(error: unknown): string {
+  if (error instanceof Error && error.message === 'invalid ONVIF service URL') {
+    return error.message;
+  }
+  return 'request failed';
+}
+
 export interface DeviceInfo {
   manufacturer?: string;
   model?: string;
@@ -151,9 +158,7 @@ export class OnvifDevice {
         lastErr = err;
       }
     }
-    throw new Error(
-      `ONVIF connect failed for ${this.host}: ${(lastErr as Error)?.message ?? lastErr}`,
-    );
+    throw new Error(`ONVIF connect failed: ${safeConnectCause(lastErr)}`);
   }
 
   private now(): Date {

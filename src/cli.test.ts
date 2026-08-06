@@ -62,6 +62,29 @@ test('runs the dedicated npm binary entry point', () => {
   assert.match(result.stdout, /--file/);
 });
 
+test('keeps credential-like capability hosts out of npm bin errors', () => {
+  const result = spawnSync(
+    process.execPath,
+    [
+      '--experimental-transform-types',
+      'src/bin.ts',
+      'capabilities',
+      '--host',
+      'viewer:top-secret@camera',
+      '--timeout-ms',
+      '1',
+    ],
+    { encoding: 'utf8' },
+  );
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /ONVIF connect failed/);
+  assert.doesNotMatch(
+    `${result.stdout}\n${result.stderr}`,
+    /viewer|secret|@camera/,
+  );
+});
+
 test('keeps fileToRtpAudio optional for legacy dependency injection', () => {
   const dependencies: PublicPlaybackDependencies = {
     openBackchannel,
@@ -802,6 +825,114 @@ test('applies capability credential defaults and omits absent optional client se
   ]);
   assert.equal(logs.length, 4);
   assert.ok(logs.every((line) => !/environment-only-secret|explicit-secret/.test(line)));
+});
+
+test('rejects missing or flag-shaped values for every capability option', async () => {
+  const previous = process.env.ONVIF_PASSWORD;
+  const logs: string[] = [];
+  const dependencies = commandDependencies(logs);
+  let calls = 0;
+  dependencies.getCameraCapabilities = async () => {
+    calls++;
+    return {};
+  };
+  const cases: Array<{ option: string; argv: string[] }> = [
+    {
+      option: 'pass',
+      argv: ['capabilities', '--host', 'camera.local', '--pass'],
+    },
+    {
+      option: 'pass',
+      argv: ['capabilities', '--host', 'camera.local', '--pass', '--timeout-ms', '50'],
+    },
+    {
+      option: 'device-url',
+      argv: ['capabilities', '--host', 'camera.local', '--device-url'],
+    },
+    {
+      option: 'device-url',
+      argv: ['capabilities', '--host', 'camera.local', '--device-url', ''],
+    },
+    {
+      option: 'device-url',
+      argv: [
+        'capabilities', '--host', 'camera.local',
+        '--device-url', 'http://device-one/onvif/device_service',
+        '--device-url',
+      ],
+    },
+    {
+      option: 'device-url',
+      argv: [
+        'capabilities', '--host', 'camera.local',
+        '--device-url', '--timeout-ms', '50',
+      ],
+    },
+    {
+      option: 'host',
+      argv: ['capabilities', '--host'],
+    },
+    {
+      option: 'host',
+      argv: ['capabilities', '--host', ''],
+    },
+    {
+      option: 'host',
+      argv: ['capabilities', '--host', '--timeout-ms', '50'],
+    },
+    {
+      option: 'user',
+      argv: ['capabilities', '--host', 'camera.local', '--user'],
+    },
+    {
+      option: 'user',
+      argv: ['capabilities', '--host', 'camera.local', '--user', ''],
+    },
+    {
+      option: 'user',
+      argv: ['capabilities', '--host', 'camera.local', '--user', '--timeout-ms', '50'],
+    },
+    {
+      option: 'timeout-ms',
+      argv: ['capabilities', '--host', 'camera.local', '--timeout-ms'],
+    },
+    {
+      option: 'timeout-ms',
+      argv: ['capabilities', '--host', 'camera.local', '--timeout-ms', ''],
+    },
+    {
+      option: 'timeout-ms',
+      argv: ['capabilities', '--host', 'camera.local', '--timeout-ms', '--user', 'operator'],
+    },
+  ];
+
+  try {
+    process.env.ONVIF_PASSWORD = 'strict-environment-secret';
+    const outcomes: string[] = [];
+    for (const { argv } of cases) {
+      try {
+        await commandMain()(argv, dependencies);
+        outcomes.push('resolved');
+      } catch (error) {
+        outcomes.push(error instanceof Error ? error.message : String(error));
+      }
+    }
+
+    assert.deepEqual(
+      outcomes,
+      cases.map(({ option }) => `missing value for --${option}`),
+    );
+    assert.doesNotMatch(
+      JSON.stringify(outcomes),
+      /strict-environment-secret|camera\.local|device-one/,
+    );
+  } finally {
+    if (previous === undefined) delete process.env.ONVIF_PASSWORD;
+    else process.env.ONVIF_PASSWORD = previous;
+  }
+
+  assert.equal(calls, 0);
+  assert.deepEqual(logs, []);
 });
 
 test('rejects missing capability hosts and non-positive or non-finite timeouts safely', async () => {

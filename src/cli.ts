@@ -118,6 +118,25 @@ function args(argv: string[], name: string): string[] {
   return values;
 }
 
+function capabilityOptionValues(
+  argv: string[],
+  name: string,
+  allowEmpty = false,
+): string[] {
+  const option = `--${name}`;
+  const values: string[] = [];
+  for (let index = 0; index < argv.length; index++) {
+    if (argv[index] !== option) continue;
+    const value = argv[index + 1];
+    if (value === undefined || value.startsWith('--') || (!allowEmpty && value === '')) {
+      throw new Error(`missing value for ${option}`);
+    }
+    values.push(value);
+    index++;
+  }
+  return values;
+}
+
 export function parseCliArgs(argv: string[]): PlaybackOptions {
   const volume = Number(arg(argv, 'volume', '0.05'));
   if (!Number.isFinite(volume) || volume < 0 || volume > 1) {
@@ -258,21 +277,20 @@ export async function main(
   }
   if (argv[0] === 'capabilities') {
     const commandArgs = argv.slice(1);
-    const deviceUrls = args(commandArgs, 'device-url');
-    const passIndex = commandArgs.indexOf('--pass');
-    const pass = passIndex >= 0 && commandArgs[passIndex + 1] !== undefined
-      ? commandArgs[passIndex + 1]
-      : process.env.ONVIF_PASSWORD ?? '';
-    const timeoutMs = commandArgs.includes('--timeout-ms')
-      ? Number(arg(commandArgs, 'timeout-ms'))
-      : undefined;
+    const hosts = capabilityOptionValues(commandArgs, 'host');
+    const users = capabilityOptionValues(commandArgs, 'user');
+    const passwords = capabilityOptionValues(commandArgs, 'pass', true);
+    const deviceUrls = capabilityOptionValues(commandArgs, 'device-url');
+    const timeoutValues = capabilityOptionValues(commandArgs, 'timeout-ms');
+    if (hosts.length === 0) throw new Error('missing --host');
+    const timeoutMs = timeoutValues.length > 0 ? Number(timeoutValues[0]) : undefined;
     if (timeoutMs !== undefined && (!Number.isFinite(timeoutMs) || timeoutMs <= 0)) {
       throw new RangeError('timeout-ms must be finite and greater than 0');
     }
     const report = await dependencies.getCameraCapabilities({
-      host: arg(commandArgs, 'host'),
-      user: arg(commandArgs, 'user', ''),
-      pass,
+      host: hosts[0],
+      user: users[0] ?? '',
+      pass: passwords.length > 0 ? passwords[0] : process.env.ONVIF_PASSWORD ?? '',
       ...(deviceUrls.length > 0 ? { deviceUrls } : {}),
       ...(timeoutMs !== undefined ? { timeoutMs } : {}),
     });
