@@ -1,5 +1,5 @@
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::time::Duration;
 
@@ -13,13 +13,8 @@ pub(super) const PTZ_NS: &str = "http://www.onvif.org/ver20/ptz/wsdl";
 pub(super) const EVENTS_NS: &str = "http://www.onvif.org/ver10/events/wsdl";
 const SOAP11_NS: &str = "http://schemas.xmlsoap.org/soap/envelope/";
 const SOAP12_NS: &str = "http://www.w3.org/2003/05/soap-envelope";
-const WSTOP_NS: &str = "http://docs.oasis-open.org/wsn/t-1";
 const PROFILE_SCOPE_PREFIX: &str = "onvif://www.onvif.org/Profile/";
 const MAX_XML_ELEMENT_DEPTH: usize = 64;
-const MAX_EVENT_TOPICS: usize = 1_024;
-const MAX_EVENT_TOPIC_PATH_BYTES: usize = 4_096;
-const MAX_EVENT_TOPIC_NAMESPACE_BYTES: usize = 2_048;
-const MAX_EVENT_TOPIC_RETAINED_BYTES: usize = 256 * 1_024;
 
 const GET_SCOPES: &str = "<GetScopes xmlns=\"http://www.onvif.org/ver10/device/wsdl\"/>";
 const GET_SERVICES: &str = concat!(
@@ -42,10 +37,6 @@ const MEDIA2_GET_OPTIONS: &str = concat!(
 const PTZ_GET_CAPABILITIES: &str =
     "<GetServiceCapabilities xmlns=\"http://www.onvif.org/ver20/ptz/wsdl\"/>";
 const PTZ_GET_NODES: &str = "<GetNodes xmlns=\"http://www.onvif.org/ver20/ptz/wsdl\"/>";
-const EVENTS_GET_CAPABILITIES: &str =
-    "<GetServiceCapabilities xmlns=\"http://www.onvif.org/ver10/events/wsdl\"/>";
-const EVENTS_GET_PROPERTIES: &str =
-    "<GetEventProperties xmlns=\"http://www.onvif.org/ver10/events/wsdl\"/>";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CameraCapabilityOptions {
@@ -163,44 +154,6 @@ pub struct PtzCapabilityReport {
     pub nodes: Vec<PtzNode>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct EventServiceCapabilities {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ws_subscription_policy_support: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ws_pull_point_support: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ws_pausable_subscription_manager_interface_support: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub persistent_notification_storage: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_notification_producers: Option<i32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_pull_points: Option<i32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub event_broker_protocols: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_event_brokers: Option<i32>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EventTopic {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub namespace: Option<String>,
-    pub path: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EventCapabilityReport {
-    pub detected: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub service_capabilities: Option<EventServiceCapabilities>,
-    pub topics: Vec<EventTopic>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Media2CapabilityReport {
@@ -219,7 +172,6 @@ pub struct CameraCapabilityReport {
     pub services: Vec<CameraCapabilityService>,
     pub profiles: Vec<CameraCapabilityProfile>,
     pub ptz: PtzCapabilityReport,
-    pub events: EventCapabilityReport,
     pub media2: Media2CapabilityReport,
     pub warnings: Vec<CameraCapabilityWarning>,
 }
@@ -233,7 +185,6 @@ struct ScopesResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ServicesResult {
     services: Vec<CameraCapabilityService>,
-    event_service_capabilities: Option<EventServiceCapabilities>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -706,93 +657,28 @@ fn select_service<'a>(
         })
 }
 
-fn parse_protocols(value: Option<&str>) -> Option<Vec<String>> {
-    let normalized = xml_scalar(value)?;
-    Some(
-        normalized
-            .split(' ')
-            .map(str::to_owned)
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect(),
-    )
-}
-
-fn event_capabilities_from_element(element: roxmltree::Node<'_, '_>) -> EventServiceCapabilities {
-    EventServiceCapabilities {
-        ws_subscription_policy_support: strict_bool(unqualified_attribute(
-            element,
-            "WSSubscriptionPolicySupport",
-        )),
-        ws_pull_point_support: strict_bool(unqualified_attribute(element, "WSPullPointSupport")),
-        ws_pausable_subscription_manager_interface_support: strict_bool(unqualified_attribute(
-            element,
-            "WSPausableSubscriptionManagerInterfaceSupport",
-        )),
-        persistent_notification_storage: strict_bool(unqualified_attribute(
-            element,
-            "PersistentNotificationStorage",
-        )),
-        max_notification_producers: strict_nonnegative_int32(unqualified_attribute(
-            element,
-            "MaxNotificationProducers",
-        )),
-        max_pull_points: strict_nonnegative_int32(unqualified_attribute(element, "MaxPullPoints")),
-        event_broker_protocols: parse_protocols(unqualified_attribute(
-            element,
-            "EventBrokerProtocols",
-        )),
-        max_event_brokers: strict_nonnegative_int32(unqualified_attribute(
-            element,
-            "MaxEventBrokers",
-        )),
-    }
-}
-
 fn parse_services_response(xml: &str) -> Result<ServicesResult, ResponseError> {
     let document = parse_document(xml)?;
     let response = operation_response(&document, DEVICE_NS, "GetServicesResponse", "GetServices")?;
-    let mut discovered = Vec::new();
+    let mut services = Vec::new();
     for element in children(response, DEVICE_NS, "Service") {
         let namespace = plain_text(child(element, DEVICE_NS, "Namespace"))
             .ok_or_else(|| ResponseError::invalid("invalid GetServices response"))?;
         let xaddr = plain_text(child(element, DEVICE_NS, "XAddr"))
             .ok_or_else(|| ResponseError::invalid("invalid GetServices response"))?;
-        let service = CameraCapabilityService {
+        services.push(CameraCapabilityService {
             namespace,
             xaddr,
             version: parse_version(element),
-        };
-        let event_capabilities = if service.namespace == EVENTS_NS {
-            child(element, DEVICE_NS, "Capabilities")
-                .and_then(|wrapper| child(wrapper, EVENTS_NS, "Capabilities"))
-                .map(event_capabilities_from_element)
-        } else {
-            None
-        };
-        discovered.push((service, event_capabilities));
+        });
     }
-    if discovered.is_empty() {
+    if services.is_empty() {
         return Err(ResponseError::invalid(
             "no services in GetServices response",
         ));
     }
-    discovered.sort_by(|left, right| service_order(&left.0, &right.0));
-    let services: Vec<_> = discovered
-        .iter()
-        .map(|(service, _)| service.clone())
-        .collect();
-    let selected_event = select_service(&services, EVENTS_NS);
-    let event_service_capabilities = selected_event.and_then(|selected| {
-        discovered
-            .iter()
-            .find(|(service, _)| service == selected)
-            .and_then(|(_, capabilities)| capabilities.clone())
-    });
-    Ok(ServicesResult {
-        services,
-        event_service_capabilities,
-    })
+    services.sort_by(service_order);
+    Ok(ServicesResult { services })
 }
 
 const LEGACY_SERVICES: [(&str, &str); 12] = [
@@ -810,20 +696,6 @@ const LEGACY_SERVICES: [(&str, &str); 12] = [
     ("Search", "http://www.onvif.org/ver10/search/wsdl"),
 ];
 
-fn legacy_event_capabilities(element: roxmltree::Node<'_, '_>) -> EventServiceCapabilities {
-    let child_bool =
-        |name| strict_bool(child(element, SCHEMA_NS, name).and_then(|node| node.text()));
-    EventServiceCapabilities {
-        ws_subscription_policy_support: child_bool("WSSubscriptionPolicySupport"),
-        ws_pull_point_support: child_bool("WSPullPointSupport"),
-        ws_pausable_subscription_manager_interface_support: child_bool(
-            "WSPausableSubscriptionManagerInterfaceSupport",
-        ),
-        persistent_notification_storage: child_bool("PersistentNotificationStorage"),
-        ..EventServiceCapabilities::default()
-    }
-}
-
 fn parse_capabilities_response(xml: &str) -> Result<ServicesResult, ResponseError> {
     let document = parse_document(xml)?;
     let response = operation_response(
@@ -838,7 +710,7 @@ fn parse_capabilities_response(xml: &str) -> Result<ServicesResult, ResponseErro
     if let Some(extension) = child(capabilities, SCHEMA_NS, "Extension") {
         containers.push(extension);
     }
-    let mut discovered = Vec::new();
+    let mut services = Vec::new();
     for container in containers {
         for element in container.children().filter(roxmltree::Node::is_element) {
             if element.tag_name().namespace() != Some(SCHEMA_NS) {
@@ -853,37 +725,20 @@ fn parse_capabilities_response(xml: &str) -> Result<ServicesResult, ResponseErro
             let Some(xaddr) = plain_text(child(element, SCHEMA_NS, "XAddr")) else {
                 continue;
             };
-            let service = CameraCapabilityService {
+            services.push(CameraCapabilityService {
                 namespace: (*namespace).to_owned(),
                 xaddr,
                 version: None,
-            };
-            let event_capabilities =
-                (element.tag_name().name() == "Events").then(|| legacy_event_capabilities(element));
-            discovered.push((service, event_capabilities));
+            });
         }
     }
-    if discovered.is_empty() {
+    if services.is_empty() {
         return Err(ResponseError::invalid(
             "no services in GetCapabilities response",
         ));
     }
-    discovered.sort_by(|left, right| service_order(&left.0, &right.0));
-    let services: Vec<_> = discovered
-        .iter()
-        .map(|(service, _)| service.clone())
-        .collect();
-    let selected_event = select_service(&services, EVENTS_NS);
-    let event_service_capabilities = selected_event.and_then(|selected| {
-        discovered
-            .iter()
-            .find(|(service, _)| service == selected)
-            .and_then(|(_, capabilities)| capabilities.clone())
-    });
-    Ok(ServicesResult {
-        services,
-        event_service_capabilities,
-    })
+    services.sort_by(service_order);
+    Ok(ServicesResult { services })
 }
 
 fn required_token(
@@ -1045,138 +900,6 @@ fn parse_ptz_nodes_response(xml: &str) -> Result<PtzNodesResult, ResponseError> 
     })
 }
 
-fn parse_event_service_capabilities_response(
-    xml: &str,
-) -> Result<EventServiceCapabilities, ResponseError> {
-    let document = parse_document(xml)?;
-    let response = operation_response(
-        &document,
-        EVENTS_NS,
-        "GetServiceCapabilitiesResponse",
-        "Events GetServiceCapabilities",
-    )?;
-    let capabilities = child(response, EVENTS_NS, "Capabilities")
-        .ok_or_else(|| ResponseError::invalid("invalid Events GetServiceCapabilities response"))?;
-    Ok(event_capabilities_from_element(capabilities))
-}
-
-fn merge_event_service_capabilities(
-    legacy: Option<EventServiceCapabilities>,
-    current: Option<EventServiceCapabilities>,
-) -> Option<EventServiceCapabilities> {
-    match (legacy, current) {
-        (None, current) => current,
-        (legacy, None) => legacy,
-        (Some(legacy), Some(current)) => Some(EventServiceCapabilities {
-            ws_subscription_policy_support: current
-                .ws_subscription_policy_support
-                .or(legacy.ws_subscription_policy_support),
-            ws_pull_point_support: current
-                .ws_pull_point_support
-                .or(legacy.ws_pull_point_support),
-            ws_pausable_subscription_manager_interface_support: current
-                .ws_pausable_subscription_manager_interface_support
-                .or(legacy.ws_pausable_subscription_manager_interface_support),
-            persistent_notification_storage: current
-                .persistent_notification_storage
-                .or(legacy.persistent_notification_storage),
-            max_notification_producers: current
-                .max_notification_producers
-                .or(legacy.max_notification_producers),
-            max_pull_points: current.max_pull_points.or(legacy.max_pull_points),
-            event_broker_protocols: current
-                .event_broker_protocols
-                .or(legacy.event_broker_protocols),
-            max_event_brokers: current.max_event_brokers.or(legacy.max_event_brokers),
-        }),
-    }
-}
-
-fn parse_event_properties_response(xml: &str) -> Result<Vec<EventTopic>, ResponseError> {
-    let document = parse_document(xml)?;
-    let response = operation_response(
-        &document,
-        EVENTS_NS,
-        "GetEventPropertiesResponse",
-        "Events GetEventProperties",
-    )?;
-    let topic_set = child(response, WSTOP_NS, "TopicSet")
-        .ok_or_else(|| ResponseError::invalid("invalid Events GetEventProperties response"))?;
-    let invalid_response = || ResponseError::invalid("invalid Events GetEventProperties response");
-    let mut topics: BTreeMap<String, BTreeSet<Option<String>>> = BTreeMap::new();
-    let mut retained_topic_count = 0usize;
-    let mut retained_topic_bytes = 0usize;
-    let mut path = String::new();
-    let mut stack: Vec<_> = topic_set
-        .children()
-        .filter(roxmltree::Node::is_element)
-        .rev()
-        .map(|node| (node, None))
-        .collect();
-    while let Some((element, restore_length)) = stack.pop() {
-        if let Some(length) = restore_length {
-            path.truncate(length);
-            continue;
-        }
-        let previous_length = path.len();
-        if !path.is_empty() {
-            path.push('/');
-        }
-        path.push_str(element.tag_name().name());
-        if strict_bool(element.attribute((WSTOP_NS, "topic"))) == Some(true) {
-            if path.len() > MAX_EVENT_TOPIC_PATH_BYTES {
-                return Err(invalid_response());
-            }
-            let namespace = element.tag_name().namespace();
-            let namespace_bytes = namespace.map_or(0, str::len);
-            if namespace_bytes > MAX_EVENT_TOPIC_NAMESPACE_BYTES {
-                return Err(invalid_response());
-            }
-            let duplicate = topics.get(path.as_str()).is_some_and(|namespaces| {
-                namespaces
-                    .iter()
-                    .any(|retained| retained.as_deref() == namespace)
-            });
-            if !duplicate {
-                if retained_topic_count >= MAX_EVENT_TOPICS {
-                    return Err(invalid_response());
-                }
-                let topic_bytes = path
-                    .len()
-                    .checked_add(namespace_bytes)
-                    .ok_or_else(invalid_response)?;
-                retained_topic_bytes = retained_topic_bytes
-                    .checked_add(topic_bytes)
-                    .filter(|total| *total <= MAX_EVENT_TOPIC_RETAINED_BYTES)
-                    .ok_or_else(invalid_response)?;
-                retained_topic_count += 1;
-                topics
-                    .entry(path.clone())
-                    .or_default()
-                    .insert(namespace.map(str::to_owned));
-            }
-        }
-        stack.push((element, Some(previous_length)));
-        stack.extend(
-            element
-                .children()
-                .filter(roxmltree::Node::is_element)
-                .rev()
-                .map(|node| (node, None)),
-        );
-    }
-    let mut retained = Vec::with_capacity(retained_topic_count);
-    for (path, namespaces) in topics {
-        for namespace in namespaces {
-            retained.push(EventTopic {
-                namespace,
-                path: path.clone(),
-            });
-        }
-    }
-    Ok(retained)
-}
-
 fn parse_media2_options_response(xml: &str) -> Result<Vec<String>, ResponseError> {
     let document = parse_document(xml)?;
     let response = operation_response(
@@ -1294,19 +1017,6 @@ fn ptz_capabilities_are_empty(capabilities: &PtzServiceCapabilities) -> bool {
         && capabilities.status_position.is_none()
 }
 
-fn event_capabilities_are_empty(capabilities: &EventServiceCapabilities) -> bool {
-    capabilities.ws_subscription_policy_support.is_none()
-        && capabilities.ws_pull_point_support.is_none()
-        && capabilities
-            .ws_pausable_subscription_manager_interface_support
-            .is_none()
-        && capabilities.persistent_notification_storage.is_none()
-        && capabilities.max_notification_producers.is_none()
-        && capabilities.max_pull_points.is_none()
-        && capabilities.event_broker_protocols.is_none()
-        && capabilities.max_event_brokers.is_none()
-}
-
 pub fn get_camera_capabilities(
     options: &CameraCapabilityOptions,
 ) -> Result<CameraCapabilityReport, String> {
@@ -1342,7 +1052,6 @@ pub fn get_camera_capabilities(
 
     let mut service_discovery = "unavailable".to_owned();
     let mut services = Vec::new();
-    let mut embedded_event_capabilities = None;
     let mut get_services_succeeded = false;
     let mut discovery_succeeded = false;
     match read_only_parse(
@@ -1354,7 +1063,6 @@ pub fn get_camera_capabilities(
         Ok(result) => {
             service_discovery = "getServices".to_owned();
             services = result.services;
-            embedded_event_capabilities = result.event_service_capabilities;
             get_services_succeeded = true;
             discovery_succeeded = true;
         }
@@ -1369,7 +1077,6 @@ pub fn get_camera_capabilities(
                 Ok(result) => {
                     service_discovery = "getCapabilities".to_owned();
                     services = result.services;
-                    embedded_event_capabilities = result.event_service_capabilities;
                     discovery_succeeded = true;
                 }
                 Err(error) => {
@@ -1383,7 +1090,6 @@ pub fn get_camera_capabilities(
         .map(|service| service.xaddr.clone())
         .unwrap_or(connected_media_endpoint);
     let ptz_endpoint = select_service(&services, PTZ_NS).map(|service| service.xaddr.clone());
-    let events_endpoint = select_service(&services, EVENTS_NS).map(|service| service.xaddr.clone());
     let media2_endpoint = select_service(&services, MEDIA2_NS).map(|service| service.xaddr.clone());
 
     let mut profiles = match read_only_parse(
@@ -1429,36 +1135,6 @@ pub fn get_camera_capabilities(
             }
         }
     }
-
-    let mut current_event_capabilities = None;
-    let mut event_topics = Vec::new();
-    if let Some(endpoint) = events_endpoint.as_deref() {
-        match read_only_parse(
-            &device,
-            endpoint,
-            EVENTS_GET_CAPABILITIES,
-            parse_event_service_capabilities_response,
-        ) {
-            Ok(capabilities) => current_event_capabilities = Some(capabilities),
-            Err(error) => {
-                record_optional_error("Events GetServiceCapabilities", error, &mut warnings)?;
-            }
-        }
-        match read_only_parse(
-            &device,
-            endpoint,
-            EVENTS_GET_PROPERTIES,
-            parse_event_properties_response,
-        ) {
-            Ok(topics) => event_topics = topics,
-            Err(error) => {
-                record_optional_error("Events GetEventProperties", error, &mut warnings)?;
-            }
-        }
-    }
-    let event_service_capabilities =
-        merge_event_service_capabilities(embedded_event_capabilities, current_event_capabilities)
-            .filter(|capabilities| !event_capabilities_are_empty(capabilities));
 
     let mut media2_encodings = Vec::new();
     let mut h265_supported = None;
@@ -1522,11 +1198,6 @@ pub fn get_camera_capabilities(
             service_capabilities: ptz_service_capabilities,
             nodes: ptz_nodes,
         },
-        events: EventCapabilityReport {
-            detected: discovery_succeeded.then_some(events_endpoint.is_some()),
-            service_capabilities: event_service_capabilities,
-            topics: event_topics,
-        },
         media2: Media2CapabilityReport {
             detected: get_services_succeeded.then_some(media2_endpoint.is_some()),
             encodings: media2_encodings,
@@ -1549,17 +1220,13 @@ mod tests {
     const MEDIA1_NS: &str = "http://www.onvif.org/ver10/media/wsdl";
     const MEDIA2_NS: &str = "http://www.onvif.org/ver20/media/wsdl";
     const PTZ_NS: &str = "http://www.onvif.org/ver20/ptz/wsdl";
-    const EVENTS_NS: &str = "http://www.onvif.org/ver10/events/wsdl";
-    const WSTOP_NS: &str = "http://docs.oasis-open.org/wsn/t-1";
-    const TOPICS_NS: &str = "http://www.onvif.org/ver10/topics";
 
     fn soap(body: &str) -> String {
         format!(
             "<s:Envelope xmlns:s=\"{SOAP12_NS}\" xmlns:tds=\"{DEVICE_NS}\" \
              xmlns:tt=\"{SCHEMA_NS}\" xmlns:trt=\"{MEDIA1_NS}\" \
              xmlns:tr2=\"{MEDIA2_NS}\" xmlns:tptz=\"{PTZ_NS}\" \
-             xmlns:tev=\"{EVENTS_NS}\" xmlns:wstop=\"{WSTOP_NS}\" \
-             xmlns:tns=\"{TOPICS_NS}\" xmlns:vendor=\"urn:vendor\">\
+             xmlns:vendor=\"urn:vendor\">\
              <s:Body>{body}</s:Body></s:Envelope>"
         )
     }
@@ -1586,11 +1253,6 @@ mod tests {
                 service_capabilities: None,
                 nodes: Vec::new(),
             },
-            events: EventCapabilityReport {
-                detected: None,
-                service_capabilities: None,
-                topics: Vec::new(),
-            },
             media2: Media2CapabilityReport {
                 detected: None,
                 encodings: Vec::new(),
@@ -1615,7 +1277,6 @@ mod tests {
                     "profileTokens": [],
                     "nodes": []
                 },
-                "events": {"detected": null, "topics": []},
                 "media2": {
                     "detected": null,
                     "encodings": [],
@@ -1865,214 +1526,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_strict_event_capabilities_and_namespace_aware_topics() {
-        let capabilities = parse_event_service_capabilities_response(&soap(
-            r#"<tev:GetServiceCapabilitiesResponse><tev:Capabilities
-              WSSubscriptionPolicySupport="false" WSPullPointSupport="true"
-              WSPausableSubscriptionManagerInterfaceSupport="1"
-              PersistentNotificationStorage="true" MaxNotificationProducers="+12"
-              MaxPullPoints="-1" MaxEventBrokers="2147483648"
-              EventBrokerProtocols="mqtt mqtts mqtt"/>
-            </tev:GetServiceCapabilitiesResponse>"#,
-        ))
-        .unwrap();
-        assert_eq!(
-            capabilities,
-            EventServiceCapabilities {
-                ws_subscription_policy_support: Some(false),
-                ws_pull_point_support: Some(true),
-                ws_pausable_subscription_manager_interface_support: Some(true),
-                persistent_notification_storage: Some(true),
-                max_notification_producers: Some(12),
-                max_pull_points: None,
-                max_event_brokers: None,
-                event_broker_protocols: Some(vec!["mqtt".to_owned(), "mqtts".to_owned()]),
-            }
-        );
-
-        let topics = parse_event_properties_response(&soap(
-            r#"<tev:GetEventPropertiesResponse>
-              <vendor:Wrapper><wstop:TopicSet><vendor:Decoy wstop:topic="true"/></wstop:TopicSet></vendor:Wrapper>
-              <wstop:TopicSet>
-                <tns:Device wstop:topic="true"><tns:Trigger><vendor:Motion wstop:topic="1"/></tns:Trigger></tns:Device>
-                <vendor:Deep><vendor:Branch><vendor:Leaf wstop:topic="true"/><vendor:Leaf wstop:topic="true"/></vendor:Branch></vendor:Deep>
-                <Same wstop:topic="true"/><tns:Same wstop:topic="true"/><tns:Ignored topic="true"/>
-              </wstop:TopicSet>
-            </tev:GetEventPropertiesResponse>"#,
-        ))
-        .unwrap();
-        assert_eq!(
-            topics,
-            vec![
-                EventTopic {
-                    namespace: Some("urn:vendor".to_owned()),
-                    path: "Deep/Branch/Leaf".to_owned()
-                },
-                EventTopic {
-                    namespace: Some(TOPICS_NS.to_owned()),
-                    path: "Device".to_owned()
-                },
-                EventTopic {
-                    namespace: Some("urn:vendor".to_owned()),
-                    path: "Device/Trigger/Motion".to_owned()
-                },
-                EventTopic {
-                    namespace: None,
-                    path: "Same".to_owned()
-                },
-                EventTopic {
-                    namespace: Some(TOPICS_NS.to_owned()),
-                    path: "Same".to_owned()
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn event_topic_walk_is_iterative_within_the_xml_depth_limit() {
-        const MAX_DEPTH: usize = 64;
-        const SOAP_AND_OPERATION_DEPTH: usize = 4;
-        let topic_depth = MAX_DEPTH - SOAP_AND_OPERATION_DEPTH;
-        let within_limit = soap(&format!(
-            "<tev:GetEventPropertiesResponse><wstop:TopicSet>{}<vendor:Leaf wstop:topic=\"true\"/>{}</wstop:TopicSet></tev:GetEventPropertiesResponse>",
-            "<tns:L>".repeat(topic_depth - 1),
-            "</tns:L>".repeat(topic_depth - 1)
-        ));
-        let topics = parse_event_properties_response(&within_limit).unwrap();
-        assert_eq!(topics.len(), 1);
-        assert_eq!(topics[0].namespace.as_deref(), Some("urn:vendor"));
-        assert_eq!(topics[0].path.split('/').count(), topic_depth);
-
-        let beyond_limit = soap(&format!(
-            "<tev:GetEventPropertiesResponse><wstop:TopicSet>{}<vendor:Leaf wstop:topic=\"true\"/>{}</wstop:TopicSet></tev:GetEventPropertiesResponse>",
-            "<tns:L>".repeat(topic_depth),
-            "</tns:L>".repeat(topic_depth)
-        ));
-        assert_eq!(
-            parse_event_properties_response(&beyond_limit)
-                .unwrap_err()
-                .to_string(),
-            "invalid XML document"
-        );
-    }
-
-    #[test]
-    fn event_topics_reject_count_path_namespace_and_aggregate_limits_before_retention() {
-        const MAX_TOPICS: usize = 1_024;
-        const MAX_PATH_BYTES: usize = 4_096;
-        const MAX_NAMESPACE_BYTES: usize = 2_048;
-        const MAX_RETAINED_BYTES: usize = 256 * 1_024;
-
-        let count_at_limit = (0..MAX_TOPICS)
-            .map(|index| format!("<vendor:T{index:04} wstop:topic=\"true\"/>"))
-            .collect::<String>();
-        let count_at_limit = format!("{count_at_limit}<vendor:T0000 wstop:topic=\"true\"/>");
-        let topics = parse_event_properties_response(&soap(&format!(
-            "<tev:GetEventPropertiesResponse><wstop:TopicSet>{count_at_limit}</wstop:TopicSet></tev:GetEventPropertiesResponse>"
-        )))
-        .unwrap();
-        assert_eq!(topics.len(), MAX_TOPICS);
-
-        let count_overflow =
-            format!("{count_at_limit}<vendor:T{MAX_TOPICS:04} wstop:topic=\"true\"/>");
-        let count_error = parse_event_properties_response(&soap(&format!(
-            "<tev:GetEventPropertiesResponse><wstop:TopicSet>{count_overflow}</wstop:TopicSet></tev:GetEventPropertiesResponse>"
-        )))
-        .unwrap_err();
-        assert_eq!(
-            count_error.to_string(),
-            "invalid Events GetEventProperties response"
-        );
-
-        let maximum_path = format!("T{}", "x".repeat(MAX_PATH_BYTES - 1));
-        assert_eq!(maximum_path.len(), MAX_PATH_BYTES);
-        let topics = parse_event_properties_response(&soap(&format!(
-            "<tev:GetEventPropertiesResponse><wstop:TopicSet><vendor:{maximum_path} wstop:topic=\"true\"/></wstop:TopicSet></tev:GetEventPropertiesResponse>"
-        )))
-        .unwrap();
-        assert_eq!(topics[0].path.len(), MAX_PATH_BYTES);
-
-        let oversized_path = format!("T{}", "x".repeat(MAX_PATH_BYTES));
-        assert_eq!(oversized_path.len(), MAX_PATH_BYTES + 1);
-        let path_error = parse_event_properties_response(&soap(&format!(
-            "<tev:GetEventPropertiesResponse><wstop:TopicSet><vendor:{oversized_path} wstop:topic=\"true\"/></wstop:TopicSet></tev:GetEventPropertiesResponse>"
-        )))
-        .unwrap_err();
-        assert_eq!(
-            path_error.to_string(),
-            "invalid Events GetEventProperties response"
-        );
-
-        let unretained = parse_event_properties_response(&soap(&format!(
-            "<tev:GetEventPropertiesResponse><wstop:TopicSet><vendor:{oversized_path}/></wstop:TopicSet></tev:GetEventPropertiesResponse>"
-        )))
-        .unwrap();
-        assert!(unretained.is_empty());
-
-        let maximum_namespace = format!("urn:{}", "n".repeat(MAX_NAMESPACE_BYTES - 4));
-        assert_eq!(maximum_namespace.len(), MAX_NAMESPACE_BYTES);
-        let topics = parse_event_properties_response(&soap(&format!(
-            "<tev:GetEventPropertiesResponse><wstop:TopicSet><maximum:Topic xmlns:maximum=\"{maximum_namespace}\" wstop:topic=\"true\"/></wstop:TopicSet></tev:GetEventPropertiesResponse>"
-        )))
-        .unwrap();
-        assert_eq!(
-            topics[0].namespace.as_ref().map(String::len),
-            Some(MAX_NAMESPACE_BYTES)
-        );
-
-        let oversized_namespace = format!("urn:{}", "n".repeat(MAX_NAMESPACE_BYTES - 3));
-        assert_eq!(oversized_namespace.len(), MAX_NAMESPACE_BYTES + 1);
-        let namespace_error = parse_event_properties_response(&soap(&format!(
-            "<tev:GetEventPropertiesResponse><wstop:TopicSet><oversized:Topic xmlns:oversized=\"{oversized_namespace}\" wstop:topic=\"true\"/></wstop:TopicSet></tev:GetEventPropertiesResponse>"
-        )))
-        .unwrap_err();
-        assert_eq!(
-            namespace_error.to_string(),
-            "invalid Events GetEventProperties response"
-        );
-
-        let aggregate_at_limit = (0..64)
-            .map(|index| {
-                let wanted_length = 4_086;
-                let prefix = format!("T{index:02}");
-                let name = format!("{prefix}{}", "x".repeat(wanted_length - prefix.len()));
-                assert_eq!(name.len(), wanted_length);
-                format!("<vendor:{name} wstop:topic=\"true\"/>")
-            })
-            .collect::<String>();
-        let first_name = format!("T00{}", "x".repeat(4_086 - 3));
-        let aggregate_at_limit =
-            format!("{aggregate_at_limit}<vendor:{first_name} wstop:topic=\"true\"/>");
-        let retained_bytes = 64 * (4_086 + "urn:vendor".len());
-        assert_eq!(retained_bytes, MAX_RETAINED_BYTES);
-        let topics = parse_event_properties_response(&soap(&format!(
-            "<tev:GetEventPropertiesResponse><wstop:TopicSet>{aggregate_at_limit}</wstop:TopicSet></tev:GetEventPropertiesResponse>"
-        )))
-        .unwrap();
-        assert_eq!(topics.len(), 64);
-
-        let aggregate_overflow = (0..64)
-            .map(|index| {
-                let wanted_length = if index == 63 { 4_087 } else { 4_086 };
-                let prefix = format!("T{index:02}");
-                let name = format!("{prefix}{}", "x".repeat(wanted_length - prefix.len()));
-                assert_eq!(name.len(), wanted_length);
-                format!("<vendor:{name} wstop:topic=\"true\"/>")
-            })
-            .collect::<String>();
-        let retained_bytes = 63 * (4_086 + "urn:vendor".len()) + 4_087 + "urn:vendor".len();
-        assert_eq!(retained_bytes, MAX_RETAINED_BYTES + 1);
-        let aggregate_error = parse_event_properties_response(&soap(&format!(
-            "<tev:GetEventPropertiesResponse><wstop:TopicSet>{aggregate_overflow}</wstop:TopicSet></tev:GetEventPropertiesResponse>"
-        )))
-        .unwrap_err();
-        assert_eq!(
-            aggregate_error.to_string(),
-            "invalid Events GetEventProperties response"
-        );
-    }
-
-    #[test]
     fn media2_options_are_namespace_aware_sorted_and_detect_h265() {
         let encodings = parse_media2_options_response(&soap(
             r#"<tr2:GetVideoEncoderConfigurationOptionsResponse>
@@ -2208,5 +1661,22 @@ mod tests {
             let error = parse_services_response(&xml).unwrap_err();
             assert!(!error.to_string().contains("payload-secret"));
         }
+    }
+
+    #[test]
+    fn accepts_64_nested_xml_elements_and_rejects_depth_65_deterministically() {
+        let depth_64 = format!("{}{}", "<n>".repeat(64), "</n>".repeat(64));
+        let document = parse_document(&depth_64).expect("64 levels of nesting must be accepted");
+        assert_eq!(
+            document
+                .descendants()
+                .filter(roxmltree::Node::is_element)
+                .count(),
+            64
+        );
+
+        let depth_65 = format!("{}{}", "<n>".repeat(65), "</n>".repeat(65));
+        let error = parse_document(&depth_65).unwrap_err();
+        assert_eq!(error.to_string(), "invalid XML document");
     }
 }

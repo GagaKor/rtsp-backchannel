@@ -152,8 +152,8 @@ fn main() -> Result<()> {
 `get_camera_capabilities`, `CameraCapabilityOptions`,
 `CameraCapabilityReport`, and the report's public nested types are exported
 from `rtsp_backchannel::onvif`. The operation is read-only: it connects once,
-reads scopes and service inventory, then requests available Media, PTZ, Events,
-and Media2 evidence.
+reads scopes and service inventory, then requests available Media, PTZ, and
+Media2 evidence.
 
 ```rust
 use std::time::Duration;
@@ -196,23 +196,35 @@ not an ONVIF certification.
     "onvif://www.onvif.org/Profile/Streaming",
     "onvif://www.onvif.org/Profile/T"
   ],
-  "declaredProfiles": ["S", "T"],
+  "declaredProfiles": [
+    "S",
+    "T"
+  ],
   "serviceDiscovery": "getServices",
   "services": [
     {
       "namespace": "http://www.onvif.org/ver10/media/wsdl",
       "xaddr": "http://camera.local/onvif/media1",
-      "version": { "major": 1, "minor": 0 }
+      "version": {
+        "major": 1,
+        "minor": 0
+      }
     },
     {
       "namespace": "http://www.onvif.org/ver20/media/wsdl",
       "xaddr": "http://camera.local/onvif/media2",
-      "version": { "major": 2, "minor": 0 }
+      "version": {
+        "major": 2,
+        "minor": 0
+      }
     },
     {
       "namespace": "http://www.onvif.org/ver20/ptz/wsdl",
       "xaddr": "http://camera.local/onvif/ptz",
-      "version": { "major": 2, "minor": 2 }
+      "version": {
+        "major": 2,
+        "minor": 2
+      }
     }
   ],
   "profiles": [
@@ -231,7 +243,9 @@ not an ONVIF certification.
     "detected": true,
     "panTiltSupported": true,
     "zoomSupported": true,
-    "profileTokens": ["shared"],
+    "profileTokens": [
+      "shared"
+    ],
     "serviceCapabilities": {
       "eFlip": true,
       "reverse": false,
@@ -253,7 +267,10 @@ not an ONVIF certification.
         },
         "maximumPresets": 4,
         "homeSupported": true,
-        "auxiliaryCommands": ["IrisClose", "IrisOpen"]
+        "auxiliaryCommands": [
+          "IrisClose",
+          "IrisOpen"
+        ]
       },
       {
         "token": "zoom-node",
@@ -272,16 +289,12 @@ not an ONVIF certification.
       }
     ]
   },
-  "events": {
-    "detected": true,
-    "serviceCapabilities": { "wsPullPointSupport": true },
-    "topics": [
-      { "namespace": "urn:onvif:topics:motion", "path": "Device/Tamper/Motion" }
-    ]
-  },
   "media2": {
     "detected": true,
-    "encodings": ["H264", "H265"],
+    "encodings": [
+      "H264",
+      "H265"
+    ],
     "h265Supported": true
   },
   "warnings": []
@@ -319,11 +332,9 @@ Interpret the report as evidence, not certification:
   match; different ports and paths remain allowed, and the advertised `XAddr`
   is still retained in `services`. See the
   [ONVIF Core specifications](https://www.onvif.org/specs/).
-- XML depth is capped at 64. Retained Event topics are capped at 1,024, with a
-  4,096-byte path, 2,048-byte namespace, and 256 KiB aggregate budget.
-  Exceeding a depth/topic response budget during optional Events enrichment
-  yields a sanitized warning and leaves that enrichment unknown or empty; the
-  rest of the report can continue.
+- XML depth is capped at 64. Exceeding the depth limit during an optional
+  enrichment request yields a sanitized warning and leaves that enrichment
+  unknown or empty; the rest of the report can continue.
 - `timeout` is a per-request limit. One report performs several requests, so
   its total elapsed time can exceed one per-request timeout interval.
 

@@ -149,7 +149,7 @@ fn main() -> Result<()> {
 `get_camera_capabilities`, `CameraCapabilityOptions`,
 `CameraCapabilityReport`와 보고서의 공개 하위 타입은
 `rtsp_backchannel::onvif`에서 export됩니다. 이 작업은 읽기 전용이며 한 번 연결한 뒤
-scope와 서비스 인벤토리를 읽고, 사용할 수 있는 Media, PTZ, Events, Media2 근거를
+scope와 서비스 인벤토리를 읽고, 사용할 수 있는 Media, PTZ, Media2 근거를
 조회합니다.
 
 ```rust
@@ -192,23 +192,35 @@ ONVIF 인증 결과가 아닙니다.
     "onvif://www.onvif.org/Profile/Streaming",
     "onvif://www.onvif.org/Profile/T"
   ],
-  "declaredProfiles": ["S", "T"],
+  "declaredProfiles": [
+    "S",
+    "T"
+  ],
   "serviceDiscovery": "getServices",
   "services": [
     {
       "namespace": "http://www.onvif.org/ver10/media/wsdl",
       "xaddr": "http://camera.local/onvif/media1",
-      "version": { "major": 1, "minor": 0 }
+      "version": {
+        "major": 1,
+        "minor": 0
+      }
     },
     {
       "namespace": "http://www.onvif.org/ver20/media/wsdl",
       "xaddr": "http://camera.local/onvif/media2",
-      "version": { "major": 2, "minor": 0 }
+      "version": {
+        "major": 2,
+        "minor": 0
+      }
     },
     {
       "namespace": "http://www.onvif.org/ver20/ptz/wsdl",
       "xaddr": "http://camera.local/onvif/ptz",
-      "version": { "major": 2, "minor": 2 }
+      "version": {
+        "major": 2,
+        "minor": 2
+      }
     }
   ],
   "profiles": [
@@ -227,7 +239,9 @@ ONVIF 인증 결과가 아닙니다.
     "detected": true,
     "panTiltSupported": true,
     "zoomSupported": true,
-    "profileTokens": ["shared"],
+    "profileTokens": [
+      "shared"
+    ],
     "serviceCapabilities": {
       "eFlip": true,
       "reverse": false,
@@ -249,7 +263,10 @@ ONVIF 인증 결과가 아닙니다.
         },
         "maximumPresets": 4,
         "homeSupported": true,
-        "auxiliaryCommands": ["IrisClose", "IrisOpen"]
+        "auxiliaryCommands": [
+          "IrisClose",
+          "IrisOpen"
+        ]
       },
       {
         "token": "zoom-node",
@@ -268,16 +285,12 @@ ONVIF 인증 결과가 아닙니다.
       }
     ]
   },
-  "events": {
-    "detected": true,
-    "serviceCapabilities": { "wsPullPointSupport": true },
-    "topics": [
-      { "namespace": "urn:onvif:topics:motion", "path": "Device/Tamper/Motion" }
-    ]
-  },
   "media2": {
     "detected": true,
-    "encodings": ["H264", "H265"],
+    "encodings": [
+      "H264",
+      "H265"
+    ],
     "h265Supported": true
   },
   "warnings": []
@@ -311,10 +324,9 @@ ONVIF 인증 결과가 아닙니다.
   canonical host/IP가 같아야 하지만 서로 다른 포트와 경로는 허용됩니다. 광고된
   `XAddr` 자체는 `services` 보고서에 유지됩니다.
   [ONVIF Core 명세](https://www.onvif.org/specs/)를 참고하십시오.
-- XML depth 한도는 64입니다. 유지하는 Event topic은 1,024개, path는 4,096 byte,
-  namespace는 2,048 byte, 합계는 256 KiB로 제한합니다. 선택적 Events enrichment에서
-  depth/topic response budget을 넘으면 sanitized warning을 남기고 해당 근거를
-  unknown 또는 빈 값으로 두며 나머지 보고서는 계속할 수 있습니다.
+- XML depth 한도는 64입니다. 선택적 enrichment 요청에서 depth 한도를 넘으면
+  sanitized warning을 남기고 해당 근거를 unknown 또는 빈 값으로 두며 나머지
+  보고서는 계속할 수 있습니다.
 - `timeout`은 per-request 한도입니다. 한 보고서는 여러 요청을 사용하므로 총 소요
   시간은 per-request timeout 한 번보다 길 수 있습니다.
 

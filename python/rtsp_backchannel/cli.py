@@ -382,48 +382,6 @@ def _camera_capability_json(report: CameraCapabilityReport):
         nodes.append(item)
     ptz["nodes"] = nodes
 
-    events = {"detected": report.events.detected}
-    if report.events.service_capabilities is not None:
-        capabilities = {}
-        source = report.events.service_capabilities
-        if source.ws_subscription_policy_support is not None:
-            capabilities["wsSubscriptionPolicySupport"] = (
-                source.ws_subscription_policy_support
-            )
-        if source.ws_pull_point_support is not None:
-            capabilities["wsPullPointSupport"] = source.ws_pull_point_support
-        if (
-            source.ws_pausable_subscription_manager_interface_support
-            is not None
-        ):
-            capabilities[
-                "wsPausableSubscriptionManagerInterfaceSupport"
-            ] = source.ws_pausable_subscription_manager_interface_support
-        if source.persistent_notification_storage is not None:
-            capabilities["persistentNotificationStorage"] = (
-                source.persistent_notification_storage
-            )
-        if source.max_notification_producers is not None:
-            capabilities["maxNotificationProducers"] = (
-                source.max_notification_producers
-            )
-        if source.max_pull_points is not None:
-            capabilities["maxPullPoints"] = source.max_pull_points
-        if source.event_broker_protocols is not None:
-            capabilities["eventBrokerProtocols"] = list(
-                source.event_broker_protocols
-            )
-        if source.max_event_brokers is not None:
-            capabilities["maxEventBrokers"] = source.max_event_brokers
-        events["serviceCapabilities"] = capabilities
-    topics = []
-    for topic in report.events.topics:
-        item = {"path": topic.path}
-        if topic.namespace is not None:
-            item["namespace"] = topic.namespace
-        topics.append(item)
-    events["topics"] = topics
-
     return {
         "device": device,
         "scopes": list(report.scopes),
@@ -432,7 +390,6 @@ def _camera_capability_json(report: CameraCapabilityReport):
         "services": services,
         "profiles": profiles,
         "ptz": ptz,
-        "events": events,
         "media2": {
             "detected": report.media2.detected,
             "encodings": list(report.media2.encodings),

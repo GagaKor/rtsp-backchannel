@@ -16,8 +16,6 @@ import type {
   CodecPreference,
   EncodedAudio,
   EncodedAudioFrame,
-  EventServiceCapabilities,
-  EventTopic,
   PtzNode,
   PtzServiceCapabilities,
   PtzSpaces,
@@ -103,13 +101,8 @@ test('exports the complete camera capability report contract', () => {
     spaces,
     auxiliaryCommands: [],
   };
-  const eventCapabilities: EventServiceCapabilities = { wsPullPointSupport: true };
-  const topic: EventTopic = {
-    namespace: 'http://www.onvif.org/ver10/topics',
-    path: 'RuleEngine/CellMotionDetector/Motion',
-  };
   const warning: CameraCapabilityWarning = {
-    operation: 'GetEventProperties',
+    operation: 'PTZ GetNodes',
     message: 'request timeout',
   };
   const report: CameraCapabilityReport = {
@@ -126,11 +119,6 @@ test('exports the complete camera capability report contract', () => {
       profileTokens: ['main'],
       serviceCapabilities,
       nodes: [node],
-    },
-    events: {
-      detected: true,
-      serviceCapabilities: eventCapabilities,
-      topics: [topic],
     },
     media2: {
       detected: true,
@@ -293,8 +281,6 @@ test('ships clean public declarations without capability parser or injection sea
     'CameraCapabilityReport',
     'CameraCapabilityService',
     'CameraCapabilityWarning',
-    'EventServiceCapabilities',
-    'EventTopic',
     'PtzNode',
     'PtzServiceCapabilities',
     'PtzSpaces',
@@ -310,6 +296,6 @@ test('ships clean public declarations without capability parser or injection sea
   );
   assert.doesNotMatch(
     publicDeclarations,
-    /OnvifResponseError|ParsedServiceDiscovery|ParsedPtzNodes|parseScopesResponse|parseServicesResponse|parseCapabilitiesResponse|selectService|parseMedia1ProfilesResponse|parseMedia2ProfilesResponse|parsePtz|parseEvent|parseMedia2OptionsResponse|mergeEventServiceCapabilities/,
+    /OnvifResponseError|ParsedServiceDiscovery|ParsedPtzNodes|parseScopesResponse|parseServicesResponse|parseCapabilitiesResponse|selectService|parseMedia1ProfilesResponse|parseMedia2ProfilesResponse|parsePtz|parseMedia2OptionsResponse/,
   );
 });

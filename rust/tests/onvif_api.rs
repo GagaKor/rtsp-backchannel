@@ -21,9 +21,6 @@ const SCHEMA_NS: &str = "http://www.onvif.org/ver10/schema";
 const MEDIA1_NS: &str = "http://www.onvif.org/ver10/media/wsdl";
 const MEDIA2_NS: &str = "http://www.onvif.org/ver20/media/wsdl";
 const PTZ_NS: &str = "http://www.onvif.org/ver20/ptz/wsdl";
-const EVENTS_NS: &str = "http://www.onvif.org/ver10/events/wsdl";
-const WSTOP_NS: &str = "http://docs.oasis-open.org/wsn/t-1";
-const TOPICS_NS: &str = "http://www.onvif.org/ver10/topics";
 
 const PROBE_RESPONSE: &str = r#"<?xml version="1.0"?>
 <s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
@@ -921,7 +918,6 @@ fn capabilities_cli_outputs_one_native_json_line_and_explicit_empty_overrides_en
                 "profileTokens": [],
                 "nodes": []
             },
-            "events": {"detected": false, "topics": []},
             "media2": {"detected": null, "encodings": [], "h265Supported": null},
             "warnings": [{
                 "operation": "GetServices",
@@ -1000,8 +996,6 @@ fn capabilities_cli_documentation_covers_native_report_and_hardened_semantics() 
             "XAddr",
             "WSSE",
             "64",
-            "1,024",
-            "256 KiB",
             "per-request",
             "ONVIF_PASSWORD",
             "`--pass \"\"`",
@@ -1241,8 +1235,6 @@ fn capability_report_matches_shared_cross_language_fixture() {
         "Media1GetProfiles",
         "PtzGetServiceCapabilities",
         "PtzGetNodes",
-        "EventsGetServiceCapabilities",
-        "EventsGetEventProperties",
         "Media2GetProfiles",
         "Media2GetVideoEncoderConfigurationOptions",
     ];
@@ -1274,7 +1266,7 @@ fn capability_report_matches_shared_cross_language_fixture() {
         request_paths(&requests),
         [
             "/device", "/device", "/device", "/device", "/device", "/media1", "/ptz", "/ptz",
-            "/events", "/events", "/media2", "/media2",
+            "/media2", "/media2",
         ]
     );
     let operation_markers = [
@@ -1290,8 +1282,6 @@ fn capability_report_matches_shared_cross_language_fixture() {
         format!("<GetProfiles xmlns=\"{MEDIA1_NS}\"/>"),
         format!("<GetServiceCapabilities xmlns=\"{PTZ_NS}\"/>"),
         format!("<GetNodes xmlns=\"{PTZ_NS}\"/>"),
-        format!("<GetServiceCapabilities xmlns=\"{EVENTS_NS}\"/>"),
-        format!("<GetEventProperties xmlns=\"{EVENTS_NS}\"/>"),
         format!("<GetProfiles xmlns=\"{MEDIA2_NS}\"><Type>All</Type></GetProfiles>"),
         format!("<GetVideoEncoderConfigurationOptions xmlns=\"{MEDIA2_NS}\"/>"),
     ];
@@ -1318,7 +1308,6 @@ fn capability_report_routes_exact_operations_to_advertised_service_endpoints() {
     let connected_media = format!("http://127.0.0.1:{port}/connected/media");
     let media1 = format!("http://127.0.0.1:{port}/advertised/media1");
     let ptz = format!("http://127.0.0.1:{port}/advertised/ptz");
-    let events = format!("http://127.0.0.1:{port}/advertised/events");
     let media2 = format!("http://127.0.0.1:{port}/advertised/media2");
     let mut responses = capability_connect_responses(&connected_media);
     responses.extend([
@@ -1326,10 +1315,9 @@ fn capability_report_routes_exact_operations_to_advertised_service_endpoints() {
             "<tds:GetScopesResponse><tds:Scopes><tt:ScopeItem>onvif://www.onvif.org/Profile/Streaming</tt:ScopeItem></tds:Scopes></tds:GetScopesResponse>",
         )),
         ok(capability_soap(&format!(
-            "<tds:GetServicesResponse>{}{}{}{}</tds:GetServicesResponse>",
+            "<tds:GetServicesResponse>{}{}{}</tds:GetServicesResponse>",
             capability_service(MEDIA1_NS, &media1, 2, 0),
             capability_service(PTZ_NS, &ptz, 2, 0),
-            capability_service(EVENTS_NS, &events, 2, 0),
             capability_service(MEDIA2_NS, &media2, 2, 0),
         ))),
         ok(capability_soap(
@@ -1340,12 +1328,6 @@ fn capability_report_routes_exact_operations_to_advertised_service_endpoints() {
         )),
         ok(capability_soap(
             "<tptz:GetNodesResponse><tptz:PTZNode token=\"node-1\"><tt:SupportedPTZSpaces><tt:AbsolutePanTiltPositionSpace/><tt:AbsoluteZoomPositionSpace/></tt:SupportedPTZSpaces></tptz:PTZNode></tptz:GetNodesResponse>",
-        )),
-        ok(capability_soap(
-            "<tev:GetServiceCapabilitiesResponse><tev:Capabilities WSPullPointSupport=\"true\"/></tev:GetServiceCapabilitiesResponse>",
-        )),
-        ok(capability_soap(
-            "<tev:GetEventPropertiesResponse><wstop:TopicSet><tns:Motion wstop:topic=\"true\"/></wstop:TopicSet></tev:GetEventPropertiesResponse>",
         )),
         ok(capability_soap(
             "<tr2:GetProfilesResponse><tr2:Profiles token=\"modern\"><tr2:Configurations><tr2:PTZ token=\"ptz-modern\"/></tr2:Configurations></tr2:Profiles></tr2:GetProfilesResponse>",
@@ -1384,12 +1366,6 @@ fn capability_report_routes_exact_operations_to_advertised_service_endpoints() {
     assert_eq!(report.ptz.detected, Some(true));
     assert_eq!(report.ptz.pan_tilt_supported, Some(true));
     assert_eq!(report.ptz.zoom_supported, Some(true));
-    assert_eq!(report.events.detected, Some(true));
-    assert_eq!(
-        report.events.topics[0].namespace.as_deref(),
-        Some(TOPICS_NS)
-    );
-    assert_eq!(report.events.topics[0].path, "Motion");
     assert_eq!(report.media2.detected, Some(true));
     assert_eq!(report.media2.encodings, ["H264", "H265"]);
     assert_eq!(report.media2.h265_supported, Some(true));
@@ -1407,8 +1383,6 @@ fn capability_report_routes_exact_operations_to_advertised_service_endpoints() {
             "/advertised/media1",
             "/advertised/ptz",
             "/advertised/ptz",
-            "/advertised/events",
-            "/advertised/events",
             "/advertised/media2",
             "/advertised/media2",
         ]
@@ -1424,12 +1398,10 @@ fn capability_report_routes_exact_operations_to_advertised_service_endpoints() {
     assert!(bodies[5].contains(&format!("<GetProfiles xmlns=\"{MEDIA1_NS}\"/>")));
     assert!(bodies[6].contains(&format!("<GetServiceCapabilities xmlns=\"{PTZ_NS}\"/>")));
     assert!(bodies[7].contains(&format!("<GetNodes xmlns=\"{PTZ_NS}\"/>")));
-    assert!(bodies[8].contains(&format!("<GetServiceCapabilities xmlns=\"{EVENTS_NS}\"/>")));
-    assert!(bodies[9].contains(&format!("<GetEventProperties xmlns=\"{EVENTS_NS}\"/>")));
-    assert!(bodies[10].contains(&format!(
+    assert!(bodies[8].contains(&format!(
         "<GetProfiles xmlns=\"{MEDIA2_NS}\"><Type>All</Type></GetProfiles>"
     )));
-    assert!(bodies[11].contains(&format!(
+    assert!(bodies[9].contains(&format!(
         "<GetVideoEncoderConfigurationOptions xmlns=\"{MEDIA2_NS}\"/>"
     )));
 }
@@ -1473,7 +1445,6 @@ fn capability_action_not_supported_falls_back_to_get_capabilities_all() {
     assert_eq!(report.warnings[0].operation, "GetServices");
     assert_eq!(report.warnings[0].message, "SOAP Fault: ActionNotSupported");
     assert_eq!(report.ptz.detected, Some(false));
-    assert_eq!(report.events.detected, Some(false));
     assert_eq!(report.media2.detected, None);
     assert_eq!(report.media2.h265_supported, None);
     let requests = requests.lock().unwrap();
@@ -1638,25 +1609,19 @@ fn capability_optional_failures_are_sanitized_and_keep_unknowns() {
     let connected_media = format!("http://127.0.0.1:{port}/connected/media");
     let media1 = format!("http://127.0.0.1:{port}/advertised/media1");
     let ptz = format!("http://127.0.0.1:{port}/advertised/ptz");
-    let events = format!("http://127.0.0.1:{port}/advertised/events");
     let media2 = format!("http://127.0.0.1:{port}/advertised/media2");
     let mut responses = capability_connect_responses(&connected_media);
     responses.extend([
         ok("<!DOCTYPE s:Envelope [<!ENTITY injected \"payload-secret\">]><broken>&injected;</broken>".to_owned()),
         ok(capability_soap(&format!(
-            "<tds:GetServicesResponse>{}{}{}{}</tds:GetServicesResponse>",
+            "<tds:GetServicesResponse>{}{}{}</tds:GetServicesResponse>",
             capability_service(MEDIA1_NS, &media1, 1, 0),
             capability_service(PTZ_NS, &ptz, 1, 0),
-            capability_service(EVENTS_NS, &events, 1, 0),
             capability_service(MEDIA2_NS, &media2, 2, 0),
         ))),
         status(500, "operator:camera-pass@camera payload-secret".to_owned()),
         ok(capability_soap(
             "<tptz:GetServiceCapabilitiesResponse><tptz:Capabilities Reverse=\"true\"/></tptz:GetServiceCapabilitiesResponse>",
-        )),
-        status(500, "payload-secret".to_owned()),
-        ok(capability_soap(
-            "<tev:GetServiceCapabilitiesResponse><tev:Capabilities/></tev:GetServiceCapabilitiesResponse>",
         )),
         status(500, "payload-secret".to_owned()),
         ok(capability_soap(
@@ -1683,8 +1648,6 @@ fn capability_optional_failures_are_sanitized_and_keep_unknowns() {
     assert_eq!(report.ptz.detected, Some(true));
     assert_eq!(report.ptz.pan_tilt_supported, None);
     assert_eq!(report.ptz.zoom_supported, None);
-    assert_eq!(report.events.detected, Some(true));
-    assert!(report.events.topics.is_empty());
     assert_eq!(report.media2.detected, Some(true));
     assert_eq!(report.media2.h265_supported, None);
     assert_eq!(report.profiles[0].token, "media2-only");
@@ -1698,7 +1661,6 @@ fn capability_optional_failures_are_sanitized_and_keep_unknowns() {
             "GetScopes",
             "Media1 GetProfiles",
             "PTZ GetNodes",
-            "Events GetEventProperties",
             "Media2 GetVideoEncoderConfigurationOptions",
         ]
     );
@@ -1926,9 +1888,7 @@ fn capability_soap(body: &str) -> String {
     format!(
         "<s:Envelope xmlns:s=\"{SOAP12_NS}\" xmlns:tds=\"{DEVICE_NS}\" \
          xmlns:tt=\"{SCHEMA_NS}\" xmlns:trt=\"{MEDIA1_NS}\" \
-         xmlns:tr2=\"{MEDIA2_NS}\" xmlns:tptz=\"{PTZ_NS}\" \
-         xmlns:tev=\"{EVENTS_NS}\" xmlns:wstop=\"{WSTOP_NS}\" \
-         xmlns:tns=\"{TOPICS_NS}\"><s:Body>{body}</s:Body></s:Envelope>"
+         xmlns:tr2=\"{MEDIA2_NS}\" xmlns:tptz=\"{PTZ_NS}\"><s:Body>{body}</s:Body></s:Envelope>"
     )
 }
 

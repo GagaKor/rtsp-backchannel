@@ -21,12 +21,7 @@ const MEDIA1_NS = 'http://www.onvif.org/ver10/media/wsdl';
 const MEDIA2_NS = 'http://www.onvif.org/ver20/media/wsdl';
 const PTZ_NS = 'http://www.onvif.org/ver20/ptz/wsdl';
 const EVENTS_NS = 'http://www.onvif.org/ver10/events/wsdl';
-const WSTOP_NS = 'http://docs.oasis-open.org/wsn/t-1';
 const PROFILE_SCOPE_PREFIX = 'onvif://www.onvif.org/Profile/';
-const MAX_EVENT_TOPICS = 1_024;
-const MAX_EVENT_TOPIC_PATH_BYTES = 4_096;
-const MAX_EVENT_TOPIC_NAMESPACE_BYTES = 2_048;
-const MAX_EVENT_TOPIC_RETAINED_BYTES = 256 * 1_024;
 
 export interface CameraCapabilityOptions {
   host: string;
@@ -79,22 +74,6 @@ export interface PtzNode {
   auxiliaryCommands: string[];
 }
 
-export interface EventServiceCapabilities {
-  wsSubscriptionPolicySupport?: boolean;
-  wsPullPointSupport?: boolean;
-  wsPausableSubscriptionManagerInterfaceSupport?: boolean;
-  persistentNotificationStorage?: boolean;
-  maxNotificationProducers?: number;
-  maxPullPoints?: number;
-  eventBrokerProtocols?: string[];
-  maxEventBrokers?: number;
-}
-
-export interface EventTopic {
-  namespace?: string;
-  path: string;
-}
-
 export interface CameraCapabilityWarning {
   operation: string;
   message: string;
@@ -114,11 +93,6 @@ export interface CameraCapabilityReport {
     profileTokens: string[];
     serviceCapabilities?: PtzServiceCapabilities;
     nodes: PtzNode[];
-  };
-  events: {
-    detected: boolean | null;
-    serviceCapabilities?: EventServiceCapabilities;
-    topics: EventTopic[];
   };
   media2: {
     detected: boolean | null;
@@ -143,7 +117,6 @@ export class OnvifResponseError extends Error {
 /** @internal */
 export interface ParsedServiceDiscovery {
   services: CameraCapabilityService[];
-  eventServiceCapabilities?: EventServiceCapabilities;
 }
 
 /** @internal */
@@ -296,52 +269,6 @@ function serviceComparator(
     || (left.version?.minor ?? -1) - (right.version?.minor ?? -1);
 }
 
-function eventCapabilitiesFromAttributes(node: XmlElement): EventServiceCapabilities {
-  const booleanAttributes: Array<[string, keyof EventServiceCapabilities]> = [
-    ['WSSubscriptionPolicySupport', 'wsSubscriptionPolicySupport'],
-    ['WSPullPointSupport', 'wsPullPointSupport'],
-    ['WSPausableSubscriptionManagerInterfaceSupport', 'wsPausableSubscriptionManagerInterfaceSupport'],
-    ['PersistentNotificationStorage', 'persistentNotificationStorage'],
-  ];
-  const integerAttributes: Array<[string, keyof EventServiceCapabilities]> = [
-    ['MaxNotificationProducers', 'maxNotificationProducers'],
-    ['MaxPullPoints', 'maxPullPoints'],
-    ['MaxEventBrokers', 'maxEventBrokers'],
-  ];
-  const result: EventServiceCapabilities = {};
-  for (const [attributeName, property] of booleanAttributes) {
-    const value = strictBoolean(attribute(node, '', attributeName));
-    if (value !== undefined) Object.assign(result, { [property]: value });
-  }
-  for (const [attributeName, property] of integerAttributes) {
-    const value = strictNonNegativeInteger(attribute(node, '', attributeName));
-    if (value !== undefined) Object.assign(result, { [property]: value });
-  }
-  const protocols = attribute(node, '', 'EventBrokerProtocols')
-    ?.split(/\s+/)
-    .map((value) => value.trim())
-    .filter(Boolean);
-  if (protocols?.length) {
-    result.eventBrokerProtocols = [...new Set(protocols)].sort(compareText);
-  }
-  return result;
-}
-
-function eventCapabilitiesFromChildren(node: XmlElement): EventServiceCapabilities {
-  const fields: Array<[string, keyof EventServiceCapabilities]> = [
-    ['WSSubscriptionPolicySupport', 'wsSubscriptionPolicySupport'],
-    ['WSPullPointSupport', 'wsPullPointSupport'],
-    ['WSPausableSubscriptionManagerInterfaceSupport', 'wsPausableSubscriptionManagerInterfaceSupport'],
-    ['PersistentNotificationStorage', 'persistentNotificationStorage'],
-  ];
-  const result: EventServiceCapabilities = {};
-  for (const [elementName, property] of fields) {
-    const value = strictBoolean(firstChild(node, SCHEMA_NS, elementName)?.text);
-    if (value !== undefined) Object.assign(result, { [property]: value });
-  }
-  return result;
-}
-
 /** @internal */
 export function parseScopesResponse(xml: string): {
   scopes: string[];
@@ -383,10 +310,6 @@ export function parseServicesResponse(xml: string): ParsedServiceDiscovery {
   const response = operationResponse(xml, DEV_NS, 'GetServicesResponse', 'GetServices');
   const sourceServices = childElements(response, DEV_NS, 'Service');
   const services: CameraCapabilityService[] = [];
-  const eventCapabilityCandidates: Array<{
-    service: CameraCapabilityService;
-    capabilities: EventServiceCapabilities;
-  }> = [];
   for (const source of sourceServices) {
     const namespace = textOf(firstChild(source, DEV_NS, 'Namespace'));
     const xaddr = textOf(firstChild(source, DEV_NS, 'XAddr'));
@@ -406,33 +329,12 @@ export function parseServicesResponse(xml: string): ParsedServiceDiscovery {
       ...(major !== undefined && minor !== undefined ? { version: { major, minor } } : {}),
     };
     services.push(service);
-    if (namespace === EVENTS_NS) {
-      const wrapper = firstChild(source, DEV_NS, 'Capabilities');
-      const capabilities = wrapper?.children.find(
-        (node) => node.uri === EVENTS_NS && node.local === 'Capabilities',
-      );
-      if (capabilities) {
-        const parsed = eventCapabilitiesFromAttributes(capabilities);
-        if (Object.keys(parsed).length > 0) {
-          eventCapabilityCandidates.push({ service, capabilities: parsed });
-        }
-      }
-    }
   }
   if (services.length === 0) {
     throw new OnvifResponseError('invalid', 'invalid GetServices response: no services');
   }
   services.sort(serviceComparator);
-  const selectedEventService = selectService(services, EVENTS_NS);
-  const eventServiceCapabilities = eventCapabilityCandidates.find(
-    (candidate) => candidate.service === selectedEventService,
-  )?.capabilities;
-  return {
-    services,
-    ...(eventServiceCapabilities && Object.keys(eventServiceCapabilities).length > 0
-      ? { eventServiceCapabilities }
-      : {}),
-  };
+  return { services };
 }
 
 const LEGACY_SERVICE_NAMESPACES: Readonly<Record<string, string>> = {
@@ -469,36 +371,17 @@ export function parseCapabilitiesResponse(xml: string): ParsedServiceDiscovery {
     ...(extension?.children.filter((node) => node.uri === SCHEMA_NS) ?? []),
   ];
   const services: CameraCapabilityService[] = [];
-  const eventCapabilityCandidates: Array<{
-    service: CameraCapabilityService;
-    capabilities?: EventServiceCapabilities;
-  }> = [];
   for (const candidate of candidates) {
     const namespace = LEGACY_SERVICE_NAMESPACES[candidate.local];
     const xaddr = textOf(firstChild(candidate, SCHEMA_NS, 'XAddr'));
     if (!namespace || !xaddr) continue;
-    const service = { namespace, xaddr };
-    services.push(service);
-    if (candidate.local === 'Events') {
-      const parsed = eventCapabilitiesFromChildren(candidate);
-      eventCapabilityCandidates.push({
-        service,
-        ...(Object.keys(parsed).length > 0 ? { capabilities: parsed } : {}),
-      });
-    }
+    services.push({ namespace, xaddr });
   }
   if (services.length === 0) {
     throw new OnvifResponseError('invalid', 'invalid GetCapabilities response: no services');
   }
   services.sort(serviceComparator);
-  const selectedEventService = selectService(services, EVENTS_NS);
-  const eventServiceCapabilities = eventCapabilityCandidates.find(
-    (candidate) => candidate.service === selectedEventService,
-  )?.capabilities;
-  return {
-    services,
-    ...(eventServiceCapabilities ? { eventServiceCapabilities } : {}),
-  };
+  return { services };
 }
 
 /** @internal */
@@ -683,101 +566,6 @@ export function parsePtzNodesResponse(xml: string): ParsedPtzNodes {
 }
 
 /** @internal */
-export function parseEventServiceCapabilitiesResponse(xml: string): EventServiceCapabilities {
-  const response = operationResponse(
-    xml,
-    EVENTS_NS,
-    'GetServiceCapabilitiesResponse',
-    'Events GetServiceCapabilities',
-  );
-  const capabilities = firstChild(response, EVENTS_NS, 'Capabilities');
-  if (!capabilities) {
-    throw new OnvifResponseError('invalid', 'invalid Events GetServiceCapabilities response');
-  }
-  return eventCapabilitiesFromAttributes(capabilities);
-}
-
-/** @internal */
-export function mergeEventServiceCapabilities(
-  legacy: EventServiceCapabilities | undefined,
-  current: EventServiceCapabilities | undefined,
-): EventServiceCapabilities {
-  return { ...legacy, ...current };
-}
-
-/** @internal */
-export function parseEventPropertiesResponse(xml: string): EventTopic[] {
-  const response = operationResponse(
-    xml,
-    EVENTS_NS,
-    'GetEventPropertiesResponse',
-    'Events GetEventProperties',
-  );
-  const topicSet = firstChild(response, WSTOP_NS, 'TopicSet');
-  if (!topicSet) {
-    throw new OnvifResponseError('invalid', 'invalid Events GetEventProperties response');
-  }
-
-  const invalidResponse = () => new OnvifResponseError(
-    'invalid',
-    'invalid Events GetEventProperties response',
-  );
-  const retained = new Map<string, Map<string, EventTopic>>();
-  let retainedTopicCount = 0;
-  let retainedTopicBytes = 0;
-  let path = '';
-  const pending: Array<{ node: XmlElement; restoreLength?: number }> = [];
-  for (let index = topicSet.children.length - 1; index >= 0; index--) {
-    pending.push({ node: topicSet.children[index] });
-  }
-  while (pending.length > 0) {
-    const { node, restoreLength } = pending.pop()!;
-    if (restoreLength !== undefined) {
-      path = path.slice(0, restoreLength);
-      continue;
-    }
-    const previousLength = path.length;
-    path += `${path ? '/' : ''}${node.local}`;
-    if (strictBoolean(attribute(node, WSTOP_NS, 'topic')) === true) {
-      const pathBytes = Buffer.byteLength(path, 'utf8');
-      if (pathBytes > MAX_EVENT_TOPIC_PATH_BYTES) throw invalidResponse();
-      const namespace = node.uri || undefined;
-      const namespaceBytes = Buffer.byteLength(namespace ?? '', 'utf8');
-      if (namespaceBytes > MAX_EVENT_TOPIC_NAMESPACE_BYTES) throw invalidResponse();
-      const namespaceKey = namespace ?? '';
-      const duplicate = retained.get(path)?.has(namespaceKey) ?? false;
-      if (!duplicate) {
-        if (retainedTopicCount >= MAX_EVENT_TOPICS) throw invalidResponse();
-        const topicBytes = pathBytes + namespaceBytes;
-        if (retainedTopicBytes + topicBytes > MAX_EVENT_TOPIC_RETAINED_BYTES) {
-          throw invalidResponse();
-        }
-        retainedTopicBytes += topicBytes;
-        retainedTopicCount++;
-        let namespaces = retained.get(path);
-        if (!namespaces) {
-          namespaces = new Map();
-          retained.set(path, namespaces);
-        }
-        namespaces.set(namespaceKey, {
-          ...(namespace ? { namespace } : {}),
-          path,
-        });
-      }
-    }
-    pending.push({ node, restoreLength: previousLength });
-    for (let index = node.children.length - 1; index >= 0; index--) {
-      pending.push({ node: node.children[index] });
-    }
-  }
-
-  const topics = [...retained.values()].flatMap((namespaces) => [...namespaces.values()]);
-  return topics.sort((left, right) =>
-    compareText(left.path, right.path)
-    || compareText(left.namespace ?? '', right.namespace ?? ''));
-}
-
-/** @internal */
 export function parseMedia2OptionsResponse(xml: string): string[] {
   const response = operationResponse(
     xml,
@@ -843,8 +631,6 @@ const MEDIA2_GET_PROFILES = `<GetProfiles xmlns="${MEDIA2_NS}"><Type>All</Type><
 const MEDIA2_GET_OPTIONS = `<GetVideoEncoderConfigurationOptions xmlns="${MEDIA2_NS}"/>`;
 const PTZ_GET_CAPABILITIES = `<GetServiceCapabilities xmlns="${PTZ_NS}"/>`;
 const PTZ_GET_NODES = `<GetNodes xmlns="${PTZ_NS}"/>`;
-const EVENTS_GET_CAPABILITIES = `<GetServiceCapabilities xmlns="${EVENTS_NS}"/>`;
-const EVENTS_GET_PROPERTIES = `<GetEventProperties xmlns="${EVENTS_NS}"/>`;
 
 function parseReadOnlyResponse<T>(
   response: OnvifRawResponse,
@@ -944,19 +730,16 @@ export async function getCameraCapabilitiesWithDependencies(
 
   let serviceDiscovery: CameraCapabilityReport['serviceDiscovery'] = 'unavailable';
   let services: CameraCapabilityService[] = [];
-  let discoveredEventCapabilities: EventServiceCapabilities | undefined;
   try {
     const parsed = await call(GET_SERVICES, parseServicesResponse);
     serviceDiscovery = 'getServices';
     services = parsed.services;
-    discoveredEventCapabilities = parsed.eventServiceCapabilities;
   } catch (getServicesError) {
     warn('GetServices', getServicesError);
     try {
       const parsed = await call(GET_ALL_CAPABILITIES, parseCapabilitiesResponse);
       serviceDiscovery = 'getCapabilities';
       services = parsed.services;
-      discoveredEventCapabilities = parsed.eventServiceCapabilities;
     } catch (getCapabilitiesError) {
       warn('GetCapabilities', getCapabilitiesError);
     }
@@ -1002,35 +785,6 @@ export async function getCameraCapabilitiesWithDependencies(
       warn('PTZ GetNodes', error);
     }
   }
-
-  const eventService = selectService(services, EVENTS_NS);
-  const eventsDetected = discoveryAvailable ? Boolean(eventService) : null;
-  let currentEventCapabilities: EventServiceCapabilities | undefined;
-  let topics: EventTopic[] = [];
-  if (eventService) {
-    try {
-      currentEventCapabilities = await call(
-        EVENTS_GET_CAPABILITIES,
-        parseEventServiceCapabilitiesResponse,
-        eventService.xaddr,
-      );
-    } catch (error) {
-      warn('Events GetServiceCapabilities', error);
-    }
-    try {
-      topics = await call(
-        EVENTS_GET_PROPERTIES,
-        parseEventPropertiesResponse,
-        eventService.xaddr,
-      );
-    } catch (error) {
-      warn('Events GetEventProperties', error);
-    }
-  }
-  const eventServiceCapabilities = mergeEventServiceCapabilities(
-    discoveredEventCapabilities,
-    currentEventCapabilities,
-  );
 
   const media2Service = selectService(services, MEDIA2_NS);
   const media2Detected = serviceDiscovery === 'getServices' ? Boolean(media2Service) : null;
@@ -1079,13 +833,6 @@ export async function getCameraCapabilitiesWithDependencies(
       profileTokens,
       ...(ptzServiceCapabilities ? { serviceCapabilities: ptzServiceCapabilities } : {}),
       nodes: ptzNodes,
-    },
-    events: {
-      detected: eventsDetected,
-      ...(Object.keys(eventServiceCapabilities).length > 0
-        ? { serviceCapabilities: eventServiceCapabilities }
-        : {}),
-      topics,
     },
     media2: {
       detected: media2Detected,

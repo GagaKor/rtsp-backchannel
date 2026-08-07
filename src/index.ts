@@ -45,8 +45,6 @@ export type {
   CameraCapabilityReport,
   CameraCapabilityService,
   CameraCapabilityWarning,
-  EventServiceCapabilities,
-  EventTopic,
   PtzNode,
   PtzServiceCapabilities,
   PtzSpaces,

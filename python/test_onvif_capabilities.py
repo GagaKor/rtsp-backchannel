@@ -20,18 +20,13 @@ from rtsp_backchannel.capabilities import (
     CameraCapabilityService,
     CameraCapabilityVersion,
     CameraCapabilityWarning,
-    EventCapabilityReport,
-    EventServiceCapabilities,
     Media2CapabilityReport,
     PtzCapabilityReport,
     PtzNode,
     PtzServiceCapabilities,
     PtzSpaces,
     _OnvifResponseError,
-    _merge_event_service_capabilities,
     _parse_capabilities_response,
-    _parse_event_properties_response,
-    _parse_event_service_capabilities_response,
     _parse_media1_profiles_response,
     _parse_media2_options_response,
     _parse_media2_profiles_response,
@@ -54,8 +49,6 @@ MEDIA1_NS = "http://www.onvif.org/ver10/media/wsdl"
 MEDIA2_NS = "http://www.onvif.org/ver20/media/wsdl"
 PTZ_NS = "http://www.onvif.org/ver20/ptz/wsdl"
 EVENTS_NS = "http://www.onvif.org/ver10/events/wsdl"
-WSTOP_NS = "http://docs.oasis-open.org/wsn/t-1"
-TOPICS_NS = "http://www.onvif.org/ver10/topics"
 NBSP = "\N{NO-BREAK SPACE}"
 
 GET_SCOPES = f'<GetScopes xmlns="{DEVICE_NS}"/>'
@@ -76,8 +69,6 @@ MEDIA2_GET_OPTIONS = (
 )
 PTZ_GET_CAPABILITIES = f'<GetServiceCapabilities xmlns="{PTZ_NS}"/>'
 PTZ_GET_NODES = f'<GetNodes xmlns="{PTZ_NS}"/>'
-EVENTS_GET_CAPABILITIES = f'<GetServiceCapabilities xmlns="{EVENTS_NS}"/>'
-EVENTS_GET_PROPERTIES = f'<GetEventProperties xmlns="{EVENTS_NS}"/>'
 
 
 def soap(body: str) -> str:
@@ -85,8 +76,7 @@ def soap(body: str) -> str:
         f'<s:Envelope xmlns:s="{SOAP12_NS}" xmlns:tds="{DEVICE_NS}" '
         f'xmlns:tt="{SCHEMA_NS}" xmlns:trt="{MEDIA1_NS}" '
         f'xmlns:tr2="{MEDIA2_NS}" xmlns:tptz="{PTZ_NS}" '
-        f'xmlns:tev="{EVENTS_NS}" xmlns:wstop="{WSTOP_NS}" '
-        f'xmlns:tns="{TOPICS_NS}" xmlns:vendor="urn:vendor">'
+        f'xmlns:vendor="urn:vendor">'
         f"<s:Body>{body}</s:Body></s:Envelope>"
     )
 
@@ -131,11 +121,6 @@ class CapabilityParserTests(unittest.TestCase):
                 service_capabilities=None,
                 nodes=(),
             ),
-            events=EventCapabilityReport(
-                detected=None,
-                service_capabilities=None,
-                topics=(),
-            ),
             media2=Media2CapabilityReport(
                 detected=True,
                 encodings=("H265",),
@@ -150,7 +135,6 @@ class CapabilityParserTests(unittest.TestCase):
             service,
             service.version,
             report.ptz,
-            report.events,
             report.media2,
             report.warnings[0],
         ):
@@ -281,16 +265,6 @@ class CapabilityOrchestrationTests(unittest.TestCase):
                     "<tt:AbsoluteZoomPositionSpace/></tt:SupportedPTZSpaces>"
                     "</tptz:PTZNode></tptz:GetNodesResponse>"
                 )
-            if body == EVENTS_GET_CAPABILITIES and endpoint == "http://camera/events":
-                return raw_response(
-                    '<tev:GetServiceCapabilitiesResponse><tev:Capabilities WSPullPointSupport="true"/>'
-                    "</tev:GetServiceCapabilitiesResponse>"
-                )
-            if body == EVENTS_GET_PROPERTIES and endpoint == "http://camera/events":
-                return raw_response(
-                    '<tev:GetEventPropertiesResponse><wstop:TopicSet><tns:Motion wstop:topic="true"/>'
-                    "</wstop:TopicSet></tev:GetEventPropertiesResponse>"
-                )
             if body == MEDIA2_GET_PROFILES and endpoint == "http://camera/media2":
                 return raw_response(
                     '<tr2:GetProfilesResponse><tr2:Profiles token="modern">'
@@ -339,8 +313,6 @@ class CapabilityOrchestrationTests(unittest.TestCase):
                 (MEDIA1_GET_PROFILES, "http://camera/media1"),
                 (PTZ_GET_CAPABILITIES, "http://camera/ptz"),
                 (PTZ_GET_NODES, "http://camera/ptz"),
-                (EVENTS_GET_CAPABILITIES, "http://camera/events"),
-                (EVENTS_GET_PROPERTIES, "http://camera/events"),
                 (MEDIA2_GET_PROFILES, "http://camera/media2"),
                 (MEDIA2_GET_OPTIONS, "http://camera/media2"),
             ],
@@ -357,14 +329,6 @@ class CapabilityOrchestrationTests(unittest.TestCase):
         self.assertEqual(report.ptz.pan_tilt_supported, True)
         self.assertEqual(report.ptz.zoom_supported, True)
         self.assertEqual(report.ptz.service_capabilities.e_flip, True)
-        self.assertEqual(report.events.detected, True)
-        self.assertEqual(
-            report.events.service_capabilities.ws_pull_point_support, True
-        )
-        self.assertEqual(
-            tuple((topic.namespace, topic.path) for topic in report.events.topics),
-            ((TOPICS_NS, "Motion"),),
-        )
         self.assertEqual(report.media2, Media2CapabilityReport(True, ("H264", "H265"), True))
         self.assertEqual(report.warnings, ())
 
@@ -404,7 +368,6 @@ class CapabilityOrchestrationTests(unittest.TestCase):
         self.assertEqual(report.ptz.detected, False)
         self.assertIsNone(report.ptz.pan_tilt_supported)
         self.assertIsNone(report.ptz.zoom_supported)
-        self.assertEqual(report.events.detected, False)
         self.assertIsNone(report.media2.detected)
         self.assertIsNone(report.media2.h265_supported)
 
@@ -537,7 +500,6 @@ class CapabilityOrchestrationTests(unittest.TestCase):
         self.assertEqual(report.service_discovery, "unavailable")
         self.assertEqual(tuple(profile.token for profile in report.profiles), ("fallback",))
         self.assertIsNone(report.ptz.detected)
-        self.assertIsNone(report.events.detected)
         self.assertIsNone(report.media2.detected)
         self.assertEqual(
             tuple(warning.operation for warning in report.warnings),
@@ -551,7 +513,7 @@ class CapabilityOrchestrationTests(unittest.TestCase):
             "admin|password|viewer|top-secret|@camera|payload-secret|PasswordDigest|digest-token",
         )
 
-    def test_media2_profiles_recover_after_media1_ptz_and_event_failures(self):
+    def test_media2_profiles_recover_after_media1_and_ptz_failures(self):
         def respond(body, endpoint):
             if body == GET_SCOPES:
                 return raw_response("<tds:GetScopesResponse/>")
@@ -575,17 +537,6 @@ class CapabilityOrchestrationTests(unittest.TestCase):
                 )
             if body == PTZ_GET_NODES:
                 raise TimeoutError("request timeout")
-            if body == EVENTS_GET_CAPABILITIES:
-                return raw_response(
-                    "<tev:GetServiceCapabilitiesResponse><tev:Capabilities/>"
-                    "</tev:GetServiceCapabilitiesResponse>",
-                    500,
-                )
-            if body == EVENTS_GET_PROPERTIES:
-                return raw_response(
-                    "<tev:GetEventPropertiesResponse><wstop:TopicSet/>"
-                    "</tev:GetEventPropertiesResponse>"
-                )
             if body == MEDIA2_GET_PROFILES and endpoint == "http://camera/media2":
                 return raw_response(
                     '<tr2:GetProfilesResponse><tr2:Profiles token="media2-only">'
@@ -618,8 +569,6 @@ class CapabilityOrchestrationTests(unittest.TestCase):
         self.assertIsNone(report.ptz.zoom_supported)
         self.assertEqual(report.ptz.nodes, ())
         self.assertEqual(report.ptz.service_capabilities.reverse, True)
-        self.assertEqual(report.events.detected, True)
-        self.assertEqual(report.events.topics, ())
         self.assertEqual(report.media2.detected, True)
         self.assertEqual(report.media2.encodings, ("H264",))
         self.assertEqual(report.media2.h265_supported, False)
@@ -628,7 +577,6 @@ class CapabilityOrchestrationTests(unittest.TestCase):
             (
                 "Media1 GetProfiles",
                 "PTZ GetNodes",
-                "Events GetServiceCapabilities",
             ),
         )
         warning_text = json.dumps(
@@ -689,49 +637,6 @@ class CapabilityOrchestrationTests(unittest.TestCase):
 
         self.assertEqual(report.service_discovery, "getCapabilities")
         self.assertEqual(report.warnings[0].message, "SOAP Fault: Fault")
-
-    def test_event_topic_budget_failure_is_a_sanitized_warning_with_unknown_topics(self):
-        overflow_topics = "".join(
-            f'<vendor:T{index:04} wstop:topic="true"/>'
-            for index in range(1025)
-        )
-
-        def respond(body, endpoint):
-            if body == GET_SCOPES:
-                return raw_response("<tds:GetScopesResponse/>")
-            if body == GET_SERVICES:
-                return raw_response(
-                    "<tds:GetServicesResponse>"
-                    + service(EVENTS_NS, "http://camera/events")
-                    + "</tds:GetServicesResponse>"
-                )
-            if body == MEDIA1_GET_PROFILES:
-                return raw_response("<trt:GetProfilesResponse/>")
-            if body == EVENTS_GET_CAPABILITIES:
-                return raw_response(
-                    "<tev:GetServiceCapabilitiesResponse>"
-                    "<tev:Capabilities/>"
-                    "</tev:GetServiceCapabilitiesResponse>"
-                )
-            if body == EVENTS_GET_PROPERTIES:
-                return raw_response(
-                    "<tev:GetEventPropertiesResponse><wstop:TopicSet>"
-                    + overflow_topics
-                    + "</wstop:TopicSet></tev:GetEventPropertiesResponse>"
-                )
-            raise AssertionError(body)
-
-        fake = FakeCapabilityDevice(respond)
-        report, _ = self._run_with_fake(fake, host="camera")
-
-        self.assertEqual(report.events.topics, ())
-        self.assertIn(
-            CameraCapabilityWarning(
-                "Events GetEventProperties",
-                "invalid Events GetEventProperties response",
-            ),
-            report.warnings,
-        )
 
     def test_connect_failure_is_fatal_before_any_capability_request(self):
         class ConnectFailureDevice(FakeCapabilityDevice):
@@ -1207,8 +1112,6 @@ class CapabilityParityFixtureTests(unittest.TestCase):
             "Media1GetProfiles",
             "PtzGetServiceCapabilities",
             "PtzGetNodes",
-            "EventsGetServiceCapabilities",
-            "EventsGetEventProperties",
             "Media2GetProfiles",
             "Media2GetVideoEncoderConfigurationOptions",
         ]
@@ -1237,8 +1140,6 @@ class CapabilityParityFixtureTests(unittest.TestCase):
                     operation = "GetServices"
                 elif "GetVideoEncoderConfigurationOptions" in body:
                     operation = "Media2GetVideoEncoderConfigurationOptions"
-                elif "GetEventProperties" in body:
-                    operation = "EventsGetEventProperties"
                 elif "GetNodes" in body:
                     operation = "PtzGetNodes"
                 elif "GetProfiles" in body and path.endswith("/media1"):
@@ -1250,11 +1151,6 @@ class CapabilityParityFixtureTests(unittest.TestCase):
                     and path.endswith("/ptz")
                 ):
                     operation = "PtzGetServiceCapabilities"
-                elif (
-                    "GetServiceCapabilities" in body
-                    and path.endswith("/events")
-                ):
-                    operation = "EventsGetServiceCapabilities"
                 else:
                     operation = None
 
@@ -1919,68 +1815,15 @@ class CapabilityProtocolParserTests(unittest.TestCase):
                 with self.assertRaisesRegex(_OnvifResponseError, "invalid GetServices"):
                     _parse_services_response(soap(malformed))
 
-    def test_selected_event_service_supplies_embedded_capabilities(self):
-        parsed = _parse_services_response(
+    def test_maps_all_legacy_services(self):
+        parsed = _parse_capabilities_response(
             soap(
-                f"""
-                <tds:GetServicesResponse>
-                  <tds:Service><tds:Namespace>{EVENTS_NS}</tds:Namespace><tds:XAddr>http://camera/events-z</tds:XAddr>
-                    <tds:Capabilities><tev:Capabilities WSPullPointSupport="false"/></tds:Capabilities>
-                    <tds:Version><tt:Major>1</tt:Major><tt:Minor>0</tt:Minor></tds:Version></tds:Service>
-                  <tds:Service><tds:Namespace>{EVENTS_NS}</tds:Namespace><tds:XAddr>http://camera/events-b</tds:XAddr>
-                    <tds:Capabilities><tev:Capabilities WSPullPointSupport="true"/></tds:Capabilities>
-                    <tds:Version><tt:Major>2</tt:Major><tt:Minor>0</tt:Minor></tds:Version></tds:Service>
-                  <tds:Service><tds:Namespace>{EVENTS_NS}</tds:Namespace><tds:XAddr>http://camera/events-a</tds:XAddr>
-                    <tds:Capabilities><tev:Capabilities WSPullPointSupport="false"/></tds:Capabilities>
-                    <tds:Version><tt:Major>2</tt:Major><tt:Minor>0</tt:Minor></tds:Version></tds:Service>
-                  <tds:Service><tds:Namespace>{EVENTS_NS}</tds:Namespace><tds:XAddr>http://camera/events-a</tds:XAddr>
-                    <tds:Capabilities><tev:Capabilities WSPullPointSupport="true"/></tds:Capabilities>
-                    <tds:Version><tt:Major>2</tt:Major><tt:Minor>0</tt:Minor></tds:Version></tds:Service>
-                </tds:GetServicesResponse>
                 """
-            )
-        )
-
-        self.assertEqual(
-            parsed.event_service_capabilities,
-            EventServiceCapabilities(ws_pull_point_support=False),
-        )
-
-    def test_legacy_event_capabilities_follow_the_selected_xaddr(self):
-        parsed = _parse_capabilities_response(
-            soap(
-                "<tds:GetCapabilitiesResponse><tds:Capabilities>"
-                "<tt:Events><tt:XAddr>http://camera/events-a</tt:XAddr>"
-                "<tt:WSPullPointSupport>false</tt:WSPullPointSupport>"
-                "</tt:Events><tt:Events><tt:XAddr>http://camera/events-b</tt:XAddr>"
-                "<tt:WSPullPointSupport>true</tt:WSPullPointSupport>"
-                "</tt:Events></tds:Capabilities></tds:GetCapabilitiesResponse>"
-            )
-        )
-
-        self.assertEqual(
-            _select_service(parsed.services, EVENTS_NS).xaddr,
-            "http://camera/events-a",
-        )
-        self.assertEqual(
-            parsed.event_service_capabilities,
-            EventServiceCapabilities(ws_pull_point_support=False),
-        )
-
-    def test_maps_all_legacy_services_and_strict_legacy_event_values(self):
-        parsed = _parse_capabilities_response(
-            soap(
-                f"""
                 <tds:GetCapabilitiesResponse><tds:Capabilities>
                   <tt:Device><tt:XAddr>http://camera/device</tt:XAddr></tt:Device>
                   <tt:Media><tt:XAddr>http://camera/media</tt:XAddr></tt:Media>
                   <tt:PTZ><tt:XAddr>http://camera/ptz</tt:XAddr></tt:PTZ>
-                  <tt:Events><tt:XAddr>http://camera/events</tt:XAddr>
-                    <tt:WSSubscriptionPolicySupport>{NBSP}true{NBSP}</tt:WSSubscriptionPolicySupport>
-                    <tt:WSPullPointSupport> \t1\r\n</tt:WSPullPointSupport>
-                    <tt:WSPausableSubscriptionManagerInterfaceSupport>false</tt:WSPausableSubscriptionManagerInterfaceSupport>
-                    <tt:PersistentNotificationStorage>true</tt:PersistentNotificationStorage>
-                  </tt:Events>
+                  <tt:Events><tt:XAddr>http://camera/events</tt:XAddr></tt:Events>
                   <tt:Imaging><tt:XAddr>http://camera/imaging</tt:XAddr></tt:Imaging>
                   <tt:Analytics><tt:XAddr>http://camera/analytics</tt:XAddr></tt:Analytics>
                   <tt:Extension>
@@ -2013,14 +1856,6 @@ class CapabilityProtocolParserTests(unittest.TestCase):
                 "http://www.onvif.org/ver10/replay/wsdl": "http://camera/replay",
                 "http://www.onvif.org/ver10/search/wsdl": "http://camera/search",
             },
-        )
-        self.assertEqual(
-            parsed.event_service_capabilities,
-            EventServiceCapabilities(
-                ws_pull_point_support=True,
-                ws_pausable_subscription_manager_interface_support=False,
-                persistent_notification_storage=True,
-            ),
         )
 
     def test_validates_soap_operations_faults_and_malformed_xml_without_payloads(self):
@@ -2314,253 +2149,36 @@ class CapabilityProtocolParserTests(unittest.TestCase):
                 with self.assertRaisesRegex(_OnvifResponseError, "invalid PTZ GetNodes"):
                     _parse_ptz_nodes_response(soap(malformed))
 
-    def test_modern_event_capabilities_are_strict_and_override_legacy_values(self):
-        modern = _parse_event_service_capabilities_response(
-            soap(
-                f"""
-                <tev:GetServiceCapabilitiesResponse><tev:Capabilities
-                  WSSubscriptionPolicySupport="false" WSPullPointSupport="{NBSP}true{NBSP}"
-                  WSPausableSubscriptionManagerInterfaceSupport="1"
-                  PersistentNotificationStorage="true" MaxNotificationProducers="+12"
-                  MaxPullPoints="-1" MaxEventBrokers="2147483648"
-                  EventBrokerProtocols="mqtt mqtts mqtt" vendor:MaxPullPoints="99"/>
-                </tev:GetServiceCapabilitiesResponse>
-                """
-            )
-        )
-        self.assertEqual(
-            modern,
-            EventServiceCapabilities(
-                ws_subscription_policy_support=False,
-                ws_pausable_subscription_manager_interface_support=True,
-                persistent_notification_storage=True,
-                max_notification_producers=12,
-                event_broker_protocols=("mqtt", "mqtts"),
-            ),
-        )
-        self.assertEqual(
-            _merge_event_service_capabilities(
-                EventServiceCapabilities(
-                    ws_subscription_policy_support=True,
-                    ws_pull_point_support=True,
-                ),
-                modern,
-            ),
-            EventServiceCapabilities(
-                ws_subscription_policy_support=False,
-                ws_pull_point_support=True,
-                ws_pausable_subscription_manager_interface_support=True,
-                persistent_notification_storage=True,
-                max_notification_producers=12,
-                event_broker_protocols=("mqtt", "mqtts"),
-            ),
-        )
-
-    def test_event_topics_require_direct_topicset_and_namespaced_markers(self):
-        topics = _parse_event_properties_response(
-            soap(
-                """
-                <tev:GetEventPropertiesResponse>
-                  <vendor:Wrapper><wstop:TopicSet><vendor:Decoy wstop:topic="true"/></wstop:TopicSet></vendor:Wrapper>
-                  <wstop:TopicSet>
-                    <tns:Device wstop:topic="true"><tns:Trigger><vendor:Motion wstop:topic="1">
-                      <tt:MessageDescription><tt:Source><tt:SimpleItemDescription Name="Token"/></tt:Source>
-                        <tt:Data><tt:SimpleItemDescription Name="State"/></tt:Data></tt:MessageDescription>
-                    </vendor:Motion></tns:Trigger></tns:Device>
-                    <vendor:Deep><vendor:Branch><vendor:Leaf wstop:topic="true"/>
-                      <vendor:Leaf wstop:topic="true"/></vendor:Branch></vendor:Deep>
-                    <Same wstop:topic="true"/><tns:Same wstop:topic="true"/>
-                    <tns:Ignored topic="true"/>
-                  </wstop:TopicSet>
-                </tev:GetEventPropertiesResponse>
-                """
-            )
-        )
-        self.assertEqual(
-            tuple((topic.namespace, topic.path) for topic in topics),
-            (
-                ("urn:vendor", "Deep/Branch/Leaf"),
-                (TOPICS_NS, "Device"),
-                ("urn:vendor", "Device/Trigger/Motion"),
-                (None, "Same"),
-                (TOPICS_NS, "Same"),
-            ),
-        )
-
-        with self.assertRaisesRegex(_OnvifResponseError, "invalid Events GetEventProperties"):
-            _parse_event_properties_response(
-                soap(
-                    """
-                    <tev:GetEventPropertiesResponse><vendor:Wrapper><wstop:TopicSet>
-                      <vendor:Decoy wstop:topic="true"/>
-                    </wstop:TopicSet></vendor:Wrapper></tev:GetEventPropertiesResponse>
-                    """
-                )
-            )
-
-    def test_event_topic_walk_is_iterative_within_the_xml_depth_limit(self):
+    def test_generic_response_parsing_is_iterative_within_the_xml_depth_limit(
+        self,
+    ):
+        # This shared guard lives in onvif._safe_xml_fromstring and applies
+        # to every SOAP response, not just one parser; GetScopes is used
+        # here only as a convenient, non-event vehicle for it.
         maximum_xml_depth = 64
-        soap_and_operation_depth = 4
-        topic_depth = maximum_xml_depth - soap_and_operation_depth
+        envelope_body_response_depth = 3
+        nested_depth = maximum_xml_depth - envelope_body_response_depth
         within_limit = soap(
-            "<tev:GetEventPropertiesResponse><wstop:TopicSet>"
-            + "<tns:L>" * (topic_depth - 1)
-            + '<vendor:Leaf wstop:topic="true"/>'
-            + "</tns:L>" * (topic_depth - 1)
-            + "</wstop:TopicSet></tev:GetEventPropertiesResponse>"
+            "<tds:GetScopesResponse>"
+            + "<tds:Scopes>" * (nested_depth - 1)
+            + "<tt:ScopeItem>onvif://www.onvif.org/Profile/Streaming</tt:ScopeItem>"
+            + "</tds:Scopes>" * (nested_depth - 1)
+            + "</tds:GetScopesResponse>"
         )
-        topics = _parse_event_properties_response(within_limit)
-        self.assertEqual(len(topics), 1)
-        self.assertEqual(topics[0].namespace, "urn:vendor")
-        self.assertEqual(len(topics[0].path.split("/")), topic_depth)
+        parsed = _parse_scopes_response(within_limit)
+        self.assertEqual(parsed.scopes, ())
 
         beyond_limit = soap(
-            "<tev:GetEventPropertiesResponse><wstop:TopicSet>"
-            + "<tns:L>" * topic_depth
-            + '<vendor:Leaf wstop:topic="true"/>'
-            + "</tns:L>" * topic_depth
-            + "</wstop:TopicSet></tev:GetEventPropertiesResponse>"
+            "<tds:GetScopesResponse>"
+            + "<tds:Scopes>" * nested_depth
+            + "<tt:ScopeItem>onvif://www.onvif.org/Profile/Streaming</tt:ScopeItem>"
+            + "</tds:Scopes>" * nested_depth
+            + "</tds:GetScopesResponse>"
         )
         with self.assertRaisesRegex(
             _OnvifResponseError, "^invalid XML document$"
         ):
-            _parse_event_properties_response(beyond_limit)
-
-    def test_event_topics_enforce_count_path_namespace_and_aggregate_budgets(self):
-        maximum_topics = 1024
-        maximum_path_bytes = 4096
-        maximum_namespace_bytes = 2048
-        maximum_retained_bytes = 256 * 1024
-
-        count_at_limit = "".join(
-            f'<vendor:T{index:04} wstop:topic="true"/>'
-            for index in range(maximum_topics)
-        )
-        count_at_limit += '<vendor:T0000 wstop:topic="true"/>'
-        topics = _parse_event_properties_response(
-            soap(
-                "<tev:GetEventPropertiesResponse><wstop:TopicSet>"
-                + count_at_limit
-                + "</wstop:TopicSet></tev:GetEventPropertiesResponse>"
-            )
-        )
-        self.assertEqual(len(topics), maximum_topics)
-
-        with self.assertRaisesRegex(
-            _OnvifResponseError,
-            "^invalid Events GetEventProperties response$",
-        ):
-            _parse_event_properties_response(
-                soap(
-                    "<tev:GetEventPropertiesResponse><wstop:TopicSet>"
-                    + count_at_limit
-                    + f'<vendor:T{maximum_topics:04} wstop:topic="true"/>'
-                    + "</wstop:TopicSet></tev:GetEventPropertiesResponse>"
-                )
-            )
-
-        maximum_path = "T" + "x" * (maximum_path_bytes - 1)
-        topics = _parse_event_properties_response(
-            soap(
-                "<tev:GetEventPropertiesResponse><wstop:TopicSet>"
-                f'<vendor:{maximum_path} wstop:topic="true"/>'
-                "</wstop:TopicSet></tev:GetEventPropertiesResponse>"
-            )
-        )
-        self.assertEqual(len(topics[0].path.encode("utf-8")), maximum_path_bytes)
-
-        oversized_path = "T" + "x" * maximum_path_bytes
-        with self.assertRaisesRegex(
-            _OnvifResponseError,
-            "^invalid Events GetEventProperties response$",
-        ):
-            _parse_event_properties_response(
-                soap(
-                    "<tev:GetEventPropertiesResponse><wstop:TopicSet>"
-                    f'<vendor:{oversized_path} wstop:topic="true"/>'
-                    "</wstop:TopicSet></tev:GetEventPropertiesResponse>"
-                )
-            )
-        self.assertEqual(
-            _parse_event_properties_response(
-                soap(
-                    "<tev:GetEventPropertiesResponse><wstop:TopicSet>"
-                    f"<vendor:{oversized_path}/>"
-                    "</wstop:TopicSet></tev:GetEventPropertiesResponse>"
-                )
-            ),
-            (),
-        )
-
-        maximum_namespace = "urn:" + "n" * (maximum_namespace_bytes - 4)
-        topics = _parse_event_properties_response(
-            soap(
-                "<tev:GetEventPropertiesResponse><wstop:TopicSet>"
-                f'<maximum:Topic xmlns:maximum="{maximum_namespace}" '
-                'wstop:topic="true"/>'
-                "</wstop:TopicSet></tev:GetEventPropertiesResponse>"
-            )
-        )
-        self.assertEqual(
-            len(topics[0].namespace.encode("utf-8")),
-            maximum_namespace_bytes,
-        )
-
-        oversized_namespace = "urn:" + "n" * (maximum_namespace_bytes - 3)
-        with self.assertRaisesRegex(
-            _OnvifResponseError,
-            "^invalid Events GetEventProperties response$",
-        ):
-            _parse_event_properties_response(
-                soap(
-                    "<tev:GetEventPropertiesResponse><wstop:TopicSet>"
-                    f'<oversized:Topic xmlns:oversized="{oversized_namespace}" '
-                    'wstop:topic="true"/>'
-                    "</wstop:TopicSet></tev:GetEventPropertiesResponse>"
-                )
-            )
-
-        aggregate_at_limit = []
-        for index in range(64):
-            wanted_length = 4086
-            prefix = f"T{index:02}"
-            name = prefix + "x" * (wanted_length - len(prefix))
-            aggregate_at_limit.append(
-                f'<vendor:{name} wstop:topic="true"/>'
-            )
-        first_name = "T00" + "x" * (4086 - 3)
-        aggregate_at_limit.append(
-            f'<vendor:{first_name} wstop:topic="true"/>'
-        )
-        self.assertEqual(64 * (4086 + len("urn:vendor")), maximum_retained_bytes)
-        topics = _parse_event_properties_response(
-            soap(
-                "<tev:GetEventPropertiesResponse><wstop:TopicSet>"
-                + "".join(aggregate_at_limit)
-                + "</wstop:TopicSet></tev:GetEventPropertiesResponse>"
-            )
-        )
-        self.assertEqual(len(topics), 64)
-
-        aggregate_overflow = []
-        for index in range(64):
-            wanted_length = 4087 if index == 63 else 4086
-            prefix = f"T{index:02}"
-            name = prefix + "x" * (wanted_length - len(prefix))
-            aggregate_overflow.append(
-                f'<vendor:{name} wstop:topic="true"/>'
-            )
-        with self.assertRaisesRegex(
-            _OnvifResponseError,
-            "^invalid Events GetEventProperties response$",
-        ):
-            _parse_event_properties_response(
-                soap(
-                    "<tev:GetEventPropertiesResponse><wstop:TopicSet>"
-                    + "".join(aggregate_overflow)
-                    + "</wstop:TopicSet></tev:GetEventPropertiesResponse>"
-                )
-            )
+            _parse_scopes_response(beyond_limit)
 
     def test_media2_options_are_standard_namespace_aware_sorted_and_deduplicated(self):
         encodings = _parse_media2_options_response(

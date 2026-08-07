@@ -6,10 +6,7 @@ import { test } from 'node:test';
 import {
   getCameraCapabilities,
   getCameraCapabilitiesWithDependencies,
-  mergeEventServiceCapabilities,
   parseCapabilitiesResponse,
-  parseEventPropertiesResponse,
-  parseEventServiceCapabilitiesResponse,
   parseMedia1ProfilesResponse,
   parseMedia2OptionsResponse,
   parseMedia2ProfilesResponse,
@@ -29,8 +26,6 @@ const MEDIA1_NS = 'http://www.onvif.org/ver10/media/wsdl';
 const MEDIA2_NS = 'http://www.onvif.org/ver20/media/wsdl';
 const PTZ_NS = 'http://www.onvif.org/ver20/ptz/wsdl';
 const EVENTS_NS = 'http://www.onvif.org/ver10/events/wsdl';
-const WSTOP_NS = 'http://docs.oasis-open.org/wsn/t-1';
-const TOPICS_NS = 'http://www.onvif.org/ver10/topics';
 const NBSP = '\u00a0';
 
 const GET_SCOPES = `<GetScopes xmlns="${DEV_NS}"/>`;
@@ -41,16 +36,13 @@ const MEDIA2_GET_PROFILES = `<GetProfiles xmlns="${MEDIA2_NS}"><Type>All</Type><
 const MEDIA2_GET_OPTIONS = `<GetVideoEncoderConfigurationOptions xmlns="${MEDIA2_NS}"/>`;
 const PTZ_GET_CAPABILITIES = `<GetServiceCapabilities xmlns="${PTZ_NS}"/>`;
 const PTZ_GET_NODES = `<GetNodes xmlns="${PTZ_NS}"/>`;
-const EVENTS_GET_CAPABILITIES = `<GetServiceCapabilities xmlns="${EVENTS_NS}"/>`;
-const EVENTS_GET_PROPERTIES = `<GetEventProperties xmlns="${EVENTS_NS}"/>`;
 
 function soap(body: string): string {
   return (
     `<s:Envelope xmlns:s="${SOAP_NS}" xmlns:tds="${DEV_NS}"`
     + ` xmlns:tt="${SCHEMA_NS}" xmlns:trt="${MEDIA1_NS}"`
     + ` xmlns:tr2="${MEDIA2_NS}" xmlns:tptz="${PTZ_NS}"`
-    + ` xmlns:tev="${EVENTS_NS}" xmlns:wstop="${WSTOP_NS}"`
-    + ` xmlns:tns="${TOPICS_NS}" xmlns:vendor="urn:vendor">`
+    + ` xmlns:vendor="urn:vendor">`
     + `<s:Body>${body}</s:Body></s:Envelope>`
   );
 }
@@ -182,34 +174,13 @@ test('accepts only XML whitespace around integer version elements', () => {
   ]);
 });
 
-test('takes embedded Event capabilities from the selected highest-version service', () => {
-  const parsed = parseServicesResponse(soap(`
-    <tds:GetServicesResponse>
-      <tds:Service><tds:Namespace>${EVENTS_NS}</tds:Namespace><tds:XAddr>http://camera/events-new</tds:XAddr>
-        <tds:Capabilities><tev:Capabilities WSPullPointSupport="true"/></tds:Capabilities>
-        <tds:Version><tt:Major>2</tt:Major><tt:Minor>0</tt:Minor></tds:Version>
-      </tds:Service>
-      <tds:Service><tds:Namespace>${EVENTS_NS}</tds:Namespace><tds:XAddr>http://camera/events-old</tds:XAddr>
-        <tds:Capabilities><tev:Capabilities WSPullPointSupport="false"/></tds:Capabilities>
-        <tds:Version><tt:Major>1</tt:Major><tt:Minor>0</tt:Minor></tds:Version>
-      </tds:Service>
-    </tds:GetServicesResponse>
-  `));
-
-  assert.deepEqual(parsed.eventServiceCapabilities, { wsPullPointSupport: true });
-});
-
-test('maps every legacy GetCapabilities service and retains legacy Event fields', () => {
+test('maps every legacy GetCapabilities service, including Events', () => {
   const parsed = parseCapabilitiesResponse(soap(`
     <tds:GetCapabilitiesResponse><tds:Capabilities>
       <tt:Device><tt:XAddr>http://camera/device</tt:XAddr></tt:Device>
       <tt:Media><tt:XAddr>http://camera/media</tt:XAddr></tt:Media>
       <tt:PTZ><tt:XAddr>http://camera/ptz</tt:XAddr></tt:PTZ>
-      <tt:Events><tt:XAddr>http://camera/events</tt:XAddr>
-        <tt:WSSubscriptionPolicySupport>true</tt:WSSubscriptionPolicySupport>
-        <tt:WSPullPointSupport>1</tt:WSPullPointSupport>
-        <tt:WSPausableSubscriptionManagerInterfaceSupport>false</tt:WSPausableSubscriptionManagerInterfaceSupport>
-      </tt:Events>
+      <tt:Events><tt:XAddr>http://camera/events</tt:XAddr></tt:Events>
       <tt:Imaging><tt:XAddr>http://camera/imaging</tt:XAddr></tt:Imaging>
       <tt:Analytics><tt:XAddr>http://camera/analytics</tt:XAddr></tt:Analytics>
       <tt:Extension>
@@ -237,36 +208,6 @@ test('maps every legacy GetCapabilities service and retains legacy Event fields'
     'http://www.onvif.org/ver10/replay/wsdl': 'http://camera/replay',
     'http://www.onvif.org/ver10/search/wsdl': 'http://camera/search',
   });
-  assert.deepEqual(parsed.eventServiceCapabilities, {
-    wsSubscriptionPolicySupport: true,
-    wsPullPointSupport: true,
-    wsPausableSubscriptionManagerInterfaceSupport: false,
-  });
-});
-
-test('keeps duplicate legacy Event capabilities attached to the selected XAddr', () => {
-  const selectedHasCapabilities = parseCapabilitiesResponse(soap(`
-    <tds:GetCapabilitiesResponse><tds:Capabilities>
-      <tt:Events><tt:XAddr>http://camera/events-a</tt:XAddr>
-        <tt:WSPullPointSupport>false</tt:WSPullPointSupport></tt:Events>
-      <tt:Events><tt:XAddr>http://camera/events-z</tt:XAddr>
-        <tt:WSPullPointSupport>true</tt:WSPullPointSupport></tt:Events>
-    </tds:Capabilities></tds:GetCapabilitiesResponse>
-  `));
-  assert.equal(selectService(selectedHasCapabilities.services, EVENTS_NS)?.xaddr,
-    'http://camera/events-a');
-  assert.deepEqual(selectedHasCapabilities.eventServiceCapabilities, {
-    wsPullPointSupport: false,
-  });
-
-  const selectedHasNoCapabilities = parseCapabilitiesResponse(soap(`
-    <tds:GetCapabilitiesResponse><tds:Capabilities>
-      <tt:Events><tt:XAddr>http://camera/events-a</tt:XAddr></tt:Events>
-      <tt:Events><tt:XAddr>http://camera/events-z</tt:XAddr>
-        <tt:WSPullPointSupport>true</tt:WSPullPointSupport></tt:Events>
-    </tds:Capabilities></tds:GetCapabilitiesResponse>
-  `));
-  assert.equal(selectedHasNoCapabilities.eventServiceCapabilities, undefined);
 });
 
 test('rejects malformed, wrong-operation, empty, and SOAP Fault service responses', () => {
@@ -647,246 +588,6 @@ test('accepts only XML whitespace around typed PTZ element values', () => {
   ]);
 });
 
-test('parses modern Event attributes strictly and merges them over legacy fields', () => {
-  const modern = parseEventServiceCapabilitiesResponse(soap(`
-    <tev:GetServiceCapabilitiesResponse><tev:Capabilities
-      WSSubscriptionPolicySupport="false" WSPausableSubscriptionManagerInterfaceSupport="1"
-      PersistentNotificationStorage="true" MaxNotificationProducers="12" MaxPullPoints="invalid"
-      EventBrokerProtocols="mqtt mqtts mqtt" MaxEventBrokers="2"/>
-    </tev:GetServiceCapabilitiesResponse>
-  `));
-  assert.deepEqual(modern, {
-    wsSubscriptionPolicySupport: false,
-    wsPausableSubscriptionManagerInterfaceSupport: true,
-    persistentNotificationStorage: true,
-    maxNotificationProducers: 12,
-    eventBrokerProtocols: ['mqtt', 'mqtts'],
-    maxEventBrokers: 2,
-  });
-  assert.deepEqual(mergeEventServiceCapabilities(
-    { wsSubscriptionPolicySupport: true, wsPullPointSupport: true },
-    modern,
-  ), {
-    wsSubscriptionPolicySupport: false,
-    wsPullPointSupport: true,
-    wsPausableSubscriptionManagerInterfaceSupport: true,
-    persistentNotificationStorage: true,
-    maxNotificationProducers: 12,
-    eventBrokerProtocols: ['mqtt', 'mqtts'],
-    maxEventBrokers: 2,
-  });
-  assert.deepEqual(parseEventServiceCapabilitiesResponse(soap(`
-    <tev:GetServiceCapabilitiesResponse>
-      <tev:Capabilities vendor:WSPullPointSupport="true" vendor:MaxPullPoints="99"/>
-    </tev:GetServiceCapabilitiesResponse>
-  `)), {});
-});
-
-test('accepts signed xs:int counts and omits negative or out-of-range values', () => {
-  assert.deepEqual(parseEventServiceCapabilitiesResponse(soap(`
-    <tev:GetServiceCapabilitiesResponse><tev:Capabilities
-      MaxNotificationProducers="+1" MaxPullPoints="-1" MaxEventBrokers="2147483648"/>
-    </tev:GetServiceCapabilitiesResponse>
-  `)), {
-    maxNotificationProducers: 1,
-  });
-  assert.deepEqual(parseEventServiceCapabilitiesResponse(soap(`
-    <tev:GetServiceCapabilitiesResponse><tev:Capabilities
-      MaxNotificationProducers="-2147483649" MaxPullPoints="2147483647"/>
-    </tev:GetServiceCapabilitiesResponse>
-  `)), {
-    maxPullPoints: 2147483647,
-  });
-});
-
-test('accepts only XML whitespace around integer capability attributes', () => {
-  assert.deepEqual(parseEventServiceCapabilitiesResponse(soap(`
-    <tev:GetServiceCapabilitiesResponse><tev:Capabilities
-      MaxNotificationProducers="${NBSP}+1${NBSP}" MaxPullPoints=" \t+2\r\n"
-      MaxEventBrokers="\n3\t"/>
-    </tev:GetServiceCapabilitiesResponse>
-  `)), {
-    maxPullPoints: 2,
-    maxEventBrokers: 3,
-  });
-});
-
-test('accepts only XML whitespace around legacy boolean elements', () => {
-  const parsed = parseCapabilitiesResponse(soap(`
-    <tds:GetCapabilitiesResponse><tds:Capabilities><tt:Events>
-      <tt:XAddr>http://camera/events</tt:XAddr>
-      <tt:WSSubscriptionPolicySupport>${NBSP}true${NBSP}</tt:WSSubscriptionPolicySupport>
-      <tt:WSPullPointSupport> \ttrue\r\n</tt:WSPullPointSupport>
-    </tt:Events></tds:Capabilities></tds:GetCapabilitiesResponse>
-  `));
-
-  assert.deepEqual(parsed.eventServiceCapabilities, {
-    wsPullPointSupport: true,
-  });
-});
-
-test('extracts only marked arbitrary-depth WS-Topics nodes with local-name paths', () => {
-  assert.deepEqual(parseEventPropertiesResponse(soap(`
-    <tev:GetEventPropertiesResponse><wstop:TopicSet>
-      <tns:Device wstop:topic="true"><tns:Trigger><vendor:Motion wstop:topic="1">
-        <tt:MessageDescription><tt:Source><tt:SimpleItemDescription Name="Token"/></tt:Source>
-          <tt:Data><tt:SimpleItemDescription Name="State"/></tt:Data></tt:MessageDescription>
-      </vendor:Motion></tns:Trigger></tns:Device>
-      <vendor:Deep><vendor:Branch><vendor:Leaf wstop:topic="true"/></vendor:Branch></vendor:Deep>
-      <tns:Ignored topic="true"><tns:Child/></tns:Ignored>
-    </wstop:TopicSet></tev:GetEventPropertiesResponse>
-  `)), [
-    { namespace: 'urn:vendor', path: 'Deep/Branch/Leaf' },
-    { namespace: TOPICS_NS, path: 'Device' },
-    { namespace: 'urn:vendor', path: 'Device/Trigger/Motion' },
-  ]);
-  assert.throws(
-    () => parseEventPropertiesResponse(soap('<tev:GetEventPropertiesResponse/>')),
-    /invalid Events GetEventProperties response/,
-  );
-});
-
-test('uses only the directly associated TopicSet and ignores nested decoys', () => {
-  assert.deepEqual(parseEventPropertiesResponse(soap(`
-    <tev:GetEventPropertiesResponse>
-      <vendor:Wrapper><wstop:TopicSet>
-        <vendor:Decoy wstop:topic="true"/>
-      </wstop:TopicSet></vendor:Wrapper>
-      <wstop:TopicSet><tns:Real wstop:topic="true"/></wstop:TopicSet>
-    </tev:GetEventPropertiesResponse>
-  `)), [
-    { namespace: TOPICS_NS, path: 'Real' },
-  ]);
-  assert.throws(
-    () => parseEventPropertiesResponse(soap(`
-      <tev:GetEventPropertiesResponse><vendor:Wrapper>
-        <wstop:TopicSet><vendor:Decoy wstop:topic="true"/></wstop:TopicSet>
-      </vendor:Wrapper></tev:GetEventPropertiesResponse>
-    `)),
-    /invalid Events GetEventProperties response/,
-  );
-});
-
-test('walks TopicSet iteratively within the 64-element XML depth limit', () => {
-  const topicDepth = 60;
-  const withinLimit = parseEventPropertiesResponse(soap(
-    '<tev:GetEventPropertiesResponse><wstop:TopicSet>'
-    + '<tns:L>'.repeat(topicDepth - 1)
-    + '<vendor:Leaf wstop:topic="true"/>'
-    + '</tns:L>'.repeat(topicDepth - 1)
-    + '</wstop:TopicSet></tev:GetEventPropertiesResponse>',
-  ));
-
-  assert.equal(withinLimit.length, 1);
-  assert.equal(withinLimit[0].namespace, 'urn:vendor');
-  assert.equal(withinLimit[0].path.split('/').length, topicDepth);
-  assert.throws(
-    () => parseEventPropertiesResponse(soap(
-      '<tev:GetEventPropertiesResponse><wstop:TopicSet>'
-      + '<tns:L>'.repeat(topicDepth)
-      + '<vendor:Leaf wstop:topic="true"/>'
-      + '</tns:L>'.repeat(topicDepth)
-      + '</wstop:TopicSet></tev:GetEventPropertiesResponse>',
-    )),
-    { name: 'Error', message: 'invalid XML document' },
-  );
-});
-
-test('retains at most 1024 unique Event topics while allowing a duplicate at the limit', () => {
-  const atLimit = Array.from(
-    { length: 1_024 },
-    (_, index) => `<vendor:T${String(index).padStart(4, '0')} wstop:topic="true"/>`,
-  ).join('');
-  const duplicateAtLimit = `${atLimit}<vendor:T0000 wstop:topic="true"/>`;
-
-  assert.equal(parseEventPropertiesResponse(soap(
-    `<tev:GetEventPropertiesResponse><wstop:TopicSet>${duplicateAtLimit}`
-    + '</wstop:TopicSet></tev:GetEventPropertiesResponse>',
-  )).length, 1_024);
-  assert.throws(
-    () => parseEventPropertiesResponse(soap(
-      `<tev:GetEventPropertiesResponse><wstop:TopicSet>${duplicateAtLimit}`
-      + '<vendor:T1024 wstop:topic="true"/>'
-      + '</wstop:TopicSet></tev:GetEventPropertiesResponse>',
-    )),
-    /invalid Events GetEventProperties response/,
-  );
-});
-
-test('enforces the 4096-byte retained Event topic path limit only for marked nodes', () => {
-  const maximumPath = `T${'x'.repeat(4_095)}`;
-  const oversizedPath = `T${'x'.repeat(4_096)}`;
-  assert.equal(Buffer.byteLength(maximumPath), 4_096);
-  assert.equal(Buffer.byteLength(oversizedPath), 4_097);
-
-  const parsed = parseEventPropertiesResponse(soap(
-    '<tev:GetEventPropertiesResponse><wstop:TopicSet>'
-    + `<vendor:${maximumPath} wstop:topic="true"/>`
-    + `<vendor:${oversizedPath}/>`
-    + '</wstop:TopicSet></tev:GetEventPropertiesResponse>',
-  ));
-  assert.equal(Buffer.byteLength(parsed[0].path), 4_096);
-  assert.throws(
-    () => parseEventPropertiesResponse(soap(
-      '<tev:GetEventPropertiesResponse><wstop:TopicSet>'
-      + `<vendor:${oversizedPath} wstop:topic="true"/>`
-      + '</wstop:TopicSet></tev:GetEventPropertiesResponse>',
-    )),
-    /invalid Events GetEventProperties response/,
-  );
-});
-
-test('enforces the 2048-byte retained Event topic namespace limit', () => {
-  const maximumNamespace = `urn:${'n'.repeat(2_044)}`;
-  const oversizedNamespace = `urn:${'n'.repeat(2_045)}`;
-  assert.equal(Buffer.byteLength(maximumNamespace), 2_048);
-  assert.equal(Buffer.byteLength(oversizedNamespace), 2_049);
-
-  const parsed = parseEventPropertiesResponse(soap(
-    '<tev:GetEventPropertiesResponse><wstop:TopicSet>'
-    + `<maximum:Topic xmlns:maximum="${maximumNamespace}" wstop:topic="true"/>`
-    + '</wstop:TopicSet></tev:GetEventPropertiesResponse>',
-  ));
-  assert.equal(Buffer.byteLength(parsed[0].namespace ?? ''), 2_048);
-  assert.throws(
-    () => parseEventPropertiesResponse(soap(
-      '<tev:GetEventPropertiesResponse><wstop:TopicSet>'
-      + `<oversized:Topic xmlns:oversized="${oversizedNamespace}" wstop:topic="true"/>`
-      + '</wstop:TopicSet></tev:GetEventPropertiesResponse>',
-    )),
-    /invalid Events GetEventProperties response/,
-  );
-});
-
-test('enforces the 256 KiB aggregate Event topic retention budget after deduplication', () => {
-  const topics = (lastPathBytes: number) => Array.from({ length: 64 }, (_, index) => {
-    const wantedLength = index === 63 ? lastPathBytes : 4_086;
-    const prefix = `T${String(index).padStart(2, '0')}`;
-    const name = prefix + 'x'.repeat(wantedLength - prefix.length);
-    return `<vendor:${name} wstop:topic="true"/>`;
-  }).join('');
-  const firstName = `T00${'x'.repeat(4_083)}`;
-  const exactlyAtLimit = topics(4_086) + `<vendor:${firstName} wstop:topic="true"/>`;
-
-  const parsed = parseEventPropertiesResponse(soap(
-    `<tev:GetEventPropertiesResponse><wstop:TopicSet>${exactlyAtLimit}`
-    + '</wstop:TopicSet></tev:GetEventPropertiesResponse>',
-  ));
-  assert.equal(parsed.length, 64);
-  assert.equal(
-    parsed.reduce((bytes, topic) =>
-      bytes + Buffer.byteLength(topic.path) + Buffer.byteLength(topic.namespace ?? ''), 0),
-    256 * 1_024,
-  );
-  assert.throws(
-    () => parseEventPropertiesResponse(soap(
-      `<tev:GetEventPropertiesResponse><wstop:TopicSet>${topics(4_087)}`
-      + '</wstop:TopicSet></tev:GetEventPropertiesResponse>',
-    )),
-    /invalid Events GetEventProperties response/,
-  );
-});
-
 test('deduplicates repeated Media2 option encodings from children and compatible attributes', () => {
   assert.deepEqual(parseMedia2OptionsResponse(soap(`
     <tr2:GetVideoEncoderConfigurationOptionsResponse>
@@ -979,7 +680,6 @@ test('orchestrates exact authenticated bodies and routes advertised services det
     if (body === GET_SERVICES) {
       return response(`<tds:GetServicesResponse>${service(MEDIA1_NS, 'http://camera/media1', 2, 0)}`
         + service(PTZ_NS, 'http://camera/ptz', 2, 0)
-        + service(EVENTS_NS, 'http://camera/events', 2, 0)
         + service(MEDIA2_NS, 'http://camera/media2', 2, 0)
         + '</tds:GetServicesResponse>');
     }
@@ -995,12 +695,6 @@ test('orchestrates exact authenticated bodies and routes advertised services det
       return response(`<tptz:GetNodesResponse><tptz:PTZNode token="node-1"><tt:SupportedPTZSpaces>`
         + '<tt:AbsolutePanTiltPositionSpace/><tt:AbsoluteZoomPositionSpace/>'
         + '</tt:SupportedPTZSpaces></tptz:PTZNode></tptz:GetNodesResponse>');
-    }
-    if (body === EVENTS_GET_CAPABILITIES && endpoint === 'http://camera/events') {
-      return response('<tev:GetServiceCapabilitiesResponse><tev:Capabilities WSPullPointSupport="true"/></tev:GetServiceCapabilitiesResponse>');
-    }
-    if (body === EVENTS_GET_PROPERTIES && endpoint === 'http://camera/events') {
-      return response('<tev:GetEventPropertiesResponse><wstop:TopicSet><tns:Motion wstop:topic="true"/></wstop:TopicSet></tev:GetEventPropertiesResponse>');
     }
     if (body === MEDIA2_GET_PROFILES && endpoint === 'http://camera/media2') {
       return response('<tr2:GetProfilesResponse><tr2:Profiles token="modern"><tr2:Configurations><tr2:PTZ token="ptz-modern"/></tr2:Configurations></tr2:Profiles></tr2:GetProfilesResponse>');
@@ -1037,8 +731,6 @@ test('orchestrates exact authenticated bodies and routes advertised services det
     { body: MEDIA1_GET_PROFILES, endpoint: 'http://camera/media1' },
     { body: PTZ_GET_CAPABILITIES, endpoint: 'http://camera/ptz' },
     { body: PTZ_GET_NODES, endpoint: 'http://camera/ptz' },
-    { body: EVENTS_GET_CAPABILITIES, endpoint: 'http://camera/events' },
-    { body: EVENTS_GET_PROPERTIES, endpoint: 'http://camera/events' },
     { body: MEDIA2_GET_PROFILES, endpoint: 'http://camera/media2' },
     { body: MEDIA2_GET_OPTIONS, endpoint: 'http://camera/media2' },
   ]);
@@ -1054,9 +746,6 @@ test('orchestrates exact authenticated bodies and routes advertised services det
   assert.equal(report.ptz.panTiltSupported, true);
   assert.equal(report.ptz.zoomSupported, true);
   assert.equal(report.ptz.serviceCapabilities?.eFlip, true);
-  assert.equal(report.events.detected, true);
-  assert.equal(report.events.serviceCapabilities?.wsPullPointSupport, true);
-  assert.deepEqual(report.events.topics, [{ namespace: TOPICS_NS, path: 'Motion' }]);
   assert.equal(report.media2.detected, true);
   assert.deepEqual(report.media2.encodings, ['H264', 'H265']);
   assert.equal(report.media2.h265Supported, true);
@@ -1143,7 +832,6 @@ test('keeps Media2 unknown after falling back to legacy GetCapabilities All', as
     assert.equal(report.ptz.detected, false);
     assert.equal(report.ptz.panTiltSupported, null);
     assert.equal(report.ptz.zoomSupported, null);
-    assert.equal(report.events.detected, false);
     assert.equal(report.media2.detected, null);
     assert.equal(report.media2.h265Supported, null);
   }
@@ -1303,7 +991,6 @@ test('keeps Media1 available when discovery fails and sanitizes optional warning
   assert.deepEqual(report.profiles.map((profile) => profile.token), ['fallback']);
   assert.equal(report.ptz.detected, null);
   assert.equal(report.ptz.panTiltSupported, null);
-  assert.equal(report.events.detected, null);
   assert.equal(report.media2.detected, null);
   assert.equal(report.media2.h265Supported, null);
   assert.deepEqual(report.warnings.map(({ operation }) => operation), [
@@ -1316,14 +1003,13 @@ test('keeps Media1 available when discovery fails and sanitizes optional warning
   );
 });
 
-test('continues with Media2 when Media1 and optional PTZ or Event enrichment fail', async () => {
+test('continues with Media2 when Media1 and optional PTZ enrichment fail', async () => {
   const calls: RecordedCapabilityCall[] = [];
   const dependencies = fakeCapabilityDependencies(calls, async (body, endpoint) => {
     if (body === GET_SCOPES) return response('<tds:GetScopesResponse/>');
     if (body === GET_SERVICES) {
       return response(`<tds:GetServicesResponse>${service(MEDIA1_NS, 'http://camera/media1')}`
         + service(PTZ_NS, 'http://camera/ptz')
-        + service(EVENTS_NS, 'http://camera/events')
         + service(MEDIA2_NS, 'http://camera/media2')
         + '</tds:GetServicesResponse>');
     }
@@ -1334,10 +1020,6 @@ test('continues with Media2 when Media1 and optional PTZ or Event enrichment fai
       return response('<tptz:GetServiceCapabilitiesResponse><tptz:Capabilities Reverse="1"/></tptz:GetServiceCapabilitiesResponse>');
     }
     if (body === PTZ_GET_NODES) throw new Error('request timeout');
-    if (body === EVENTS_GET_CAPABILITIES) throw new Error('HTTP 500');
-    if (body === EVENTS_GET_PROPERTIES) {
-      return response('<tev:GetEventPropertiesResponse><wstop:TopicSet/></tev:GetEventPropertiesResponse>');
-    }
     if (body === MEDIA2_GET_PROFILES && endpoint === 'http://camera/media2') {
       return response('<tr2:GetProfilesResponse><tr2:Profiles token="media2-only"><tr2:Configurations><tr2:AudioEncoder/></tr2:Configurations></tr2:Profiles></tr2:GetProfilesResponse>');
     }
@@ -1360,55 +1042,13 @@ test('continues with Media2 when Media1 and optional PTZ or Event enrichment fai
   assert.equal(report.ptz.zoomSupported, null);
   assert.deepEqual(report.ptz.nodes, []);
   assert.equal(report.ptz.serviceCapabilities?.reverse, true);
-  assert.equal(report.events.detected, true);
   assert.equal(report.media2.detected, true);
   assert.deepEqual(report.media2.encodings, ['H264']);
   assert.equal(report.media2.h265Supported, false);
   assert.deepEqual(report.warnings.map(({ operation }) => operation), [
-    'Media1 GetProfiles', 'PTZ GetNodes', 'Events GetServiceCapabilities',
+    'Media1 GetProfiles', 'PTZ GetNodes',
   ]);
   assert.doesNotMatch(JSON.stringify(report.warnings), /operator|camera-pass|@camera/i);
-});
-
-test('keeps Events detected but topics unknown with one warning when topic budgets are exceeded', async () => {
-  const calls: RecordedCapabilityCall[] = [];
-  const oversizedTopics = Array.from(
-    { length: 1_025 },
-    (_, index) => `<vendor:T${String(index).padStart(4, '0')} wstop:topic="true"/>`,
-  ).join('');
-  const dependencies = fakeCapabilityDependencies(calls, async (body, endpoint) => {
-    if (body === GET_SCOPES) return response('<tds:GetScopesResponse/>');
-    if (body === GET_SERVICES) {
-      return response(
-        `<tds:GetServicesResponse>${service(EVENTS_NS, 'http://camera/events')}`
-        + '</tds:GetServicesResponse>',
-      );
-    }
-    if (body === MEDIA1_GET_PROFILES && endpoint === 'http://camera/connected-media') {
-      return response('<trt:GetProfilesResponse/>');
-    }
-    if (body === EVENTS_GET_CAPABILITIES && endpoint === 'http://camera/events') {
-      return response(
-        '<tev:GetServiceCapabilitiesResponse><tev:Capabilities/></tev:GetServiceCapabilitiesResponse>',
-      );
-    }
-    if (body === EVENTS_GET_PROPERTIES && endpoint === 'http://camera/events') {
-      return response(
-        `<tev:GetEventPropertiesResponse><wstop:TopicSet>${oversizedTopics}`
-        + '</wstop:TopicSet></tev:GetEventPropertiesResponse>',
-      );
-    }
-    throw new Error(`unexpected fake operation: ${body} at ${endpoint}`);
-  });
-
-  const report = await getCameraCapabilitiesWithDependencies({ host: 'camera' }, dependencies);
-
-  assert.equal(report.events.detected, true);
-  assert.deepEqual(report.events.topics, []);
-  assert.deepEqual(report.warnings, [{
-    operation: 'Events GetEventProperties',
-    message: 'invalid Events GetEventProperties response',
-  }]);
 });
 
 test('retains cross-host advertised XAddr facts but warns without contacting their server', async () => {
@@ -1495,8 +1135,6 @@ test('retains cross-host advertised XAddr facts but warns without contacting the
       'Media1 GetProfiles',
       'PTZ GetServiceCapabilities',
       'PTZ GetNodes',
-      'Events GetServiceCapabilities',
-      'Events GetEventProperties',
       'Media2 GetProfiles',
       'Media2 GetVideoEncoderConfigurationOptions',
     ]);
@@ -1534,8 +1172,6 @@ test('capability report matches shared cross-language fixture', async () => {
     'Media1GetProfiles',
     'PtzGetServiceCapabilities',
     'PtzGetNodes',
-    'EventsGetServiceCapabilities',
-    'EventsGetEventProperties',
     'Media2GetProfiles',
     'Media2GetVideoEncoderConfigurationOptions',
   ];
@@ -1561,19 +1197,15 @@ test('capability report matches shared cross-language fixture', async () => {
                 ? 'GetServices'
                 : body.includes('GetVideoEncoderConfigurationOptions')
                   ? 'Media2GetVideoEncoderConfigurationOptions'
-                  : body.includes('GetEventProperties')
-                    ? 'EventsGetEventProperties'
-                    : body.includes('GetNodes')
-                      ? 'PtzGetNodes'
-                      : body.includes('GetProfiles') && path.endsWith('/media1')
-                        ? 'Media1GetProfiles'
-                        : body.includes('GetProfiles') && path.endsWith('/media2')
-                          ? 'Media2GetProfiles'
-                          : body.includes('GetServiceCapabilities') && path.endsWith('/ptz')
-                            ? 'PtzGetServiceCapabilities'
-                            : body.includes('GetServiceCapabilities') && path.endsWith('/events')
-                              ? 'EventsGetServiceCapabilities'
-                              : undefined;
+                  : body.includes('GetNodes')
+                    ? 'PtzGetNodes'
+                    : body.includes('GetProfiles') && path.endsWith('/media1')
+                      ? 'Media1GetProfiles'
+                      : body.includes('GetProfiles') && path.endsWith('/media2')
+                        ? 'Media2GetProfiles'
+                        : body.includes('GetServiceCapabilities') && path.endsWith('/ptz')
+                          ? 'PtzGetServiceCapabilities'
+                          : undefined;
 
       response.setHeader('Connection', 'close');
       response.setHeader('Content-Type', 'application/soap+xml');

@@ -191,7 +191,7 @@ get_camera_capabilities(
 ```
 
 이 읽기 전용 API는 장치 식별 정보, scope, 광고된 서비스, Media profile, PTZ 사실,
-event topic, Media2 encoder 근거를 하나의 보고서로 수집합니다. 패키지 root에서
+Media2 encoder 근거를 하나의 보고서로 수집합니다. 패키지 root에서
 `CameraCapabilityReport`, `CameraCapabilityVersion` 및 중첩 보고서 dataclass를
 공개하므로 타입이 있는 결과로 확인할 수 있습니다.
 
@@ -233,23 +233,35 @@ print(report.declared_profiles, report.media2.h265_supported)
     "onvif://www.onvif.org/Profile/Streaming",
     "onvif://www.onvif.org/Profile/T"
   ],
-  "declaredProfiles": ["S", "T"],
+  "declaredProfiles": [
+    "S",
+    "T"
+  ],
   "serviceDiscovery": "getServices",
   "services": [
     {
       "namespace": "http://www.onvif.org/ver10/media/wsdl",
       "xaddr": "http://camera.local/onvif/media1",
-      "version": { "major": 1, "minor": 0 }
+      "version": {
+        "major": 1,
+        "minor": 0
+      }
     },
     {
       "namespace": "http://www.onvif.org/ver20/media/wsdl",
       "xaddr": "http://camera.local/onvif/media2",
-      "version": { "major": 2, "minor": 0 }
+      "version": {
+        "major": 2,
+        "minor": 0
+      }
     },
     {
       "namespace": "http://www.onvif.org/ver20/ptz/wsdl",
       "xaddr": "http://camera.local/onvif/ptz",
-      "version": { "major": 2, "minor": 2 }
+      "version": {
+        "major": 2,
+        "minor": 2
+      }
     }
   ],
   "profiles": [
@@ -268,7 +280,9 @@ print(report.declared_profiles, report.media2.h265_supported)
     "detected": true,
     "panTiltSupported": true,
     "zoomSupported": true,
-    "profileTokens": ["shared"],
+    "profileTokens": [
+      "shared"
+    ],
     "serviceCapabilities": {
       "eFlip": true,
       "reverse": false,
@@ -290,7 +304,10 @@ print(report.declared_profiles, report.media2.h265_supported)
         },
         "maximumPresets": 4,
         "homeSupported": true,
-        "auxiliaryCommands": ["IrisClose", "IrisOpen"]
+        "auxiliaryCommands": [
+          "IrisClose",
+          "IrisOpen"
+        ]
       },
       {
         "token": "zoom-node",
@@ -309,16 +326,12 @@ print(report.declared_profiles, report.media2.h265_supported)
       }
     ]
   },
-  "events": {
-    "detected": true,
-    "serviceCapabilities": { "wsPullPointSupport": true },
-    "topics": [
-      { "namespace": "urn:onvif:topics:motion", "path": "Device/Tamper/Motion" }
-    ]
-  },
   "media2": {
     "detected": true,
-    "encodings": ["H264", "H265"],
+    "encodings": [
+      "H264",
+      "H265"
+    ],
     "h265Supported": true
   },
   "warnings": []
@@ -339,8 +352,6 @@ print(report.declared_profiles, report.media2.h265_supported)
   설명합니다. 광고된 PTZ 서비스, `profile_tokens`의 profile binding,
   `pan_tilt_supported`, `zoom_supported`, PTZ node의 실제 movement space는 서로 다른
   사실이며 어느 하나가 나머지를 보장하지 않습니다.
-- `events`는 Event 서비스 근거, 선택적인 서비스 기능, 표시된 WS-Topics path를
-  보고합니다.
 - `media2.detected`는 성공한 `GetServices` 응답이 Media2를 광고했는지만 나타냅니다.
   접근 가능 여부가 아니며 Media2 보강에 실패해도 `true`로 남을 수 있습니다. 기존
   fallback 또는 서비스 검색 실패에서는 `null`입니다. CLI의 `media2.encodings`와
@@ -357,7 +368,7 @@ JSON 표기를 출력합니다. 장치가 보고하지 않은 선택적인 JSON 
 생략합니다. Media2 광고와 성공한 H.265 보강은 유용한 Profile T 근거이지만 Profile T
 인증의 증명은 아닙니다.
 
-서비스 검색에 성공하면 선택적인 Media, PTZ, Events 보강 요청은 각각 일치하는 광고된
+서비스 검색에 성공하면 선택적인 Media, PTZ 보강 요청은 각각 일치하는 광고된
 서비스 XAddr로 routing됩니다. 반환된 서비스 URL은 WSSE 생성이나 네트워크 I/O 전에
 동일 출처 규칙으로 검증합니다. 스킴과 정규화한 호스트 이름은 선택된 Device 서비스와
 같아야 하며 port, path, query는 달라도 됩니다. 다른 출처의 XAddr도 `services`에는
@@ -365,10 +376,8 @@ JSON 표기를 출력합니다. 장치가 보고하지 않은 선택적인 JSON 
 연결 과정에서 반환된 Media XAddr에도 같은 규칙을 적용합니다.
 
 XML은 encoding-aware DTD/entity 차단을 유지하며 element 깊이는 최대 64단계입니다.
-Event 보존 예산은 고유 topic 1,024개, topic path당 UTF-8 4,096byte, namespace당 UTF-8
-2,048byte, 전체 256 KiB입니다. 예산을 넘으면 안전한 warning을 남기고 해당 선택 정보는
-unknown으로 유지합니다. SOAP fault는 `ActionNotSupported`를 포함한 고정 인증/프로토콜
-allowlist만 출력하며 알 수 없는 code는 항상 `SOAP Fault: Fault`로 정규화합니다.
+SOAP fault는 `ActionNotSupported`를 포함한 고정 인증/프로토콜 allowlist만 출력하며
+알 수 없는 code는 항상 `SOAP Fault: Fault`로 정규화합니다.
 
 `timeout`은 요청마다 적용되므로 여러 요청을 수행하는 보고서의 전체 시간은 한 timeout
 구간보다 길 수 있습니다.

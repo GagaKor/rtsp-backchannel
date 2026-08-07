@@ -169,7 +169,7 @@ RTSP URI를 반환합니다. 네트워크, 인증 및 프로토콜 오류는 Pro
 ### 카메라 기능 보고서
 
 `getCameraCapabilities`는 장치 식별 정보, scope, 광고된 서비스, Media profile,
-PTZ 사실, event topic, Media2 encoder 근거를 하나의 보고서로 수집합니다. 비밀번호는
+PTZ 사실, Media2 encoder 근거를 하나의 보고서로 수집합니다. 비밀번호는
 소스 코드에 넣지 말고 `ONVIF_PASSWORD`로 전달하십시오.
 
 ```typescript
@@ -212,23 +212,35 @@ scope에서 얻은 자기 보고일 뿐 독립적인 ONVIF 인증 결과가 아�
     "onvif://www.onvif.org/Profile/Streaming",
     "onvif://www.onvif.org/Profile/T"
   ],
-  "declaredProfiles": ["S", "T"],
+  "declaredProfiles": [
+    "S",
+    "T"
+  ],
   "serviceDiscovery": "getServices",
   "services": [
     {
       "namespace": "http://www.onvif.org/ver10/media/wsdl",
       "xaddr": "http://camera.local/onvif/media1",
-      "version": { "major": 1, "minor": 0 }
+      "version": {
+        "major": 1,
+        "minor": 0
+      }
     },
     {
       "namespace": "http://www.onvif.org/ver20/media/wsdl",
       "xaddr": "http://camera.local/onvif/media2",
-      "version": { "major": 2, "minor": 0 }
+      "version": {
+        "major": 2,
+        "minor": 0
+      }
     },
     {
       "namespace": "http://www.onvif.org/ver20/ptz/wsdl",
       "xaddr": "http://camera.local/onvif/ptz",
-      "version": { "major": 2, "minor": 2 }
+      "version": {
+        "major": 2,
+        "minor": 2
+      }
     }
   ],
   "profiles": [
@@ -247,7 +259,9 @@ scope에서 얻은 자기 보고일 뿐 독립적인 ONVIF 인증 결과가 아�
     "detected": true,
     "panTiltSupported": true,
     "zoomSupported": true,
-    "profileTokens": ["shared"],
+    "profileTokens": [
+      "shared"
+    ],
     "serviceCapabilities": {
       "eFlip": true,
       "reverse": false,
@@ -269,7 +283,10 @@ scope에서 얻은 자기 보고일 뿐 독립적인 ONVIF 인증 결과가 아�
         },
         "maximumPresets": 4,
         "homeSupported": true,
-        "auxiliaryCommands": ["IrisClose", "IrisOpen"]
+        "auxiliaryCommands": [
+          "IrisClose",
+          "IrisOpen"
+        ]
       },
       {
         "token": "zoom-node",
@@ -288,16 +305,12 @@ scope에서 얻은 자기 보고일 뿐 독립적인 ONVIF 인증 결과가 아�
       }
     ]
   },
-  "events": {
-    "detected": true,
-    "serviceCapabilities": { "wsPullPointSupport": true },
-    "topics": [
-      { "namespace": "urn:onvif:topics:motion", "path": "Device/Tamper/Motion" }
-    ]
-  },
   "media2": {
     "detected": true,
-    "encodings": ["H264", "H265"],
+    "encodings": [
+      "H264",
+      "H265"
+    ],
     "h265Supported": true
   },
   "warnings": []
@@ -318,8 +331,6 @@ scope에서 얻은 자기 보고일 뿐 독립적인 ONVIF 인증 결과가 아�
 - `ptz`에서는 광고된 PTZ 서비스(`detected`), profile과 PTZ의 연결
   (`profileTokens`), 실제 movement space(`panTiltSupported`, `zoomSupported`,
   `nodes`)를 서로 다른 사실로 취급합니다. 어느 하나가 나머지를 보장하지 않습니다.
-- `events`는 Event 서비스, 선택적인 서비스 기능, 표시된 WS-Topics path를
-  보고합니다.
 - `media2.detected`는 성공한 `GetServices` 응답이 Media2 서비스를 광고했는지만 나타냅니다.
   접근 가능 여부를 뜻하지 않으며 Media2 보강 요청이 실패해도 `true`로 유지될 수 있습니다.
   기존 `GetCapabilities` fallback 또는 서비스 검색 실패에서는 `null`입니다.
@@ -330,18 +341,17 @@ scope에서 얻은 자기 보고일 뿐 독립적인 ONVIF 인증 결과가 아�
   인증 실패는 치명적이며 Promise를 reject하므로 warning으로 바뀌지 않습니다.
 
 인증된 서비스 요청의 신뢰 기준은 선택된 Device Service URL입니다. 연결된 Media
-endpoint와 광고된 모든 Media1, Media2, PTZ, Event XAddr는 같은 scheme과 canonical
+endpoint와 광고된 모든 Media1, Media2, PTZ XAddr는 같은 scheme과 canonical
 hostname 또는 IP 주소를 사용해야 합니다. 포트, path, query string은 달라도 됩니다.
 카메라가 보고한 XAddr는 근거로 `services`에 그대로 남지만, 기준과 다른 endpoint에는
 WS-Security material과 network request를 모두 보내지 않습니다. 선택적 보강에서는
 generic warning을 추가하고 관련 근거를 비어 있거나 알 수 없는 상태로 남깁니다.
 
 ONVIF 응답 header는 64 KiB, 응답 body/XML 입력은 1 MiB로 제한하며 XML element
-깊이는 최대 64입니다. Event 보강은 고유 topic을 최대 1,024개 보존하고, UTF-8 기준
-path 4,096 byte, namespace 2,048 byte, path와 namespace 합계 256 KiB를 넘을 수
-없습니다. 선택적 보강이 이 예산을 넘으면 결과를 비어 있거나 알 수 없는 상태로 두고
-자격 증명에 안전한 warning을 추가합니다. SOAP Fault는 canonical 인증 및 protocol
-code만 노출하며 알 수 없는 카메라 code는 payload를 반영하지 않고 `Fault`가 됩니다.
+깊이는 최대 64입니다. 선택적 보강이 이 예산을 넘으면 결과를 비어 있거나 알 수 없는
+상태로 두고 자격 증명에 안전한 warning을 추가합니다. SOAP Fault는 canonical 인증
+및 protocol code만 노출하며 알 수 없는 카메라 code는 payload를 반영하지 않고
+`Fault`가 됩니다.
 
 3상 boolean에는 의도가 있습니다. `true`는 성공한 응답에서 해당 사실을 찾았다는
 뜻이고, `false`는 성공한 응답이 부재를 확인했다는 뜻이며, `null`은 사실을 확인할

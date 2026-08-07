@@ -12,8 +12,8 @@ pub mod capabilities;
 pub use capabilities::{
     CameraCapabilityOptions, CameraCapabilityProfile, CameraCapabilityReport,
     CameraCapabilityService, CameraCapabilityVersion, CameraCapabilityWarning,
-    EventCapabilityReport, EventServiceCapabilities, EventTopic, Media2CapabilityReport,
-    PtzCapabilityReport, PtzNode, PtzServiceCapabilities, PtzSpaces, get_camera_capabilities,
+    Media2CapabilityReport, PtzCapabilityReport, PtzNode, PtzServiceCapabilities, PtzSpaces,
+    get_camera_capabilities,
 };
 
 const DEVICE_NS: &str = "http://www.onvif.org/ver10/device/wsdl";

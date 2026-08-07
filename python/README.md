@@ -194,9 +194,9 @@ get_camera_capabilities(
 ```
 
 This read-only API collects device identity, scopes, advertised services,
-Media profiles, PTZ facts, event topics, and Media2 encoder evidence. The
-package root exports `CameraCapabilityReport`, `CameraCapabilityVersion`, and
-the other nested report dataclasses for typed inspection.
+Media profiles, PTZ facts, and Media2 encoder evidence. The package root
+exports `CameraCapabilityReport`, `CameraCapabilityVersion`, and the other
+nested report dataclasses for typed inspection.
 
 ```python
 import os
@@ -236,23 +236,35 @@ not an ONVIF certification.
     "onvif://www.onvif.org/Profile/Streaming",
     "onvif://www.onvif.org/Profile/T"
   ],
-  "declaredProfiles": ["S", "T"],
+  "declaredProfiles": [
+    "S",
+    "T"
+  ],
   "serviceDiscovery": "getServices",
   "services": [
     {
       "namespace": "http://www.onvif.org/ver10/media/wsdl",
       "xaddr": "http://camera.local/onvif/media1",
-      "version": { "major": 1, "minor": 0 }
+      "version": {
+        "major": 1,
+        "minor": 0
+      }
     },
     {
       "namespace": "http://www.onvif.org/ver20/media/wsdl",
       "xaddr": "http://camera.local/onvif/media2",
-      "version": { "major": 2, "minor": 0 }
+      "version": {
+        "major": 2,
+        "minor": 0
+      }
     },
     {
       "namespace": "http://www.onvif.org/ver20/ptz/wsdl",
       "xaddr": "http://camera.local/onvif/ptz",
-      "version": { "major": 2, "minor": 2 }
+      "version": {
+        "major": 2,
+        "minor": 2
+      }
     }
   ],
   "profiles": [
@@ -271,7 +283,9 @@ not an ONVIF certification.
     "detected": true,
     "panTiltSupported": true,
     "zoomSupported": true,
-    "profileTokens": ["shared"],
+    "profileTokens": [
+      "shared"
+    ],
     "serviceCapabilities": {
       "eFlip": true,
       "reverse": false,
@@ -293,7 +307,10 @@ not an ONVIF certification.
         },
         "maximumPresets": 4,
         "homeSupported": true,
-        "auxiliaryCommands": ["IrisClose", "IrisOpen"]
+        "auxiliaryCommands": [
+          "IrisClose",
+          "IrisOpen"
+        ]
       },
       {
         "token": "zoom-node",
@@ -312,16 +329,12 @@ not an ONVIF certification.
       }
     ]
   },
-  "events": {
-    "detected": true,
-    "serviceCapabilities": { "wsPullPointSupport": true },
-    "topics": [
-      { "namespace": "urn:onvif:topics:motion", "path": "Device/Tamper/Motion" }
-    ]
-  },
   "media2": {
     "detected": true,
-    "encodings": ["H264", "H265"],
+    "encodings": [
+      "H264",
+      "H265"
+    ],
     "h265Supported": true
   },
   "warnings": []
@@ -343,8 +356,6 @@ The report fields have these meanings:
   `profile_tokens`, and movement spaces represented by `pan_tilt_supported`,
   `zoom_supported`, and PTZ nodes are separate facts; one does not imply the
   others.
-- `events` contains Event-service evidence, optional service capabilities, and
-  marked WS-Topics paths.
 - `media2.detected` says only whether a successful `GetServices` response
   advertised Media2. It is not a reachability result and can remain `true`
   when Media2 enrichment fails. It is `null` after a legacy fallback or
@@ -365,8 +376,8 @@ object members are omitted when the device did not report them. A Media2
 advertisement and successful H.265 enrichment are useful Profile T evidence,
 not proof of Profile T certification.
 
-Successful service discovery routes each optional Media, PTZ, and Events
-enrichment request to the matching advertised service XAddr. Returned service
+Successful service discovery routes each optional Media and PTZ enrichment
+request to the matching advertised service XAddr. Returned service
 URLs are subject to a same-origin rule before WSSE generation or network I/O:
 their scheme and canonical hostname must match the selected Device service;
 ports, paths, and queries may differ. A cross-origin XAddr remains in
@@ -374,12 +385,9 @@ ports, paths, and queries may differ. A cross-origin XAddr remains in
 warning. The connected Media XAddr is validated by the same rule.
 
 XML keeps the encoding-aware DTD/entity rejection and permits at most 64
-element levels. Event retention allows at most 1,024 unique topics, 4,096 UTF-8
-bytes per topic path, 2,048 UTF-8 bytes per namespace, and 256 KiB in aggregate.
-An exceeded budget becomes a sanitized warning and leaves that optional fact
-unknown. SOAP fault output uses a fixed authentication/protocol allowlist,
-including `ActionNotSupported`; every unknown code is reported only as
-`SOAP Fault: Fault`.
+element levels. SOAP fault output uses a fixed authentication/protocol
+allowlist, including `ActionNotSupported`; every unknown code is reported
+only as `SOAP Fault: Fault`.
 
 `timeout` applies per request; because one report performs multiple requests,
 its total elapsed time can exceed one timeout interval.

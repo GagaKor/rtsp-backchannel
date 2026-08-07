@@ -8,6 +8,17 @@
 
 **Tech Stack:** Node.js 22 + TypeScript + `saxes`, Python 3.11+ standard-library `ElementTree`, Rust 1.86+ + existing `roxmltree`/`reqwest`, SOAP 1.2, ONVIF Device/Media/Media2/PTZ/Events services.
 
+> **Scope change (2026-08-07), after this plan was executed:** the project owner
+> decided that reporting which events a camera supports is out of scope. Event
+> reporting was removed from all three implementations after the fact — the
+> `events` report member, the `GetServiceCapabilities`/`GetEventProperties`
+> requests against the Events service, the topic-set walk, and the event-only
+> retention budgets (1,024 topics, 4,096-byte path, 2,048-byte namespace,
+> 256 KiB aggregate) are all gone. Every mention of events below therefore
+> describes what was built, not what ships. The Events service is still listed
+> in the generic `services` inventory, because that is service discovery rather
+> than event reporting. Everything else in this plan still holds.
+
 ---
 
 ## Public contract

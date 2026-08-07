@@ -25,12 +25,6 @@ _MEDIA1_NS = "http://www.onvif.org/ver10/media/wsdl"
 _MEDIA2_NS = "http://www.onvif.org/ver20/media/wsdl"
 _PTZ_NS = "http://www.onvif.org/ver20/ptz/wsdl"
 _EVENTS_NS = "http://www.onvif.org/ver10/events/wsdl"
-_WSTOP_NS = "http://docs.oasis-open.org/wsn/t-1"
-
-_MAX_EVENT_TOPICS = 1024
-_MAX_EVENT_TOPIC_PATH_BYTES = 4096
-_MAX_EVENT_TOPIC_NAMESPACE_BYTES = 2048
-_MAX_EVENT_TOPIC_RETAINED_BYTES = 256 * 1024
 
 _AUTH_FAULT_PATTERNS = (
     (
@@ -69,10 +63,6 @@ _MEDIA2_GET_OPTIONS = (
 )
 _PTZ_GET_CAPABILITIES = f'<GetServiceCapabilities xmlns="{_PTZ_NS}"/>'
 _PTZ_GET_NODES = f'<GetNodes xmlns="{_PTZ_NS}"/>'
-_EVENTS_GET_CAPABILITIES = (
-    f'<GetServiceCapabilities xmlns="{_EVENTS_NS}"/>'
-)
-_EVENTS_GET_PROPERTIES = f'<GetEventProperties xmlns="{_EVENTS_NS}"/>'
 
 _LEGACY_SERVICES = {
     "Analytics": "http://www.onvif.org/ver20/analytics/wsdl",
@@ -161,31 +151,6 @@ class PtzCapabilityReport:
 
 
 @dataclass(frozen=True)
-class EventServiceCapabilities:
-    ws_subscription_policy_support: bool | None = None
-    ws_pull_point_support: bool | None = None
-    ws_pausable_subscription_manager_interface_support: bool | None = None
-    persistent_notification_storage: bool | None = None
-    max_notification_producers: int | None = None
-    max_pull_points: int | None = None
-    event_broker_protocols: tuple[str, ...] | None = None
-    max_event_brokers: int | None = None
-
-
-@dataclass(frozen=True)
-class EventTopic:
-    namespace: str | None
-    path: str
-
-
-@dataclass(frozen=True)
-class EventCapabilityReport:
-    detected: bool | None
-    service_capabilities: EventServiceCapabilities | None
-    topics: tuple[EventTopic, ...]
-
-
-@dataclass(frozen=True)
 class Media2CapabilityReport:
     detected: bool | None
     encodings: tuple[str, ...]
@@ -203,7 +168,6 @@ class CameraCapabilityReport:
     services: tuple[CameraCapabilityService, ...]
     profiles: tuple[CameraCapabilityProfile, ...]
     ptz: PtzCapabilityReport
-    events: EventCapabilityReport
     media2: Media2CapabilityReport
     warnings: tuple[CameraCapabilityWarning, ...]
 
@@ -217,7 +181,6 @@ class _ScopesResult:
 @dataclass(frozen=True)
 class _ServicesResult:
     services: tuple[CameraCapabilityService, ...]
-    event_service_capabilities: EventServiceCapabilities | None = None
 
 
 @dataclass(frozen=True)
@@ -477,54 +440,11 @@ def _select_service(
     )
 
 
-def _event_capabilities_from_element(
-    element: ElementTree.Element,
-) -> EventServiceCapabilities:
-    return EventServiceCapabilities(
-        ws_subscription_policy_support=_strict_bool(
-            element.attrib.get("WSSubscriptionPolicySupport")
-        ),
-        ws_pull_point_support=_strict_bool(
-            element.attrib.get("WSPullPointSupport")
-        ),
-        ws_pausable_subscription_manager_interface_support=_strict_bool(
-            element.attrib.get(
-                "WSPausableSubscriptionManagerInterfaceSupport"
-            )
-        ),
-        persistent_notification_storage=_strict_bool(
-            element.attrib.get("PersistentNotificationStorage")
-        ),
-        max_notification_producers=_strict_nonnegative_int32(
-            element.attrib.get("MaxNotificationProducers")
-        ),
-        max_pull_points=_strict_nonnegative_int32(
-            element.attrib.get("MaxPullPoints")
-        ),
-        max_event_brokers=_strict_nonnegative_int32(
-            element.attrib.get("MaxEventBrokers")
-        ),
-        event_broker_protocols=_parse_protocols(
-            element.attrib.get("EventBrokerProtocols")
-        ),
-    )
-
-
-def _parse_protocols(value: str | None) -> tuple[str, ...] | None:
-    normalized = _xml_scalar(value)
-    if not normalized:
-        return None
-    return tuple(sorted(set(normalized.split(" "))))
-
-
 def _parse_services_response(xml: bytes | str) -> _ServicesResult:
     response = _soap_operation(
         xml, _DEVICE_NS, "GetServicesResponse", "GetServices"
     )
     services: list[CameraCapabilityService] = []
-    embedded: dict[
-        tuple[str, str, CameraCapabilityVersion | None], EventServiceCapabilities
-    ] = {}
     for element in _children(response, _DEVICE_NS, "Service"):
         namespace = _plain_text(_child(element, _DEVICE_NS, "Namespace"))
         xaddr = _plain_text(_child(element, _DEVICE_NS, "XAddr"))
@@ -532,49 +452,10 @@ def _parse_services_response(xml: bytes | str) -> _ServicesResult:
             raise _OnvifResponseError("invalid", "invalid GetServices response")
         service = CameraCapabilityService(namespace, xaddr, _version(element))
         services.append(service)
-        if namespace == _EVENTS_NS:
-            wrapper = _child(element, _DEVICE_NS, "Capabilities")
-            caps = (
-                _child(wrapper, _EVENTS_NS, "Capabilities")
-                if wrapper is not None
-                else None
-            )
-            if caps is not None:
-                embedded.setdefault(
-                    (service.namespace, service.xaddr, service.version),
-                    _event_capabilities_from_element(caps),
-                )
     if not services:
         raise _OnvifResponseError("invalid", "no services in GetServices response")
     ordered = tuple(sorted(services, key=_service_sort_key))
-    event = _select_service(ordered, _EVENTS_NS)
-    event_capabilities = (
-        embedded.get((event.namespace, event.xaddr, event.version))
-        if event is not None
-        else None
-    )
-    return _ServicesResult(ordered, event_capabilities)
-
-
-def _legacy_event_capabilities(
-    element: ElementTree.Element,
-) -> EventServiceCapabilities:
-    def child_bool(name: str) -> bool | None:
-        item = _child(element, _SCHEMA_NS, name)
-        return _strict_bool(item.text if item is not None else None)
-
-    return EventServiceCapabilities(
-        ws_subscription_policy_support=child_bool(
-            "WSSubscriptionPolicySupport"
-        ),
-        ws_pull_point_support=child_bool("WSPullPointSupport"),
-        ws_pausable_subscription_manager_interface_support=child_bool(
-            "WSPausableSubscriptionManagerInterfaceSupport"
-        ),
-        persistent_notification_storage=child_bool(
-            "PersistentNotificationStorage"
-        ),
-    )
+    return _ServicesResult(ordered)
 
 
 def _parse_capabilities_response(xml: bytes | str) -> _ServicesResult:
@@ -591,10 +472,6 @@ def _parse_capabilities_response(xml: bytes | str) -> _ServicesResult:
     if extension is not None:
         containers.append(extension)
     services: list[CameraCapabilityService] = []
-    event_capabilities_by_service: dict[
-        tuple[str, str, CameraCapabilityVersion | None],
-        EventServiceCapabilities,
-    ] = {}
     for container in containers:
         for item in list(container):
             namespace, local = _tag_parts(item.tag)
@@ -605,29 +482,12 @@ def _parse_capabilities_response(xml: bytes | str) -> _ServicesResult:
                 continue
             service = CameraCapabilityService(_LEGACY_SERVICES[local], xaddr)
             services.append(service)
-            if local == "Events":
-                event_capabilities_by_service.setdefault(
-                    (service.namespace, service.xaddr, service.version),
-                    _legacy_event_capabilities(item),
-                )
     if not services:
         raise _OnvifResponseError(
             "invalid", "no services in GetCapabilities response"
         )
     ordered = tuple(sorted(services, key=_service_sort_key))
-    event_service = _select_service(ordered, _EVENTS_NS)
-    event_capabilities = (
-        event_capabilities_by_service.get(
-            (
-                event_service.namespace,
-                event_service.xaddr,
-                event_service.version,
-            )
-        )
-        if event_service is not None
-        else None
-    )
-    return _ServicesResult(ordered, event_capabilities)
+    return _ServicesResult(ordered)
 
 
 def _required_token(element: ElementTree.Element, description: str) -> str:
@@ -821,109 +681,6 @@ def _parse_ptz_nodes_response(xml: bytes | str) -> _PtzNodesResult:
     return _PtzNodesResult(ordered, pan_tilt, zoom)
 
 
-def _parse_event_service_capabilities_response(
-    xml: bytes | str,
-) -> EventServiceCapabilities:
-    response = _soap_operation(
-        xml,
-        _EVENTS_NS,
-        "GetServiceCapabilitiesResponse",
-        "Events GetServiceCapabilities",
-    )
-    capabilities = _child(response, _EVENTS_NS, "Capabilities")
-    if capabilities is None:
-        raise _OnvifResponseError(
-            "invalid", "invalid Events GetServiceCapabilities response"
-        )
-    return _event_capabilities_from_element(capabilities)
-
-
-def _merge_event_service_capabilities(
-    legacy: EventServiceCapabilities | None,
-    current: EventServiceCapabilities | None,
-) -> EventServiceCapabilities | None:
-    if legacy is None:
-        return current
-    if current is None:
-        return legacy
-    values = {
-        field.name: (
-            getattr(current, field.name)
-            if getattr(current, field.name) is not None
-            else getattr(legacy, field.name)
-        )
-        for field in fields(EventServiceCapabilities)
-    }
-    return EventServiceCapabilities(**values)
-
-
-def _parse_event_properties_response(
-    xml: bytes | str,
-) -> tuple[EventTopic, ...]:
-    response = _soap_operation(
-        xml,
-        _EVENTS_NS,
-        "GetEventPropertiesResponse",
-        "Events GetEventProperties",
-    )
-    topic_set = _child(response, _WSTOP_NS, "TopicSet")
-    if topic_set is None:
-        raise _OnvifResponseError(
-            "invalid", "invalid Events GetEventProperties response"
-        )
-    topics: dict[tuple[str, str | None], EventTopic] = {}
-    retained_bytes = 0
-    path: list[str] = []
-    stack: list[tuple[ElementTree.Element, bool]] = [
-        (item, False) for item in reversed(list(topic_set))
-    ]
-    while stack:
-        element, exiting = stack.pop()
-        if exiting:
-            path.pop()
-            continue
-        namespace, local = _tag_parts(element.tag)
-        path.append(local)
-        if _strict_bool(element.attrib.get(f"{{{_WSTOP_NS}}}topic")) is True:
-            retained_path = "/".join(path)
-            retained_namespace = namespace or None
-            path_bytes = len(retained_path.encode("utf-8"))
-            namespace_bytes = len(namespace.encode("utf-8"))
-            if (
-                path_bytes > _MAX_EVENT_TOPIC_PATH_BYTES
-                or namespace_bytes > _MAX_EVENT_TOPIC_NAMESPACE_BYTES
-            ):
-                raise _OnvifResponseError(
-                    "invalid",
-                    "invalid Events GetEventProperties response",
-                )
-            key = (retained_path, retained_namespace)
-            if key not in topics:
-                topic_bytes = path_bytes + namespace_bytes
-                if (
-                    len(topics) >= _MAX_EVENT_TOPICS
-                    or retained_bytes + topic_bytes
-                    > _MAX_EVENT_TOPIC_RETAINED_BYTES
-                ):
-                    raise _OnvifResponseError(
-                        "invalid",
-                        "invalid Events GetEventProperties response",
-                    )
-                retained_bytes += topic_bytes
-                topics[key] = EventTopic(
-                    namespace=retained_namespace,
-                    path=retained_path,
-                )
-        stack.append((element, True))
-        stack.extend((item, False) for item in reversed(list(element)))
-    return tuple(
-        sorted(
-            topics.values(),
-            key=lambda topic: (topic.path, topic.namespace or ""),
-        )
-    )
-
-
 def _parse_media2_options_response(xml: bytes | str) -> tuple[str, ...]:
     response = _soap_operation(
         xml,
@@ -1078,14 +835,10 @@ def get_camera_capabilities(
 
     service_discovery = "unavailable"
     services: tuple[CameraCapabilityService, ...] = ()
-    discovered_event_capabilities: EventServiceCapabilities | None = None
     try:
         parsed_services = call(_GET_SERVICES, _parse_services_response)
         service_discovery = "getServices"
         services = parsed_services.services
-        discovered_event_capabilities = (
-            parsed_services.event_service_capabilities
-        )
     except _EXPECTED_OPERATION_ERRORS as get_services_error:
         warn("GetServices", get_services_error)
         try:
@@ -1094,9 +847,6 @@ def get_camera_capabilities(
             )
             service_discovery = "getCapabilities"
             services = parsed_services.services
-            discovered_event_capabilities = (
-                parsed_services.event_service_capabilities
-            )
         except _EXPECTED_OPERATION_ERRORS as get_capabilities_error:
             warn("GetCapabilities", get_capabilities_error)
 
@@ -1147,33 +897,6 @@ def get_camera_capabilities(
             zoom_supported = parsed_nodes.zoom_supported
         except _EXPECTED_OPERATION_ERRORS as error:
             warn("PTZ GetNodes", error)
-
-    event_service = _select_service(services, _EVENTS_NS)
-    events_detected = bool(event_service) if discovery_available else None
-    current_event_capabilities: EventServiceCapabilities | None = None
-    topics: tuple[EventTopic, ...] = ()
-    if event_service is not None:
-        try:
-            current_event_capabilities = call(
-                _EVENTS_GET_CAPABILITIES,
-                _parse_event_service_capabilities_response,
-                event_service.xaddr,
-            )
-        except _EXPECTED_OPERATION_ERRORS as error:
-            warn("Events GetServiceCapabilities", error)
-        try:
-            topics = call(
-                _EVENTS_GET_PROPERTIES,
-                _parse_event_properties_response,
-                event_service.xaddr,
-            )
-        except _EXPECTED_OPERATION_ERRORS as error:
-            warn("Events GetEventProperties", error)
-    event_service_capabilities = _merge_event_service_capabilities(
-        discovered_event_capabilities, current_event_capabilities
-    )
-    if not _has_reported_fields(event_service_capabilities):
-        event_service_capabilities = None
 
     media2_service = _select_service(services, _MEDIA2_NS)
     media2_detected = (
@@ -1229,11 +952,6 @@ def get_camera_capabilities(
             service_capabilities=ptz_service_capabilities,
             nodes=ptz_nodes,
         ),
-        events=EventCapabilityReport(
-            detected=events_detected,
-            service_capabilities=event_service_capabilities,
-            topics=topics,
-        ),
         media2=Media2CapabilityReport(
             detected=media2_detected,
             encodings=encodings,
@@ -1249,9 +967,6 @@ __all__ = [
     "CameraCapabilityService",
     "CameraCapabilityVersion",
     "CameraCapabilityWarning",
-    "EventCapabilityReport",
-    "EventServiceCapabilities",
-    "EventTopic",
     "Media2CapabilityReport",
     "PtzCapabilityReport",
     "PtzNode",

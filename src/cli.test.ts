@@ -779,7 +779,6 @@ test('invokes capabilities exactly once and logs the native report as one JSON l
       profileTokens: [],
       nodes: [],
     },
-    events: { detected: false, topics: [] },
     media2: { detected: true, encodings: ['H265'], h265Supported: true },
     warnings: [],
   };
@@ -831,7 +830,6 @@ test('applies capability credential defaults and omits absent optional client se
         detected: null, panTiltSupported: null, zoomSupported: null,
         profileTokens: [], nodes: [],
       },
-      events: { detected: null, topics: [] },
       media2: { detected: null, encodings: [], h265Supported: null },
       warnings: [],
     };

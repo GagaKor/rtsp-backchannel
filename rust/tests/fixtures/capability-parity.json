@@ -8,8 +8,6 @@
     "Media1GetProfiles": "<trt:GetProfilesResponse><trt:Profiles token=\"shared\"><tt:Name>Legacy Shared</tt:Name><tt:AudioEncoderConfiguration/><tt:AudioOutputConfiguration/><tt:PTZConfiguration token=\"ptz-config-m1\"><tt:NodeToken>zoom-node</tt:NodeToken></tt:PTZConfiguration></trt:Profiles></trt:GetProfilesResponse>",
     "PtzGetServiceCapabilities": "<tptz:GetServiceCapabilitiesResponse><tptz:Capabilities EFlip=\"true\" Reverse=\"false\" GetCompatibleConfigurations=\"true\" MoveStatus=\"false\" StatusPosition=\"true\"/></tptz:GetServiceCapabilitiesResponse>",
     "PtzGetNodes": "<tptz:GetNodesResponse><tptz:PTZNode token=\"zoom-node\"><tt:Name>Zoom only</tt:Name><tt:SupportedPTZSpaces><tt:AbsoluteZoomPositionSpace/></tt:SupportedPTZSpaces><tt:MaximumNumberOfPresets>2</tt:MaximumNumberOfPresets><tt:HomeSupported>false</tt:HomeSupported></tptz:PTZNode><tptz:PTZNode token=\"pan-node\"><tt:Name>Pan only</tt:Name><tt:SupportedPTZSpaces><tt:ContinuousPanTiltVelocitySpace/></tt:SupportedPTZSpaces><tt:MaximumNumberOfPresets>4</tt:MaximumNumberOfPresets><tt:HomeSupported>true</tt:HomeSupported><tt:AuxiliaryCommands>IrisOpen</tt:AuxiliaryCommands><tt:AuxiliaryCommands>IrisClose</tt:AuxiliaryCommands></tptz:PTZNode></tptz:GetNodesResponse>",
-    "EventsGetServiceCapabilities": "<tev:GetServiceCapabilitiesResponse><tev:Capabilities WSPullPointSupport=\"true\"/></tev:GetServiceCapabilitiesResponse>",
-    "EventsGetEventProperties": "<tev:GetEventPropertiesResponse><wstop:TopicSet xmlns:security=\"urn:onvif:topics:security\" xmlns:motion=\"urn:onvif:topics:motion\"><tns:Device><security:Tamper wstop:topic=\"true\"><motion:Motion wstop:topic=\"true\"/></security:Tamper></tns:Device></wstop:TopicSet></tev:GetEventPropertiesResponse>",
     "Media2GetProfiles": "<tr2:GetProfilesResponse><tr2:Profiles token=\"shared\"><tr2:Name>Modern Shared</tr2:Name><tr2:Configurations><tr2:AudioEncoder/><tr2:AudioSource/><tr2:PTZ token=\"ptz-config-m2\"><tt:NodeToken>pan-node</tt:NodeToken></tr2:PTZ></tr2:Configurations></tr2:Profiles></tr2:GetProfilesResponse>",
     "Media2GetVideoEncoderConfigurationOptions": "<tr2:GetVideoEncoderConfigurationOptionsResponse><tr2:Options><tt:Encoding>H265</tt:Encoding></tr2:Options><tr2:Options><tt:Encoding>H264</tt:Encoding></tr2:Options></tr2:GetVideoEncoderConfigurationOptionsResponse>"
   },
@@ -132,22 +130,6 @@
           "maximumPresets": 2,
           "homeSupported": false,
           "auxiliaryCommands": []
-        }
-      ]
-    },
-    "events": {
-      "detected": true,
-      "serviceCapabilities": {
-        "wsPullPointSupport": true
-      },
-      "topics": [
-        {
-          "namespace": "urn:onvif:topics:security",
-          "path": "Device/Tamper"
-        },
-        {
-          "namespace": "urn:onvif:topics:motion",
-          "path": "Device/Tamper/Motion"
         }
       ]
     },

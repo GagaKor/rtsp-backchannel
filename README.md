@@ -181,9 +181,8 @@ supported for compatibility; use a trusted network or VPN.
 ### Camera Capability Reports
 
 `getCameraCapabilities` collects the device identity, scopes, advertised
-services, Media profiles, PTZ facts, event topics, and Media2 encoder evidence
-in one report. Supply passwords through `ONVIF_PASSWORD` rather than source
-code:
+services, Media profiles, PTZ facts, and Media2 encoder evidence in one
+report. Supply passwords through `ONVIF_PASSWORD` rather than source code:
 
 ```typescript
 import {
@@ -227,23 +226,35 @@ not an ONVIF certification.
     "onvif://www.onvif.org/Profile/Streaming",
     "onvif://www.onvif.org/Profile/T"
   ],
-  "declaredProfiles": ["S", "T"],
+  "declaredProfiles": [
+    "S",
+    "T"
+  ],
   "serviceDiscovery": "getServices",
   "services": [
     {
       "namespace": "http://www.onvif.org/ver10/media/wsdl",
       "xaddr": "http://camera.local/onvif/media1",
-      "version": { "major": 1, "minor": 0 }
+      "version": {
+        "major": 1,
+        "minor": 0
+      }
     },
     {
       "namespace": "http://www.onvif.org/ver20/media/wsdl",
       "xaddr": "http://camera.local/onvif/media2",
-      "version": { "major": 2, "minor": 0 }
+      "version": {
+        "major": 2,
+        "minor": 0
+      }
     },
     {
       "namespace": "http://www.onvif.org/ver20/ptz/wsdl",
       "xaddr": "http://camera.local/onvif/ptz",
-      "version": { "major": 2, "minor": 2 }
+      "version": {
+        "major": 2,
+        "minor": 2
+      }
     }
   ],
   "profiles": [
@@ -262,7 +273,9 @@ not an ONVIF certification.
     "detected": true,
     "panTiltSupported": true,
     "zoomSupported": true,
-    "profileTokens": ["shared"],
+    "profileTokens": [
+      "shared"
+    ],
     "serviceCapabilities": {
       "eFlip": true,
       "reverse": false,
@@ -284,7 +297,10 @@ not an ONVIF certification.
         },
         "maximumPresets": 4,
         "homeSupported": true,
-        "auxiliaryCommands": ["IrisClose", "IrisOpen"]
+        "auxiliaryCommands": [
+          "IrisClose",
+          "IrisOpen"
+        ]
       },
       {
         "token": "zoom-node",
@@ -303,16 +319,12 @@ not an ONVIF certification.
       }
     ]
   },
-  "events": {
-    "detected": true,
-    "serviceCapabilities": { "wsPullPointSupport": true },
-    "topics": [
-      { "namespace": "urn:onvif:topics:motion", "path": "Device/Tamper/Motion" }
-    ]
-  },
   "media2": {
     "detected": true,
-    "encodings": ["H264", "H265"],
+    "encodings": [
+      "H264",
+      "H265"
+    ],
     "h265Supported": true
   },
   "warnings": []
@@ -334,8 +346,6 @@ The public report fields have these meanings:
   (`detected`), profile-to-PTZ bindings (`profileTokens`), and actual movement
   spaces (`panTiltSupported`, `zoomSupported`, and `nodes`). One does not imply
   the others.
-- `events` reports the Event service, optional service capabilities, and marked
-  WS-Topics paths.
 - `media2.detected` reports only whether a successful `GetServices` response advertised a Media2 service.
   It is not a reachability result and can remain `true` when Media2 enrichment
   requests fail. It is `null` after the legacy `GetCapabilities` fallback or
@@ -348,7 +358,7 @@ The public report fields have these meanings:
   promise instead of becoming warnings.
 
 Authenticated service routing is anchored to the selected Device Service URL.
-The connected Media endpoint and every advertised Media1, Media2, PTZ, or Event
+The connected Media endpoint and every advertised Media1, Media2, or PTZ
 XAddr must use the same scheme and canonical hostname or IP address. Ports,
 paths, and query strings may differ. Camera-reported XAddr values remain in
 `services` as evidence, but a mismatched endpoint receives neither WS-Security
@@ -356,12 +366,10 @@ material nor a network request; optional enrichment records a generic warning
 and leaves the corresponding evidence empty or unknown.
 
 ONVIF response headers are limited to 64 KiB and response bodies/XML input to
-1 MiB. Parsed XML is limited to 64 element levels. Event enrichment retains at
-most 1,024 unique topics, with a 4,096-byte UTF-8 path limit, a 2,048-byte
-namespace limit, and a 256 KiB aggregate path-plus-namespace budget. Exceeding
-an optional enrichment budget leaves its result empty/unknown and adds a
-credential-safe warning. SOAP faults expose only canonical authentication and
-protocol codes; unknown camera codes become `Fault` without payload reflection.
+1 MiB. Parsed XML is limited to 64 element levels. Exceeding an optional
+enrichment budget leaves its result empty/unknown and adds a credential-safe
+warning. SOAP faults expose only canonical authentication and protocol codes;
+unknown camera codes become `Fault` without payload reflection.
 
 Tri-state booleans are deliberate: `true` means a successful response found the
 fact, `false` means a successful response established its absence, and `null`

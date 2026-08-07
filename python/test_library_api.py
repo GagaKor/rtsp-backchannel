@@ -12,7 +12,6 @@ from unittest.mock import Mock, call, patch
 def _minimal_capability_report():
     from rtsp_backchannel.capabilities import (
         CameraCapabilityReport,
-        EventCapabilityReport,
         Media2CapabilityReport,
         PtzCapabilityReport,
     )
@@ -32,11 +31,6 @@ def _minimal_capability_report():
             profile_tokens=(),
             service_capabilities=None,
             nodes=(),
-        ),
-        events=EventCapabilityReport(
-            detected=None,
-            service_capabilities=None,
-            topics=(),
         ),
         media2=Media2CapabilityReport(
             detected=None,
@@ -85,9 +79,6 @@ class LibraryApiTests(unittest.TestCase):
             "PtzNode",
             "PtzServiceCapabilities",
             "PtzCapabilityReport",
-            "EventServiceCapabilities",
-            "EventTopic",
-            "EventCapabilityReport",
             "Media2CapabilityReport",
             "CameraCapabilityReport",
             "get_camera_capabilities",
@@ -988,9 +979,6 @@ class LibraryApiTests(unittest.TestCase):
             CameraCapabilityService,
             CameraCapabilityVersion,
             CameraCapabilityWarning,
-            EventCapabilityReport,
-            EventServiceCapabilities,
-            EventTopic,
             Media2CapabilityReport,
             PtzCapabilityReport,
             PtzNode,
@@ -1048,18 +1036,6 @@ class LibraryApiTests(unittest.TestCase):
                         home_supported=False,
                         auxiliary_commands=("LightOn",),
                     ),
-                ),
-            ),
-            events=EventCapabilityReport(
-                detected=True,
-                service_capabilities=EventServiceCapabilities(
-                    ws_pull_point_support=False,
-                    max_pull_points=0,
-                    event_broker_protocols=("mqtt", "mqtts"),
-                ),
-                topics=(
-                    EventTopic(namespace=None, path="Device/Motion"),
-                    EventTopic(namespace="urn:vendor", path="Tamper"),
                 ),
             ),
             media2=Media2CapabilityReport(
@@ -1172,18 +1148,6 @@ class LibraryApiTests(unittest.TestCase):
                         }
                     ],
                 },
-                "events": {
-                    "detected": True,
-                    "serviceCapabilities": {
-                        "wsPullPointSupport": False,
-                        "maxPullPoints": 0,
-                        "eventBrokerProtocols": ["mqtt", "mqtts"],
-                    },
-                    "topics": [
-                        {"path": "Device/Motion"},
-                        {"namespace": "urn:vendor", "path": "Tamper"},
-                    ],
-                },
                 "media2": {
                     "detected": None,
                     "encodings": ["H264"],
@@ -1219,7 +1183,6 @@ class LibraryApiTests(unittest.TestCase):
                     "profileTokens": [],
                     "nodes": [],
                 },
-                "events": {"detected": None, "topics": []},
                 "media2": {
                     "detected": None,
                     "encodings": [],
@@ -1577,10 +1540,7 @@ class LibraryApiTests(unittest.TestCase):
                 "--timeout-ms",
                 "XAddr",
                 "86,400,000",
-                "1,024",
                 "4,096",
-                "2,048",
-                "256 KiB",
             ):
                 self.assertIn(expected, readme)
             self.assertRegex(
@@ -1610,11 +1570,11 @@ class LibraryApiTests(unittest.TestCase):
         )
         self.assertRegex(
             english,
-            r"64[\s\S]{0,500}1,024[\s\S]{0,500}4,096[\s\S]{0,500}2,048[\s\S]{0,500}256 KiB",
+            r"permits at most 64\s+element levels",
         )
         self.assertRegex(
             korean,
-            r"64[\s\S]{0,500}1,024[\s\S]{0,500}4,096[\s\S]{0,500}2,048[\s\S]{0,500}256 KiB",
+            r"최대 64단계",
         )
         self.assertRegex(
             english,
