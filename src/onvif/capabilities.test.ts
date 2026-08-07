@@ -1236,6 +1236,46 @@ test('does not hide HTTP or SOAP authentication failures behind service fallback
   );
 });
 
+test('does not infer authentication failure from a generic transport error message', async () => {
+  const calls: RecordedCapabilityCall[] = [];
+  const dependencies = fakeCapabilityDependencies(calls, async (body, endpoint) => {
+    if (body === GET_SCOPES) {
+      throw new Error(
+        'getaddrinfo ENOTFOUND unauthorized-camera.example transport-sensitive-marker',
+      );
+    }
+    if (body === GET_SERVICES) {
+      return response(`<tds:GetServicesResponse>${service(
+        MEDIA1_NS,
+        'http://camera/media1',
+      )}</tds:GetServicesResponse>`);
+    }
+    if (body === MEDIA1_GET_PROFILES && endpoint === 'http://camera/media1') {
+      return response('<trt:GetProfilesResponse/>');
+    }
+    throw new Error(`unexpected fake operation: ${body} at ${endpoint}`);
+  });
+
+  const report = await getCameraCapabilitiesWithDependencies(
+    { host: 'camera', user: 'viewer', pass: 'credential-sensitive-marker' },
+    dependencies,
+  );
+
+  assert.deepEqual(calls.map(({ body }) => body), [
+    GET_SCOPES,
+    GET_SERVICES,
+    MEDIA1_GET_PROFILES,
+  ]);
+  assert.deepEqual(report.warnings, [{
+    operation: 'GetScopes',
+    message: 'network request failed (ENOTFOUND)',
+  }]);
+  assert.doesNotMatch(
+    JSON.stringify(report.warnings),
+    /unauthorized-camera|transport-sensitive-marker|credential-sensitive-marker|viewer/,
+  );
+});
+
 test('keeps Media1 available when discovery fails and sanitizes optional warnings', async () => {
   const calls: RecordedCapabilityCall[] = [];
   const dependencies = fakeCapabilityDependencies(calls, async (body, endpoint) => {

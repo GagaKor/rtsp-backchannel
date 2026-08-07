@@ -207,6 +207,9 @@ const AUTHENTICATION_FAULT_TOKENS: ReadonlyArray<readonly [string, string]> = [
   ['FailedAuthentication', 'failed-authentication'],
   ['Unauthorized', 'unauthorized'],
 ] as const;
+const AUTHENTICATION_FAULT_CODES = new Set(
+  AUTHENTICATION_FAULT_TOKENS.map(([canonical]) => canonical),
+);
 
 function canonicalAuthenticationFault(value: string | undefined): string | undefined {
   if (!value) return undefined;
@@ -869,11 +872,10 @@ function isAuthenticationFailure(error: unknown): boolean {
   if (error instanceof OnvifHttpError) {
     return error.statusCode === 401 || error.statusCode === 403;
   }
-  const code = error instanceof OnvifResponseError ? error.faultCode : undefined;
-  const message = error instanceof Error ? error.message : String(error);
-  return /(?:NotAuthorized|InvalidSecurity|FailedAuthentication|Unauthorized)/i.test(
-    `${code ?? ''} ${message}`,
-  );
+  return error instanceof OnvifResponseError
+    && error.kind === 'fault'
+    && error.faultCode !== undefined
+    && AUTHENTICATION_FAULT_CODES.has(error.faultCode);
 }
 
 function sanitizedWarningMessage(
