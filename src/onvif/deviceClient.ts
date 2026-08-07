@@ -24,6 +24,8 @@ const PWD_DIGEST =
 const DEFAULT_TIMEOUT_MS = 8_000;
 const MAX_RESPONSE_HEADER_BYTES = 64 * 1024;
 const MAX_RESPONSE_BODY_BYTES = 1024 * 1024;
+const HTTP_RESPONSE_ERROR = 'ONVIF HTTP response error';
+const SOAP_FAULT_ERROR = 'ONVIF SOAP Fault';
 
 function decodeXml(value: string): string {
   return value
@@ -87,6 +89,40 @@ function safeConnectCause(error: unknown): string {
     return error.message;
   }
   return 'request failed';
+}
+
+function isSoapFaultEnvelope(xml: string): boolean {
+  try {
+    const root = parseXml(xml);
+    if (
+      root.local !== 'Envelope'
+      || (root.uri !== SOAP_12_NS && root.uri !== SOAP_11_NS)
+    ) {
+      return false;
+    }
+    let body: XmlElement | undefined;
+    if (
+      root.children.length === 1
+      && root.children[0].uri === root.uri
+      && root.children[0].local === 'Body'
+    ) {
+      body = root.children[0];
+    } else if (
+      root.children.length === 2
+      && root.children[0].uri === root.uri
+      && root.children[0].local === 'Header'
+      && root.children[1].uri === root.uri
+      && root.children[1].local === 'Body'
+    ) {
+      body = root.children[1];
+    }
+    const payload = body?.children;
+    return payload?.length === 1
+      && payload[0].uri === root.uri
+      && payload[0].local === 'Fault';
+  } catch {
+    return false;
+  }
 }
 
 export interface DeviceInfo {
@@ -338,11 +374,19 @@ export class OnvifDevice {
 
   private async soap(url: string, body: string, withAuth: boolean): Promise<string> {
     const response = await this.soapResponse(url, body, withAuth);
-    // Preserve the legacy behavior: ONVIF may return a SOAP Fault envelope on 5xx.
-    if (response.statusCode >= 500 && !response.xml.includes('Envelope')) {
-      throw new Error(`HTTP ${response.statusCode} from ${url}`);
+    if (response.statusCode >= 200 && response.statusCode < 300) {
+      if (isSoapFaultEnvelope(response.xml)) throw new Error(SOAP_FAULT_ERROR);
+      return response.xml;
     }
-    return response.xml;
+    // ONVIF returns Faults with 5xx; anything else is a transport-level failure.
+    if (
+      response.statusCode >= 500
+      && response.statusCode < 600
+      && isSoapFaultEnvelope(response.xml)
+    ) {
+      throw new Error(SOAP_FAULT_ERROR);
+    }
+    throw new Error(HTTP_RESPONSE_ERROR);
   }
 
   async getSystemDateAndTime(url: string): Promise<Date> {
@@ -365,25 +409,18 @@ export class OnvifDevice {
   async getDeviceInformation(url = this.requireDeviceUrl()): Promise<DeviceInfo> {
     const xml = await this.soap(url, `<GetDeviceInformation xmlns="${DEV_NS}"/>`, true);
     if (!xml.includes('GetDeviceInformationResponse')) {
-      const fault = /<[^>]*:?(?:Subcode|Value)>\s*([^<]*ter:[^<]+)</.exec(xml)?.[1] ??
-        /ter:(\w+)/.exec(xml)?.[0] ?? 'auth failed';
-      throw new Error(`GetDeviceInformation rejected: ${fault.trim()}`);
+      throw new Error('ONVIF response missing GetDeviceInformationResponse');
     }
     return parseDeviceInformation(xml);
   }
 
   private async discoverMediaUrl(deviceUrl: string): Promise<string> {
-    let advertisedUrl: string | undefined;
-    try {
-      const cap = await this.soap(
-        deviceUrl,
-        `<GetCapabilities xmlns="${DEV_NS}"><Category>Media</Category></GetCapabilities>`,
-        true,
-      );
-      advertisedUrl = /<[^>]*:?XAddr>(https?:\/\/[^<]*[Mm]edia[^<]*)<\/[^>]*:?XAddr>/.exec(cap)?.[1];
-    } catch {
-      /* fall through to derived URL */
-    }
+    const cap = await this.soap(
+      deviceUrl,
+      `<GetCapabilities xmlns="${DEV_NS}"><Category>Media</Category></GetCapabilities>`,
+      true,
+    );
+    const advertisedUrl = /<[^>]*:?XAddr>(https?:\/\/[^<]*[Mm]edia[^<]*)<\/[^>]*:?XAddr>/.exec(cap)?.[1];
     const mediaUrl = advertisedUrl ?? deviceUrl.replace('device_service', 'media_service');
     parseServiceUrlAgainstDevice(deviceUrl, mediaUrl);
     return mediaUrl;

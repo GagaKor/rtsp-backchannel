@@ -61,6 +61,32 @@ async function getDeviceInformationFromResponse(xml: string) {
   }
 }
 
+function successfulConnectResponse(requestBody: string, mediaUrl: string): string {
+  const envelope = (content: string) =>
+    '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">'
+    + `<s:Body>${content}</s:Body></s:Envelope>`;
+  if (requestBody.includes('GetSystemDateAndTime')) {
+    return envelope(
+      '<GetSystemDateAndTimeResponse><SystemDateAndTime><UTCDateTime>'
+      + '<Time><Hour>12</Hour><Minute>30</Minute><Second>0</Second></Time>'
+      + '<Date><Year>2026</Year><Month>8</Month><Day>7</Day></Date>'
+      + '</UTCDateTime></SystemDateAndTime></GetSystemDateAndTimeResponse>',
+    );
+  }
+  if (requestBody.includes('GetDeviceInformation')) {
+    return envelope(
+      '<tds:GetDeviceInformationResponse xmlns:tds="http://www.onvif.org/ver10/device/wsdl">'
+      + '<tds:Manufacturer>normal-response-payload-secret</tds:Manufacturer>'
+      + '</tds:GetDeviceInformationResponse>',
+    );
+  }
+  return envelope(
+    '<GetCapabilitiesResponse><Capabilities><Media><XAddr>'
+    + mediaUrl
+    + '</XAddr></Media></Capabilities></GetCapabilitiesResponse>',
+  );
+}
+
 test('omits WS-Security entirely when both ONVIF credentials are empty', async () => {
   const body = await captureDeviceInformationRequest(new OnvifDevice('camera'));
 
@@ -162,6 +188,324 @@ test('enforces an absolute wall-clock timeout during a trickle response', async 
       /timeout/i,
     );
     assert.ok(Date.now() - startedAt < 400);
+  } finally {
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
+});
+
+test('rejects every non-2xx connect response without following redirects or reflecting secrets', async () => {
+  let attackerConnections = 0;
+  let attackerRequests = 0;
+  const attacker = http.createServer((_request, response) => {
+    attackerRequests++;
+    response.end();
+  });
+  attacker.on('connection', () => {
+    attackerConnections++;
+  });
+  await new Promise<void>((resolve) => attacker.listen(0, '127.0.0.1', resolve));
+  const attackerAddress = attacker.address();
+  assert.ok(attackerAddress && typeof attackerAddress !== 'string');
+
+  const server = http.createServer((request, response) => {
+    let requestBody = '';
+    request.setEncoding('utf8');
+    request.on('data', (chunk) => {
+      requestBody += chunk;
+    });
+    request.on('end', () => {
+      const statusCode = Number(request.url?.split('/')[2]);
+      const address = server.address();
+      assert.ok(address && typeof address !== 'string');
+      const headers = statusCode >= 301 && statusCode <= 303
+        ? {
+            'Content-Type': 'application/soap+xml',
+            Location: `http://127.0.0.1:${attackerAddress.port}/redirect-secret-marker`,
+          }
+        : { 'Content-Type': 'application/soap+xml' };
+      response.writeHead(statusCode, headers);
+      response.end(successfulConnectResponse(
+        requestBody,
+        `http://127.0.0.1:${address.port}/media_service`,
+      ));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+
+  try {
+    for (const statusCode of [301, 302, 303, 401, 403, 404, 500]) {
+      const deviceUrl = `http://127.0.0.1:${address.port}/status/${statusCode}/url-secret-marker`;
+      await assert.rejects(
+        new OnvifDevice('camera', 'viewer-marker', 'credential-secret-marker', {
+          deviceUrls: [deviceUrl],
+        }).connect(),
+        (error: unknown) => {
+          assert.ok(error instanceof Error);
+          assert.equal(error.message, 'ONVIF connect failed: request failed');
+          assert.doesNotMatch(
+            error.message,
+            /viewer-marker|credential-secret-marker|normal-response-payload-secret|url-secret-marker|redirect-secret-marker/,
+          );
+          return true;
+        },
+      );
+    }
+    assert.equal(attackerRequests, 0);
+    assert.equal(attackerConnections, 0);
+  } finally {
+    await Promise.all([
+      new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve()))),
+      new Promise<void>((resolve, reject) =>
+        attacker.close((error) => (error ? reject(error) : resolve()))),
+    ]);
+  }
+});
+
+test('rejects structurally valid 5xx SOAP 1.1 and 1.2 Faults with a fixed classification', async () => {
+  const soap12Fault =
+    '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"'
+    + ' xmlns:ter="http://www.onvif.org/ver10/error"><s:Body><s:Fault>'
+    + '<s:Code><s:Value>s:Sender</s:Value><s:Subcode>'
+    + '<s:Value>ter:NotAuthorized</s:Value></s:Subcode></s:Code>'
+    + '<s:Reason><s:Text>fault-payload-secret</s:Text></s:Reason>'
+    + '</s:Fault></s:Body></s:Envelope>';
+  const soap11Fault =
+    '<env:Envelope xmlns:env="http://schemas.xmlsoap.org/soap/envelope/"'
+    + ' xmlns:ter="http://www.onvif.org/ver10/error"><env:Body><env:Fault>'
+    + '<faultcode>ter:NotAuthorized</faultcode>'
+    + '<faultstring>fault-payload-secret</faultstring>'
+    + '</env:Fault></env:Body></env:Envelope>';
+  const server = http.createServer((request, response) => {
+    response.writeHead(request.url === '/outside-5xx' ? 600 : 500, {
+      'Content-Type': 'application/soap+xml',
+    });
+    response.end(request.url === '/soap11' ? soap11Fault : soap12Fault);
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+
+  try {
+    for (const path of ['soap11', 'soap12']) {
+      await assert.rejects(
+        new OnvifDevice('camera').getDeviceInformation(
+          `http://127.0.0.1:${address.port}/${path}`,
+        ),
+        (error: unknown) => {
+          assert.ok(error instanceof Error);
+          assert.equal(error.message, 'ONVIF SOAP Fault');
+          assert.doesNotMatch(error.message, /fault-payload-secret|127\.0\.0\.1/);
+          return true;
+        },
+      );
+    }
+    await assert.rejects(
+      new OnvifDevice('camera').getDeviceInformation(
+        `http://127.0.0.1:${address.port}/outside-5xx`,
+      ),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.equal(error.message, 'ONVIF HTTP response error');
+        assert.doesNotMatch(error.message, /fault-payload-secret|127\.0\.0\.1/);
+        return true;
+      },
+    );
+  } finally {
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
+});
+
+test('rejects a valid 5xx SOAP Fault before legacy parsers can read Detail decoys', async () => {
+  const server = http.createServer((request, response) => {
+    const statusCode = request.url === '/status-200' ? 200 : 500;
+    response.writeHead(statusCode, { 'Content-Type': 'application/soap+xml' });
+    response.end(
+      '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><s:Fault>'
+      + '<s:Code><s:Value>s:Receiver</s:Value></s:Code>'
+      + '<s:Reason><s:Text>fault-detail-secret</s:Text></s:Reason><s:Detail>'
+      + '<UTCDateTime><Time><Hour>12</Hour></Time>'
+      + '<Date><Year>2026</Year><Month>8</Month><Day>7</Day></Date></UTCDateTime>'
+      + '<XAddr>http://attacker.example/fault-detail-secret</XAddr>'
+      + '<Profiles token="fault-detail-secret"/>'
+      + '</s:Detail></s:Fault></s:Body></s:Envelope>',
+    );
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+
+  try {
+    for (const path of ['status-200', 'status-500']) {
+      await assert.rejects(
+        new OnvifDevice('camera').getSystemDateAndTime(
+          `http://127.0.0.1:${address.port}/${path}`,
+        ),
+        (error: unknown) => {
+          assert.ok(error instanceof Error);
+          assert.equal(error.message, 'ONVIF SOAP Fault');
+          assert.doesNotMatch(error.message, /fault-detail-secret|attacker|127\.0\.0\.1/);
+          return true;
+        },
+      );
+    }
+  } finally {
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
+});
+
+test('does not hide third-stage HTTP authentication or SOAP Fault responses during connect', async () => {
+  const requestCounts = new Map<string, number>();
+  const server = http.createServer((request, response) => {
+    let requestBody = '';
+    request.setEncoding('utf8');
+    request.on('data', (chunk) => {
+      requestBody += chunk;
+    });
+    request.on('end', () => {
+      const mode = request.url?.split('/')[2] ?? '';
+      requestCounts.set(mode, (requestCounts.get(mode) ?? 0) + 1);
+      const address = server.address();
+      assert.ok(address && typeof address !== 'string');
+      response.setHeader('Content-Type', 'application/soap+xml');
+      if (!requestBody.includes('GetCapabilities')) {
+        response.end(successfulConnectResponse(
+          requestBody,
+          `http://127.0.0.1:${address.port}/media_service`,
+        ));
+        return;
+      }
+      if (mode === 'fault') {
+        response.statusCode = 500;
+        response.end(
+          '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body>'
+          + '<s:Fault><s:Code><s:Value>s:Sender</s:Value></s:Code>'
+          + '<s:Reason><s:Text>third-stage-fault-secret</s:Text></s:Reason>'
+          + '</s:Fault></s:Body></s:Envelope>',
+        );
+        return;
+      }
+      response.statusCode = Number(mode);
+      response.end(successfulConnectResponse(
+        requestBody,
+        `http://127.0.0.1:${address.port}/media_service`,
+      ));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+
+  try {
+    for (const mode of ['401', '403', 'fault']) {
+      await assert.rejects(
+        new OnvifDevice('camera', 'viewer', 'third-stage-credential-secret', {
+          deviceUrls: [`http://127.0.0.1:${address.port}/mode/${mode}/device_service`],
+        }).connect(),
+        (error: unknown) => {
+          assert.ok(error instanceof Error);
+          assert.equal(error.message, 'ONVIF connect failed: request failed');
+          assert.doesNotMatch(
+            error.message,
+            /viewer|third-stage-credential-secret|third-stage-fault-secret|127\.0\.0\.1/,
+          );
+          return true;
+        },
+      );
+      assert.equal(requestCounts.get(mode), 3);
+    }
+  } finally {
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
+});
+
+test('derives the legacy Media URL only after a successful capability response without XAddr', async () => {
+  const server = http.createServer((request, response) => {
+    let requestBody = '';
+    request.setEncoding('utf8');
+    request.on('data', (chunk) => {
+      requestBody += chunk;
+    });
+    request.on('end', () => {
+      const address = server.address();
+      assert.ok(address && typeof address !== 'string');
+      response.setHeader('Content-Type', 'application/soap+xml');
+      if (requestBody.includes('GetCapabilities')) {
+        response.end(
+          '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body>'
+          + '<GetCapabilitiesResponse><Capabilities/></GetCapabilitiesResponse>'
+          + '</s:Body></s:Envelope>',
+        );
+      } else {
+        response.end(successfulConnectResponse(
+          requestBody,
+          `http://127.0.0.1:${address.port}/unused-media`,
+        ));
+      }
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+  const deviceUrl = `http://127.0.0.1:${address.port}/onvif/device_service`;
+
+  try {
+    const device = new OnvifDevice('camera', '', '', { deviceUrls: [deviceUrl] });
+    await device.connect();
+    assert.equal(
+      device.connectedMediaUrl(),
+      `http://127.0.0.1:${address.port}/onvif/media_service`,
+    );
+  } finally {
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
+});
+
+test('rejects 5xx fault-looking envelopes that contain operation-response decoys', async () => {
+  const operationResponse =
+    '<GetSystemDateAndTimeResponse><SystemDateAndTime><UTCDateTime>'
+    + '<Time><Hour>12</Hour></Time>'
+    + '<Date><Year>2026</Year><Month>8</Month><Day>7</Day></Date>'
+    + '</UTCDateTime></SystemDateAndTime></GetSystemDateAndTimeResponse>';
+  const server = http.createServer((request, response) => {
+    const body = request.url === '/body-sibling'
+      ? `<s:Body><s:Fault/>${operationResponse}</s:Body>`
+      : `<s:Body><s:Fault/></s:Body>${operationResponse}`;
+    response.writeHead(500, { 'Content-Type': 'application/soap+xml' });
+    response.end(
+      '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">'
+      + `${body}</s:Envelope>`,
+    );
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+
+  try {
+    for (const path of ['body-sibling', 'envelope-sibling']) {
+      await assert.rejects(
+        new OnvifDevice('camera').getSystemDateAndTime(
+          `http://127.0.0.1:${address.port}/${path}`,
+        ),
+        (error: unknown) => {
+          assert.ok(error instanceof Error);
+          assert.equal(error.message, 'ONVIF HTTP response error');
+          return true;
+        },
+      );
+    }
   } finally {
     await new Promise<void>((resolve, reject) =>
       server.close((error) => (error ? reject(error) : resolve())),
