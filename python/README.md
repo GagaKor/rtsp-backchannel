@@ -3,9 +3,9 @@
 [English](https://github.com/GagaKor/rtsp-backchannel/blob/master/python/README.md) |
 [한국어](https://github.com/GagaKor/rtsp-backchannel/blob/master/python/README.ko.md)
 
-Python library and CLI for discovering ONVIF cameras, resolving profile RTSP
-URIs, and playing one audio file through an ONVIF RTSP backchannel. FFmpeg is
-required only for file playback; GStreamer is not used.
+Python library and CLI for discovering and inspecting ONVIF cameras, resolving
+profile RTSP URIs, and playing one audio file through an ONVIF RTSP
+backchannel. FFmpeg is required only for file playback; GStreamer is not used.
 
 Other implementations:
 
@@ -23,7 +23,7 @@ are implemented in Python. FFmpeg is not bundled or installed by this package.
 - `ffmpeg` on `PATH` for file playback
 - A camera that exposes an ONVIF `sendonly` audio backchannel
 
-Discovery and stream URI lookup do not require FFmpeg.
+Discovery, capability reporting, and stream URI lookup do not require FFmpeg.
 
 ## Installation
 
@@ -180,6 +180,218 @@ Authenticates with the ONVIF Device and Media services and returns every Media
 Profile's `profile_token`, optional `profile_name`, and `uri`. Credentials are
 not inserted into returned RTSP URIs.
 
+### `get_camera_capabilities`
+
+```python
+get_camera_capabilities(
+    *,
+    host: str,
+    user: str = "",
+    password: str = "",
+    device_urls: list[str] | None = None,
+    timeout: float = 8.0,
+) -> CameraCapabilityReport
+```
+
+This read-only API collects device identity, scopes, advertised services,
+Media profiles, PTZ facts, and Media2 encoder evidence. The package root
+exports `CameraCapabilityReport`, `CameraCapabilityVersion`, and the other
+nested report dataclasses for typed inspection.
+
+```python
+import os
+
+from rtsp_backchannel import get_camera_capabilities
+
+report = get_camera_capabilities(
+    host="camera.local",
+    user="operator",
+    password=os.environ["ONVIF_PASSWORD"],
+    device_urls=["http://camera.local/onvif/device_service"],
+    timeout=8.0,
+)
+
+print(report.declared_profiles, report.media2.h265_supported)
+```
+
+The following is the JSON the `capabilities` CLI command prints for a camera
+that declares Profile S and T support and advertises a PTZ service; it is
+pretty-printed here, though the CLI writes one line. The two PTZ nodes make
+the point: `pan-node` reports `continuousPanTilt: true` while `zoom-node`
+reports only `absoluteZoom: true`, so an advertised PTZ service does not by
+itself mean pan/tilt support, and the top-level
+`ptz.panTiltSupported`/`ptz.zoomSupported` summarize across both nodes.
+`declaredProfiles` here is a self-report drawn from the device's own scopes,
+not an ONVIF certification.
+
+```json
+{
+  "device": {
+    "manufacturer": "Parity Camera",
+    "model": "PX-1",
+    "firmware": "1.2.3",
+    "serial": "parity-001"
+  },
+  "scopes": [
+    "onvif://www.onvif.org/Profile/Streaming",
+    "onvif://www.onvif.org/Profile/T"
+  ],
+  "declaredProfiles": [
+    "S",
+    "T"
+  ],
+  "serviceDiscovery": "getServices",
+  "services": [
+    {
+      "namespace": "http://www.onvif.org/ver10/media/wsdl",
+      "xaddr": "http://camera.local/onvif/media1",
+      "version": {
+        "major": 1,
+        "minor": 0
+      }
+    },
+    {
+      "namespace": "http://www.onvif.org/ver20/media/wsdl",
+      "xaddr": "http://camera.local/onvif/media2",
+      "version": {
+        "major": 2,
+        "minor": 0
+      }
+    },
+    {
+      "namespace": "http://www.onvif.org/ver20/ptz/wsdl",
+      "xaddr": "http://camera.local/onvif/ptz",
+      "version": {
+        "major": 2,
+        "minor": 2
+      }
+    }
+  ],
+  "profiles": [
+    {
+      "token": "shared",
+      "source": "media2",
+      "name": "Modern Shared",
+      "hasAudioEncoder": true,
+      "hasAudioOutput": false,
+      "hasAudioSource": true,
+      "ptzConfigurationToken": "ptz-config-m2",
+      "ptzNodeToken": "pan-node"
+    }
+  ],
+  "ptz": {
+    "detected": true,
+    "panTiltSupported": true,
+    "zoomSupported": true,
+    "profileTokens": [
+      "shared"
+    ],
+    "serviceCapabilities": {
+      "eFlip": true,
+      "reverse": false,
+      "getCompatibleConfigurations": true,
+      "moveStatus": false,
+      "statusPosition": true
+    },
+    "nodes": [
+      {
+        "token": "pan-node",
+        "name": "Pan only",
+        "spaces": {
+          "absolutePanTilt": false,
+          "absoluteZoom": false,
+          "relativePanTilt": false,
+          "relativeZoom": false,
+          "continuousPanTilt": true,
+          "continuousZoom": false
+        },
+        "maximumPresets": 4,
+        "homeSupported": true,
+        "auxiliaryCommands": [
+          "IrisClose",
+          "IrisOpen"
+        ]
+      },
+      {
+        "token": "zoom-node",
+        "name": "Zoom only",
+        "spaces": {
+          "absolutePanTilt": false,
+          "absoluteZoom": true,
+          "relativePanTilt": false,
+          "relativeZoom": false,
+          "continuousPanTilt": false,
+          "continuousZoom": false
+        },
+        "maximumPresets": 2,
+        "homeSupported": false,
+        "auxiliaryCommands": []
+      }
+    ]
+  },
+  "media2": {
+    "detected": true,
+    "encodings": [
+      "H264",
+      "H265"
+    ],
+    "h265Supported": true
+  },
+  "warnings": []
+}
+```
+
+The report fields have these meanings:
+
+- `device` contains the reported manufacturer, model, firmware, and serial;
+  `scopes` preserves the deduplicated raw ONVIF scope values.
+- `declared_profiles` contains normalized profile names from device scopes.
+  These are device self-reports, not independent ONVIF certification results.
+  The CLI spells this field `declaredProfiles`.
+- `service_discovery` records whether inventory came from `GetServices`, the
+  legacy `GetCapabilities` fallback, or was unavailable. `services` contains
+  namespace, XAddr, and optional `CameraCapabilityVersion` facts.
+- `profiles` describes Media1/Media2 bindings and optional PTZ configuration
+  and node tokens. A reported PTZ service, profile bindings in
+  `profile_tokens`, and movement spaces represented by `pan_tilt_supported`,
+  `zoom_supported`, and PTZ nodes are separate facts; one does not imply the
+  others.
+- `media2.detected` says only whether a successful `GetServices` response
+  advertised Media2. It is not a reachability result and can remain `true`
+  when Media2 enrichment fails. It is `null` after a legacy fallback or
+  unavailable discovery. The CLI fields
+  `media2.encodings` and `media2.h265Supported` contain encoder-option evidence
+  when available.
+- `warnings` contains failures from optional enrichment operations. Each
+  `warning.message` uses generic canonical text and contains no credentials,
+  WSSE digest material, URL userinfo, or raw or real camera response payload.
+  Initial connection and authentication failures are fatal; they raise an
+  exception instead of becoming warnings.
+
+Tri-state booleans are intentional: `true` means a successful response found
+the fact, `false` means a successful response established its absence, and
+`null` means the fact could not be established. The Python dataclasses use
+`True`, `False`, and `None`; the CLI emits their JSON forms. Optional JSON
+object members are omitted when the device did not report them. A Media2
+advertisement and successful H.265 enrichment are useful Profile T evidence,
+not proof of Profile T certification.
+
+Successful service discovery routes each optional Media and PTZ enrichment
+request to the matching advertised service XAddr. Returned service
+URLs are subject to a same-origin rule before WSSE generation or network I/O:
+their scheme and canonical hostname must match the selected Device service;
+ports, paths, and queries may differ. A cross-origin XAddr remains in
+`services`, but its enrichment is skipped with an `invalid ONVIF service URL`
+warning. The connected Media XAddr is validated by the same rule.
+
+XML keeps the encoding-aware DTD/entity rejection and permits at most 64
+element levels. SOAP fault output uses a fixed authentication/protocol
+allowlist, including `ActionNotSupported`; every unknown code is reported
+only as `SOAP Fault: Fault`.
+
+`timeout` applies per request; because one report performs multiple requests,
+its total elapsed time can exceed one timeout interval.
+
 ### `play_file`
 
 ```python
@@ -262,6 +474,13 @@ rtsp-backchannel streams \
   --host camera.local \
   --user admin
 
+# Print one camelCase camera capability report as one JSON line.
+rtsp-backchannel capabilities \
+  --host camera.local \
+  --user operator \
+  --device-url http://camera.local/onvif/device_service \
+  --timeout-ms 8000
+
 # Play one file and close the RTSP session.
 rtsp-backchannel play \
   --host camera.local \
@@ -279,9 +498,26 @@ rtsp-backchannel play --host 'rtsp://admin:p%40ss@camera.local/backchannel' \
   --file '/absolute/path/to/event.mp3'
 ```
 
-The `play` word is optional for backward compatibility. Python's CLI defaults
-`--user` and `--pass` to empty strings; pass `--pass` explicitly when the
-camera requires credentials.
+The `play` word is optional for backward compatibility. `streams` and playback
+retain their empty-string credential defaults. For `capabilities`, omitting
+`--pass` reads `ONVIF_PASSWORD` and uses an empty password if that variable is
+unset. An explicit `--pass ""` overrides the environment with an empty
+password.
+
+`capabilities` requires a non-empty `--host`, accepts a non-empty `--user`, and
+preserves repeatable `--device-url` values in supplied order. It calls the API
+once and prints exactly one native camelCase JSON object. Omitting
+`--timeout-ms` uses the API default; a supplied value may be decimal but must
+be finite and greater than zero and no greater than the inclusive 24-hour
+maximum (86,400,000 ms). The parsed millisecond number is validated before it
+is converted to seconds. Invalid or excessive values exit with status 2 and a
+fixed value-free diagnostic before API or network dispatch.
+
+The capability CLI rejects a bare `--` argument terminator with a fixed
+value-free diagnostic. Hyphen-prefixed passwords remain opaque when supplied
+as `--pass=--value` or as the separate value to `--pass`; known capability
+flags are still treated as a missing password. The explicit `--pass ""`
+environment override is unchanged.
 
 ## Playback Behavior
 

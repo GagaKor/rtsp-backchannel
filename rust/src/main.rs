@@ -1,17 +1,19 @@
 use anyhow::Result;
 use rtsp_backchannel::audio::AudioCodec;
 use rtsp_backchannel::backchannel::parse_rtsp_target;
-use rtsp_backchannel::cli::{Cli, Invocation, parse_invocation_from};
+use rtsp_backchannel::cli::{ApplicationInvocation, Cli, parse_application_invocation_from};
 use rtsp_backchannel::discovery::{
     CidrDiscoveryOptions, DiscoveryOptions, discover_devices, discover_devices_in_cidrs,
 };
-use rtsp_backchannel::onvif::{StreamUriOptions, get_stream_uris};
+use rtsp_backchannel::onvif::{
+    CameraCapabilityOptions, StreamUriOptions, get_camera_capabilities, get_stream_uris,
+};
 use rtsp_backchannel::playback::{PlaybackConfig, play_file_with_codec};
 use rtsp_backchannel::rtsp::has_rtsp_scheme;
 use std::time::Duration;
 
 fn main() {
-    let invocation = match parse_invocation_from(std::env::args_os()) {
+    let invocation = match parse_application_invocation_from(std::env::args_os()) {
         Ok(invocation) => invocation,
         Err(error) => error.exit(),
     };
@@ -21,10 +23,10 @@ fn main() {
     }
 }
 
-fn run(invocation: Invocation) -> Result<()> {
+fn run(invocation: ApplicationInvocation) -> Result<()> {
     match invocation {
-        Invocation::Play(cli) => run_playback(cli),
-        Invocation::Discover(cli) => {
+        ApplicationInvocation::Play(cli) => run_playback(cli),
+        ApplicationInvocation::Discover(cli) => {
             let devices = if cli.cidrs.is_empty() {
                 discover_devices(&DiscoveryOptions {
                     timeout: Duration::from_millis(cli.timeout_ms),
@@ -47,7 +49,7 @@ fn run(invocation: Invocation) -> Result<()> {
             }
             Ok(())
         }
-        Invocation::Streams(cli) => {
+        ApplicationInvocation::Streams(cli) => {
             let streams = get_stream_uris(&StreamUriOptions {
                 host: cli.host,
                 user: cli.user,
@@ -59,6 +61,21 @@ fn run(invocation: Invocation) -> Result<()> {
             for stream in streams {
                 println!("{}", serde_json::to_string(&stream)?);
             }
+            Ok(())
+        }
+        ApplicationInvocation::Capabilities(cli) => {
+            let mut options = CameraCapabilityOptions::new(
+                cli.host,
+                cli.user.unwrap_or_default(),
+                cli.password.unwrap_or_default(),
+            );
+            options.device_urls = cli.device_urls;
+            if let Some(timeout) = cli.timeout {
+                options.timeout = timeout;
+            }
+            let report = get_camera_capabilities(&options).map_err(anyhow::Error::msg)?;
+            let json = serde_json::to_string(&report)?;
+            println!("{json}");
             Ok(())
         }
     }

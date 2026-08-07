@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Equivalent TypeScript, Python, and Rust APIs plus a `capabilities` command for
+  read-only ONVIF camera capability reports covering device identity, scopes,
+  declared profiles, services, media profiles, PTZ, and Media2/H.265 evidence.
+- A shared cross-language SOAP fixture that verifies all three implementations
+  produce the same deterministic camelCase report.
+
+### Security
+
+- Validate advertised ONVIF service URLs against the selected Device endpoint
+  before adding WS-Security credentials or sending a request, and reject HTTP
+  redirects during SOAP operations.
+- Bound XML parsing, redact untrusted SOAP fault details, and keep optional
+  capability failures in sanitized warnings.
+
 ## [0.1.0] - Unreleased
 
 ### Added

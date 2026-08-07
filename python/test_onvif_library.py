@@ -523,8 +523,9 @@ class OnvifLibraryTests(unittest.TestCase):
             with self.subTest(declared=bool(response.headers)), patch.object(
                 onvif, "_MAX_SOAP_RESPONSE_BYTES", 4
             ), patch.object(
-                onvif.urllib.request, "urlopen", return_value=response
-            ):
+                onvif, "_discovery_opener"
+            ) as opener:
+                opener.return_value.open.return_value = response
                 with self.assertRaisesRegex(
                     RuntimeError, "ONVIF SOAP response is too large"
                 ):
@@ -556,10 +557,11 @@ class OnvifLibraryTests(unittest.TestCase):
         with patch.object(
             onvif.time, "monotonic", side_effect=lambda: now[0]
         ), patch.object(
-            onvif.urllib.request, "urlopen", side_effect=open_response
-        ) as urlopen, patch.object(
+            onvif, "_discovery_opener"
+        ) as opener, patch.object(
             onvif, "_set_response_timeout"
         ) as set_timeout:
+            opener.return_value.open.side_effect = open_response
             with self.assertRaisesRegex(
                 TimeoutError, "ONVIF SOAP deadline exceeded"
             ):
@@ -570,7 +572,9 @@ class OnvifLibraryTests(unittest.TestCase):
                     1.0,
                 )
 
-        self.assertEqual(urlopen.call_args.kwargs["timeout"], 1.0)
+        self.assertEqual(
+            opener.return_value.open.call_args.kwargs["timeout"], 1.0
+        )
         self.assertAlmostEqual(set_timeout.call_args.args[1], 0.25)
         self.assertTrue(response.closed)
 
@@ -588,8 +592,9 @@ class OnvifLibraryTests(unittest.TestCase):
 
         response = ReadOneResponse(b"<Response/>")
         with patch.object(
-            onvif.urllib.request, "urlopen", return_value=response
-        ):
+            onvif, "_discovery_opener"
+        ) as opener:
+            opener.return_value.open.return_value = response
             result = onvif._soap_request(
                 "http://camera/onvif/device_service",
                 "<Request/>",
@@ -655,8 +660,9 @@ class OnvifLibraryTests(unittest.TestCase):
 
         error = urllib.error.URLError(socket.timeout("timed out"))
         with patch.object(
-            onvif.urllib.request, "urlopen", side_effect=error
-        ):
+            onvif, "_discovery_opener"
+        ) as opener:
+            opener.return_value.open.side_effect = error
             with self.assertRaisesRegex(
                 TimeoutError, "ONVIF SOAP deadline exceeded"
             ):
@@ -682,8 +688,9 @@ class OnvifLibraryTests(unittest.TestCase):
         with patch.object(
             onvif, "_MAX_SOAP_RESPONSE_BYTES", 4
         ), patch.object(
-            onvif.urllib.request, "urlopen", side_effect=error
-        ):
+            onvif, "_discovery_opener"
+        ) as opener:
+            opener.return_value.open.side_effect = error
             with self.assertRaisesRegex(
                 RuntimeError, "ONVIF SOAP response is too large"
             ):
@@ -709,8 +716,9 @@ class OnvifLibraryTests(unittest.TestCase):
         )
 
         with patch.object(
-            onvif.urllib.request, "urlopen", side_effect=error
-        ):
+            onvif, "_discovery_opener"
+        ) as opener:
+            opener.return_value.open.side_effect = error
             result = onvif._soap_request(
                 "http://camera/onvif/device_service",
                 "<Request/>",

@@ -8,9 +8,17 @@ import type {
   AdtsFrame,
   AudioCodecName,
   BackchannelOptions,
+  CameraCapabilityOptions,
+  CameraCapabilityProfile,
+  CameraCapabilityReport,
+  CameraCapabilityService,
+  CameraCapabilityWarning,
   CodecPreference,
   EncodedAudio,
   EncodedAudioFrame,
+  PtzNode,
+  PtzServiceCapabilities,
+  PtzSpaces,
   SendCodec,
 } from './index.ts';
 
@@ -26,6 +34,7 @@ test('exports the supported npm library surface from one entry point', () => {
   assert.equal(typeof library.linearToALaw, 'function');
   assert.equal(typeof library.discoverDevices, 'function');
   assert.equal(typeof library.getStreamUris, 'function');
+  assert.equal(typeof library.getCameraCapabilities, 'function');
   assert.equal(library.SAMPLE_RATE, 8000);
   assert.equal(library.PACKET_MS, 40);
 });
@@ -54,6 +63,80 @@ test('exports the codec-neutral public API types', () => {
     [audio.codec, adtsFrame.sampleRate, options.codec],
     ['pcma', 8000, 'pcma'],
   );
+});
+
+test('exports the complete camera capability report contract', () => {
+  const options: CameraCapabilityOptions = {
+    host: 'camera.local',
+    user: 'operator',
+    pass: 'example-only',
+    deviceUrls: ['http://camera.local/onvif/device_service'],
+    timeoutMs: 8_000,
+  };
+  const service: CameraCapabilityService = {
+    namespace: 'http://www.onvif.org/ver20/media/wsdl',
+    xaddr: 'http://camera.local/onvif/media2',
+    version: { major: 2, minor: 0 },
+  };
+  const profile: CameraCapabilityProfile = {
+    token: 'main',
+    source: 'media2',
+    hasAudioEncoder: true,
+    hasAudioOutput: false,
+    hasAudioSource: true,
+    ptzConfigurationToken: 'ptz-main',
+    ptzNodeToken: 'node-main',
+  };
+  const serviceCapabilities: PtzServiceCapabilities = { moveStatus: true };
+  const spaces: PtzSpaces = {
+    absolutePanTilt: true,
+    absoluteZoom: false,
+    relativePanTilt: false,
+    relativeZoom: false,
+    continuousPanTilt: true,
+    continuousZoom: true,
+  };
+  const node: PtzNode = {
+    token: 'node-main',
+    spaces,
+    auxiliaryCommands: [],
+  };
+  const warning: CameraCapabilityWarning = {
+    operation: 'PTZ GetNodes',
+    message: 'request timeout',
+  };
+  const report: CameraCapabilityReport = {
+    device: { manufacturer: 'Example Camera Vendor' },
+    scopes: ['onvif://www.onvif.org/Profile/Streaming'],
+    declaredProfiles: ['S'],
+    serviceDiscovery: 'getServices',
+    services: [service],
+    profiles: [profile],
+    ptz: {
+      detected: true,
+      panTiltSupported: true,
+      zoomSupported: true,
+      profileTokens: ['main'],
+      serviceCapabilities,
+      nodes: [node],
+    },
+    media2: {
+      detected: true,
+      encodings: ['H264', 'H265'],
+      h265Supported: true,
+    },
+    warnings: [warning],
+  };
+  const getCapabilities: (
+    value: CameraCapabilityOptions,
+  ) => Promise<CameraCapabilityReport> = library.getCameraCapabilities;
+
+  assert.equal(typeof getCapabilities, 'function');
+  assert.deepEqual([options.host, report.ptz.nodes[0]?.spaces, report.warnings[0]], [
+    'camera.local',
+    spaces,
+    warning,
+  ]);
 });
 
 test('declares an installable npm package with ESM types and CLI exports', () => {
@@ -116,17 +199,103 @@ test('ships separate English and Korean TypeScript documentation', () => {
     assert.match(readme, /10\.0\.0\.0\/24/);
     assert.match(readme, /10\.128\.0\.10/);
     assert.match(readme, /--cidr/);
+    assert.match(readme, /getCameraCapabilities/);
+    assert.match(readme, /declaredProfiles/);
+    assert.match(readme, /Profile T/);
+    assert.match(readme, /media2\.detected/);
+    assert.match(readme, /h265Supported/);
+    assert.match(readme, /panTiltSupported/);
+    assert.match(readme, /warnings/);
+    assert.match(readme, /timeoutMs/);
+    assert.match(readme, /true/);
+    assert.match(readme, /false/);
+    assert.match(readme, /null/);
+    assert.match(readme, /ONVIF_PASSWORD/);
+    assert.match(readme, /capabilities/);
+    assert.match(readme, /--device-url/);
   }
 });
 
-test('ships a discovery declaration without test dependency injection', () => {
+test('documents exact Media2 discovery and warning guarantees in both languages', () => {
+  const english = readFileSync('README.md', 'utf8');
+  const korean = readFileSync('README.ko.md', 'utf8');
+
+  assert.match(
+    english,
+    /`media2\.detected` reports only whether a successful `GetServices` response advertised a Media2 service/,
+  );
+  assert.match(
+    english,
+    /can remain `true` when Media2 enrichment\s+requests fail/,
+  );
+  assert.match(
+    korean,
+    /`media2\.detected`는 성공한 `GetServices` 응답이 Media2 서비스를 광고했는지만 나타냅니다/,
+  );
+  assert.match(
+    korean,
+    /Media2 보강 요청이 실패해도 `true`로 유지될 수 있습니다/,
+  );
+
+  for (const readme of [english, korean]) {
+    assert.match(readme, /`media2\.h265Supported`/);
+    assert.doesNotMatch(readme, /`h265Supported`/);
+    assert.match(
+      readme,
+      /`GetCapabilities`[\s\S]{0,300}`media2\.detected`[\s\S]{0,120}`media2\.h265Supported`[\s\S]{0,120}`null`/,
+    );
+    assert.match(readme, /`warning\.message`[\s\S]{0,300}generic canonical/);
+    assert.match(readme, /`warning\.message`[\s\S]{0,300}credentials/);
+    assert.match(readme, /`warning\.message`[\s\S]{0,300}WSSE digest material/);
+    assert.match(readme, /`warning\.message`[\s\S]{0,300}URL userinfo/);
+    assert.match(readme, /`warning\.message`[\s\S]{0,300}raw or real camera response payload/);
+  }
+
+  assert.match(
+    english,
+    /Initial connection and authentication failures are fatal[\s\S]{0,100}reject/,
+  );
+  assert.match(
+    korean,
+    /최초 연결 또는\s+인증 실패는 치명적이며[\s\S]{0,100}reject/,
+  );
+});
+
+test('ships clean public declarations without capability parser or injection seams', () => {
   const build = spawnSync('npm', ['run', 'build'], { encoding: 'utf8' });
   assert.equal(build.status, 0, build.stderr || build.stdout);
 
-  const declaration = readFileSync('dist/onvif/discovery.d.ts', 'utf8');
-  assert.doesNotMatch(declaration, /DiscoveryDependencies/);
+  const discoveryDeclaration = readFileSync('dist/onvif/discovery.d.ts', 'utf8');
+  assert.doesNotMatch(discoveryDeclaration, /DiscoveryDependencies/);
   assert.match(
-    declaration,
+    discoveryDeclaration,
     /discoverDevices\(options\?: DiscoveryOptions\): Promise<DiscoveredDevice\[\]>/,
+  );
+
+  const indexDeclaration = readFileSync('dist/index.d.ts', 'utf8');
+  const cliDeclaration = readFileSync('dist/cli.d.ts', 'utf8');
+  assert.match(indexDeclaration, /export \{ getCameraCapabilities \}/);
+  for (const typeName of [
+    'CameraCapabilityOptions',
+    'CameraCapabilityProfile',
+    'CameraCapabilityReport',
+    'CameraCapabilityService',
+    'CameraCapabilityWarning',
+    'PtzNode',
+    'PtzServiceCapabilities',
+    'PtzSpaces',
+  ]) {
+    assert.match(indexDeclaration, new RegExp(`\\b${typeName}\\b`));
+  }
+  assert.match(cliDeclaration, /getCameraCapabilities: typeof getCameraCapabilities/);
+
+  const publicDeclarations = `${indexDeclaration}\n${cliDeclaration}`;
+  assert.doesNotMatch(
+    publicDeclarations,
+    /CameraCapability(?:Dependencies|Device)|OnvifRawResponse|getCameraCapabilitiesWithDependencies/,
+  );
+  assert.doesNotMatch(
+    publicDeclarations,
+    /OnvifResponseError|ParsedServiceDiscovery|ParsedPtzNodes|parseScopesResponse|parseServicesResponse|parseCapabilitiesResponse|selectService|parseMedia1ProfilesResponse|parseMedia2ProfilesResponse|parsePtz|parseMedia2OptionsResponse/,
   );
 });

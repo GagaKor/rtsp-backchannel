@@ -38,6 +38,17 @@ export type {
   SendCodec,
 } from './rtsp/sdp.ts';
 
+export { getCameraCapabilities } from './onvif/capabilities.ts';
+export type {
+  CameraCapabilityOptions,
+  CameraCapabilityProfile,
+  CameraCapabilityReport,
+  CameraCapabilityService,
+  CameraCapabilityWarning,
+  PtzNode,
+  PtzServiceCapabilities,
+  PtzSpaces,
+} from './onvif/capabilities.ts';
 export { discoverDevices } from './onvif/discovery.ts';
 export type {
   DiscoveredDevice,

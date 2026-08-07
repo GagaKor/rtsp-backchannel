@@ -15,6 +15,7 @@ import {
 } from './backchannel.ts';
 import { fileToG711, fileToRtpAudio } from './audio/transcode.ts';
 import { pathToFileURL } from 'node:url';
+import { getCameraCapabilities } from './onvif/capabilities.ts';
 import { discoverDevices } from './onvif/discovery.ts';
 import { getStreamUris } from './onvif/streams.ts';
 import type { CodecPreference } from './rtsp/sdp.ts';
@@ -24,6 +25,8 @@ const HELP = `Usage: rtsp-backchannel --host <camera> --user <user> --pass <pass
                             [--cidr <IPv4/CIDR> ...] [--port <number> ...]
                             [--concurrency <1..256>]
   rtsp-backchannel streams --host <camera> [--user <user>] [--pass <password>]
+  rtsp-backchannel capabilities --host <camera> [--user <user>] [--pass <password>]
+                                [--device-url <url> ...] [--timeout-ms <ms>]
 
 Options:
   --file <path>       audio file to play once
@@ -40,6 +43,10 @@ Discovery options:
   --concurrency <n>   concurrent CIDR hosts (default: 64)
   --timeout-ms <ms>   discovery timeout (default: 3000)
 
+Capability options:
+  --device-url <url>  ONVIF Device Service URL (repeatable)
+  --timeout-ms <ms>   finite positive per-request timeout (maximum: 86,400,000 ms)
+
 Playback profile: SDP codec negotiation, TCP interleaved RTP, real-time pacing.
 `;
 
@@ -53,6 +60,10 @@ const CODEC_PREFERENCES: readonly CodecPreference[] = [
   'g726-40',
   'aac',
 ];
+const MAX_CAPABILITY_TIMEOUT_MS = 86_400_000;
+const CAPABILITY_TIMEOUT_RANGE_ERROR = 'timeout-ms exceeds the 24-hour maximum';
+const CAPABILITY_TERMINATOR_ERROR = 'capabilities does not accept an argument terminator';
+const UNKNOWN_CAPABILITY_ARGUMENT_ERROR = 'unknown capabilities argument';
 
 function arg(argv: string[], name: string, def?: string): string {
   const i = argv.indexOf(`--${name}`);
@@ -86,6 +97,7 @@ export interface PlaybackDependencies {
 export interface CommandDependencies extends PlaybackDependencies {
   discoverDevices: typeof discoverDevices;
   getStreamUris: typeof getStreamUris;
+  getCameraCapabilities: typeof getCameraCapabilities;
 }
 
 const playbackDependencies: PlaybackDependencies = {
@@ -99,6 +111,7 @@ const commandDependencies: CommandDependencies = {
   ...playbackDependencies,
   discoverDevices,
   getStreamUris,
+  getCameraCapabilities,
 };
 
 function args(argv: string[], name: string): string[] {
@@ -107,6 +120,97 @@ function args(argv: string[], name: string): string[] {
     if (argv[index] === `--${name}` && argv[index + 1]) values.push(argv[++index]);
   }
   return values;
+}
+
+const CAPABILITY_OPTION_NAMES = [
+  'host',
+  'user',
+  'pass',
+  'device-url',
+  'timeout-ms',
+] as const;
+type CapabilityOptionName = typeof CAPABILITY_OPTION_NAMES[number];
+
+function exactCapabilityOptionName(value: string): CapabilityOptionName | undefined {
+  return CAPABILITY_OPTION_NAMES.find((name) => value === `--${name}`);
+}
+
+function attachedCapabilityOption(
+  value: string,
+): { name: CapabilityOptionName; value: string } | undefined {
+  for (const name of CAPABILITY_OPTION_NAMES) {
+    const prefix = `--${name}=`;
+    if (value.startsWith(prefix)) return { name, value: value.slice(prefix.length) };
+  }
+  return undefined;
+}
+
+function isKnownCapabilityFlag(value: string): boolean {
+  return value === '-h'
+    || value === '--help'
+    || exactCapabilityOptionName(value) !== undefined
+    || attachedCapabilityOption(value) !== undefined;
+}
+
+function missingCapabilityValue(name: CapabilityOptionName): Error {
+  return new Error(`missing value for --${name}`);
+}
+
+interface ParsedCapabilityArguments {
+  host: string[];
+  user: string[];
+  pass: string[];
+  'device-url': string[];
+  'timeout-ms': string[];
+}
+
+function parseCapabilityArguments(argv: string[]): ParsedCapabilityArguments {
+  const terminatorIndex = argv.indexOf('--');
+  if (terminatorIndex >= 0) {
+    const precedingOption = exactCapabilityOptionName(argv[terminatorIndex - 1] ?? '');
+    if (precedingOption) throw missingCapabilityValue(precedingOption);
+    throw new Error(CAPABILITY_TERMINATOR_ERROR);
+  }
+
+  const parsed: ParsedCapabilityArguments = {
+    host: [],
+    user: [],
+    pass: [],
+    'device-url': [],
+    'timeout-ms': [],
+  };
+  for (let index = 0; index < argv.length; index++) {
+    const attached = attachedCapabilityOption(argv[index]);
+    if (attached) {
+      if (
+        (attached.name !== 'pass' && attached.value === '')
+        || (attached.name !== 'pass' && attached.value.startsWith('--'))
+      ) {
+        throw missingCapabilityValue(attached.name);
+      }
+      parsed[attached.name].push(attached.value);
+      continue;
+    }
+
+    const name = exactCapabilityOptionName(argv[index]);
+    if (!name) {
+      if (argv[index] === '-h' || argv[index] === '--help') continue;
+      throw new Error(UNKNOWN_CAPABILITY_ARGUMENT_ERROR);
+    }
+    const value = argv[index + 1];
+    if (
+      value === undefined
+      || (name !== 'pass' && value === '')
+      || (name === 'pass'
+        ? isKnownCapabilityFlag(value)
+        : value === '-h' || value.startsWith('--'))
+    ) {
+      throw missingCapabilityValue(name);
+    }
+    parsed[name].push(value);
+    index++;
+  }
+  return parsed;
 }
 
 export function parseCliArgs(argv: string[]): PlaybackOptions {
@@ -213,7 +317,7 @@ export async function main(
   argv = process.argv.slice(2),
   dependencies: CommandDependencies = commandDependencies,
 ): Promise<void> {
-  if (argv.includes('--help') || argv.includes('-h')) {
+  if (argv[0] !== 'capabilities' && (argv.includes('--help') || argv.includes('-h'))) {
     process.stdout.write(HELP);
     return;
   }
@@ -245,6 +349,36 @@ export async function main(
       ...(concurrency !== undefined ? { concurrency } : {}),
     });
     for (const device of devices) dependencies.log(JSON.stringify(device));
+    return;
+  }
+  if (argv[0] === 'capabilities') {
+    const commandArgs = argv.slice(1);
+    const parsed = parseCapabilityArguments(commandArgs);
+    if (commandArgs.includes('--help') || commandArgs.includes('-h')) {
+      process.stdout.write(HELP);
+      return;
+    }
+    const hosts = parsed.host;
+    const users = parsed.user;
+    const passwords = parsed.pass;
+    const deviceUrls = parsed['device-url'];
+    const timeoutValues = parsed['timeout-ms'];
+    if (hosts.length === 0) throw new Error('missing --host');
+    const timeoutMs = timeoutValues.length > 0 ? Number(timeoutValues[0]) : undefined;
+    if (timeoutMs !== undefined && (!Number.isFinite(timeoutMs) || timeoutMs <= 0)) {
+      throw new RangeError('timeout-ms must be finite and greater than 0');
+    }
+    if (timeoutMs !== undefined && timeoutMs > MAX_CAPABILITY_TIMEOUT_MS) {
+      throw new RangeError(CAPABILITY_TIMEOUT_RANGE_ERROR);
+    }
+    const report = await dependencies.getCameraCapabilities({
+      host: hosts[0],
+      user: users[0] ?? '',
+      pass: passwords.length > 0 ? passwords[0] : process.env.ONVIF_PASSWORD ?? '',
+      ...(deviceUrls.length > 0 ? { deviceUrls } : {}),
+      ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+    });
+    dependencies.log(JSON.stringify(report));
     return;
   }
   if (argv[0] === 'streams') {

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import codecs
 import datetime
 import hashlib
 import ipaddress
@@ -29,7 +30,10 @@ _DEFAULT_CIDR_CONCURRENCY = 64
 _MAX_CIDR_HOSTS = 4096
 _MAX_DISCOVERY_RESPONSE_BYTES = 1024 * 1024
 _MAX_SOAP_RESPONSE_BYTES = 1024 * 1024
+_MAX_XML_ELEMENT_DEPTH = 64
 _DISCOVERY_READ_CHUNK_BYTES = 64 * 1024
+_SOAP11_NS = "http://schemas.xmlsoap.org/soap/envelope/"
+_SOAP12_NS = "http://www.w3.org/2003/05/soap-envelope"
 _DEVICE_NS = "http://www.onvif.org/ver10/device/wsdl"
 _MEDIA_NS = "http://www.onvif.org/ver10/media/wsdl"
 _SCHEMA_NS = "http://www.onvif.org/ver10/schema"
@@ -46,6 +50,13 @@ _PASSWORD_DIGEST = (
     "oasis-200401-wss-username-token-profile-1.0#PasswordDigest"
 )
 _TLS_CONTEXT = ssl._create_unverified_context()
+_EXPECTED_OPERATION_ERRORS = (
+    OSError,
+    RuntimeError,
+    ValueError,
+    OverflowError,
+    ElementTree.ParseError,
+)
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -73,14 +84,139 @@ class OnvifProfile:
 
 
 @dataclass(frozen=True)
+class DeviceInfo:
+    manufacturer: str | None = None
+    model: str | None = None
+    firmware: str | None = None
+    serial: str | None = None
+
+
+@dataclass(frozen=True)
 class StreamUri:
     profile_token: str
     profile_name: str | None
     uri: str
 
 
+@dataclass(frozen=True)
+class _SoapResponse:
+    status_code: int
+    xml: str
+
+
 def _local_name(tag: str) -> str:
     return tag.rsplit("}", 1)[-1].rsplit(":", 1)[-1]
+
+
+def _has_wide_xml_markup_prefix(
+    xml: bytes, unit_size: int, byte_order: str
+) -> bool:
+    offset = 0
+    while offset + unit_size <= len(xml):
+        value = int.from_bytes(
+            xml[offset : offset + unit_size], byte_order
+        )
+        if value in (0x09, 0x0A, 0x0D, 0x20):
+            offset += unit_size
+            continue
+        return value == ord("<")
+    return False
+
+
+def _declaration_scan_text(xml: bytes | str) -> str:
+    if not isinstance(xml, bytes):
+        return xml
+    if xml.startswith((codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)):
+        encoding = "utf-32"
+    elif xml.startswith(codecs.BOM_UTF8):
+        encoding = "utf-8-sig"
+    elif xml.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        encoding = "utf-16"
+    elif _has_wide_xml_markup_prefix(xml, 4, "big"):
+        encoding = "utf-32-be"
+    elif _has_wide_xml_markup_prefix(xml, 4, "little"):
+        encoding = "utf-32-le"
+    elif _has_wide_xml_markup_prefix(xml, 2, "big"):
+        encoding = "utf-16-be"
+    elif _has_wide_xml_markup_prefix(xml, 2, "little"):
+        encoding = "utf-16-le"
+    else:
+        encoding = "latin-1"
+    try:
+        return xml.decode(encoding)
+    except UnicodeDecodeError:
+        raise ElementTree.ParseError("invalid XML document") from None
+
+
+def _contains_forbidden_declaration(xml: bytes | str) -> bool:
+    text = _declaration_scan_text(xml)
+    cursor = 0
+    while True:
+        markup = text.find("<", cursor)
+        if markup < 0:
+            return False
+        if text.startswith("<!--", markup):
+            end = text.find("-->", markup + 4)
+            if end < 0:
+                return False
+            cursor = end + 3
+            continue
+        if text.startswith("<![CDATA[", markup):
+            end = text.find("]]>", markup + 9)
+            if end < 0:
+                return False
+            cursor = end + 3
+            continue
+        if text.startswith("<?", markup):
+            end = text.find("?>", markup + 2)
+            if end < 0:
+                return False
+            cursor = end + 2
+            continue
+        if text.startswith("<!", markup):
+            name_start = markup + 2
+            while name_start < len(text) and text[name_start] in " \t\r\n":
+                name_start += 1
+            name_end = name_start
+            while name_end < len(text):
+                character = text[name_end]
+                if not (
+                    "0" <= character <= "9"
+                    or "A" <= character <= "Z"
+                    or character == "_"
+                    or "a" <= character <= "z"
+                ):
+                    break
+                name_end += 1
+            if text[name_start:name_end].upper() in ("DOCTYPE", "ENTITY"):
+                return True
+        cursor = markup + 1
+
+
+class _DepthBoundedTreeBuilder(ElementTree.TreeBuilder):
+    def __init__(self) -> None:
+        super().__init__()
+        self._depth = 0
+
+    def start(self, tag, attrs):
+        self._depth += 1
+        if self._depth > _MAX_XML_ELEMENT_DEPTH:
+            raise ElementTree.ParseError("invalid XML document")
+        return super().start(tag, attrs)
+
+    def end(self, tag):
+        element = super().end(tag)
+        self._depth -= 1
+        return element
+
+
+def _safe_xml_fromstring(xml: bytes | str) -> ElementTree.Element:
+    if _contains_forbidden_declaration(xml):
+        raise ElementTree.ParseError(
+            "DTD and entity declarations are not allowed"
+        )
+    parser = ElementTree.XMLParser(target=_DepthBoundedTreeBuilder())
+    return ElementTree.fromstring(xml, parser=parser)
 
 
 def _first_text(element: ElementTree.Element, name: str) -> str | None:
@@ -88,6 +224,55 @@ def _first_text(element: ElementTree.Element, name: str) -> str | None:
         if _local_name(candidate.tag) == name and candidate.text is not None:
             return candidate.text.strip()
     return None
+
+
+def _tag_parts(tag: str) -> tuple[str, str]:
+    if tag.startswith("{"):
+        namespace, local = tag[1:].split("}", 1)
+        return namespace, local
+    return "", tag
+
+
+def _direct_child(
+    element: ElementTree.Element, namespace: str, name: str
+) -> ElementTree.Element | None:
+    expected = (namespace, name)
+    return next(
+        (child for child in list(element) if _tag_parts(child.tag) == expected),
+        None,
+    )
+
+
+def _parse_device_information(xml: bytes | str) -> DeviceInfo:
+    root = _safe_xml_fromstring(xml)
+    soap_namespace, root_name = _tag_parts(root.tag)
+    if root_name != "Envelope" or soap_namespace not in (
+        _SOAP11_NS,
+        _SOAP12_NS,
+    ):
+        raise RuntimeError("ONVIF authentication failed")
+    body = _direct_child(root, soap_namespace, "Body")
+    response = (
+        _direct_child(body, _DEVICE_NS, "GetDeviceInformationResponse")
+        if body is not None
+        else None
+    )
+    if response is None:
+        raise RuntimeError("ONVIF authentication failed")
+
+    def value(name: str) -> str | None:
+        child = _direct_child(response, _DEVICE_NS, name)
+        if child is None or child.text is None:
+            return None
+        parsed = child.text.strip()
+        return parsed or None
+
+    return DeviceInfo(
+        manufacturer=value("Manufacturer"),
+        model=value("Model"),
+        firmware=value("FirmwareVersion"),
+        serial=value("SerialNumber"),
+    )
 
 
 def _sanitize_stream_uri(uri: str) -> str:
@@ -125,7 +310,7 @@ def parse_probe_matches(
 ) -> list[DiscoveredDevice]:
     """Parse every ONVIF ProbeMatch in a WS-Discovery datagram."""
 
-    root = ElementTree.fromstring(xml)
+    root = _safe_xml_fromstring(xml)
     devices = []
     for match in root.iter():
         if _local_name(match.tag) != "ProbeMatch":
@@ -419,7 +604,7 @@ def _probe_device_service(url: str, deadline: float) -> None:
         status = response.getcode()
         if not 200 <= status < 300:
             raise RuntimeError(f"ONVIF discovery returned HTTP {status}")
-        root = ElementTree.fromstring(_bounded_response_body(response, deadline))
+        root = _safe_xml_fromstring(_bounded_response_body(response, deadline))
     if not any(
         _local_name(candidate.tag) == "UTCDateTime" for candidate in root.iter()
     ):
@@ -437,7 +622,7 @@ def _probe_cidr_host(
         try:
             _probe_device_service(url, deadline)
             xaddrs.append(url)
-        except Exception:
+        except _EXPECTED_OPERATION_ERRORS:
             continue
     if not xaddrs:
         return None
@@ -541,7 +726,7 @@ def discover_devices(
 
 
 def parse_profiles(xml: bytes | str) -> list[OnvifProfile]:
-    root = ElementTree.fromstring(xml)
+    root = _safe_xml_fromstring(xml)
     profiles = []
     for candidate in root.iter():
         if _local_name(candidate.tag) != "Profiles":
@@ -562,7 +747,100 @@ def parse_profiles(xml: bytes | str) -> list[OnvifProfile]:
     return profiles
 
 
-def _soap_request(url: str, body: str, header: str, timeout: float) -> str:
+def _validated_service_url(value: str):
+    if not isinstance(value, str) or any(
+        ord(character) <= 0x20 or ord(character) == 0x7F
+        for character in value
+    ):
+        raise RuntimeError("invalid ONVIF service URL")
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except (AttributeError, TypeError, ValueError):
+        raise RuntimeError("invalid ONVIF service URL") from None
+    if (
+        parsed.scheme.lower() not in ("http", "https")
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+        or port == 0
+    ):
+        raise RuntimeError("invalid ONVIF service URL")
+    return parsed
+
+
+def _validate_service_url(value: str) -> None:
+    _validated_service_url(value)
+
+
+def _legacy_ipv4_address(hostname: str) -> str | None:
+    if any(
+        character != "." and not "0" <= character <= "9"
+        for character in hostname
+    ):
+        return None
+    parts = hostname.split(".")
+    if not 1 <= len(parts) <= 4 or any(
+        not part
+        or (len(part) > 1 and part.startswith("0"))
+        for part in parts
+    ):
+        raise RuntimeError("invalid ONVIF service URL")
+    last_bits = 8 * (5 - len(parts))
+    maximums = [255] * (len(parts) - 1) + [(1 << last_bits) - 1]
+    numbers = []
+    for part, maximum in zip(parts, maximums):
+        maximum_text = str(maximum)
+        if len(part) > len(maximum_text) or (
+            len(part) == len(maximum_text) and part > maximum_text
+        ):
+            raise RuntimeError("invalid ONVIF service URL")
+        numbers.append(int(part))
+    address = numbers[-1]
+    for index, number in enumerate(numbers[:-1]):
+        address |= number << (24 - index * 8)
+    return str(ipaddress.IPv4Address(address))
+
+
+def _canonical_service_host(parsed) -> str:
+    hostname = parsed.hostname
+    if hostname is None:
+        raise RuntimeError("invalid ONVIF service URL")
+    legacy_ipv4 = _legacy_ipv4_address(hostname)
+    if legacy_ipv4 is not None:
+        return f"ip:{legacy_ipv4}"
+    try:
+        return f"ip:{ipaddress.ip_address(hostname)}"
+    except ValueError:
+        try:
+            domain = hostname.removesuffix(".").encode("idna").decode("ascii")
+        except UnicodeError:
+            raise RuntimeError("invalid ONVIF service URL") from None
+        return f"domain:{domain.lower()}"
+
+
+def _validate_service_url_against_device(
+    device_url: str, service_url: str
+) -> None:
+    device = _validated_service_url(device_url)
+    service = _validated_service_url(service_url)
+    if (
+        device.scheme.lower() != service.scheme.lower()
+        or _canonical_service_host(device) != _canonical_service_host(service)
+    ):
+        raise RuntimeError("invalid ONVIF service URL")
+
+
+def _soap_response(
+    url: str,
+    body: str,
+    header: str,
+    timeout: float,
+    *,
+    stop_on_auth_error: bool = False,
+) -> _SoapResponse:
+    _validate_service_url(url)
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("timeout must be finite and greater than 0")
     deadline = time.monotonic() + timeout
@@ -581,30 +859,47 @@ def _soap_request(url: str, body: str, header: str, timeout: float) -> str:
     if remaining <= 0:
         raise TimeoutError("ONVIF SOAP deadline exceeded")
     try:
-        response = urllib.request.urlopen(
-            request, timeout=remaining, context=_TLS_CONTEXT
-        )
+        response = _discovery_opener().open(request, timeout=remaining)
     except urllib.error.HTTPError as error:
+        if stop_on_auth_error and error.code in (401, 403):
+            error.close()
+            return _SoapResponse(error.code, "")
         with error:
-            return _bounded_response_body(
+            xml = _bounded_response_body(
                 error,
                 deadline,
                 max_bytes=_MAX_SOAP_RESPONSE_BYTES,
                 context="ONVIF SOAP",
             ).decode("utf-8", "replace")
+        return _SoapResponse(error.code, xml)
     except urllib.error.URLError as error:
         if isinstance(error.reason, TimeoutError):
             raise TimeoutError("ONVIF SOAP deadline exceeded") from error
         raise
     except TimeoutError as error:
         raise TimeoutError("ONVIF SOAP deadline exceeded") from error
+    getcode = getattr(response, "getcode", None)
+    status = (
+        getcode()
+        if callable(getcode)
+        else getattr(response, "status", 200)
+    )
+    status = status if isinstance(status, int) else 200
+    if stop_on_auth_error and status in (401, 403):
+        response.close()
+        return _SoapResponse(status, "")
     with response:
-        return _bounded_response_body(
+        xml = _bounded_response_body(
             response,
             deadline,
             max_bytes=_MAX_SOAP_RESPONSE_BYTES,
             context="ONVIF SOAP",
         ).decode("utf-8", "replace")
+    return _SoapResponse(status, xml)
+
+
+def _soap_request(url: str, body: str, header: str, timeout: float) -> str:
+    return _soap_response(url, body, header, timeout).xml
 
 
 def _wsse_header(user: str, password: str, when: datetime.datetime) -> str:
@@ -655,20 +950,65 @@ class OnvifDevice:
             f"http://{self.host}:8000/onvif/device_service",
         ]
 
-    def _call(self, url: str, body: str, *, authenticated: bool = True) -> str:
+    def _request(
+        self,
+        url: str,
+        body: str,
+        *,
+        authenticated: bool,
+        include_status: bool,
+    ) -> str | _SoapResponse:
+        if self.device_url is None:
+            _validate_service_url(url)
+        else:
+            _validate_service_url_against_device(self.device_url, url)
         header = ""
         if authenticated and (self.user or self.password):
             now = datetime.datetime.now(datetime.timezone.utc) + self.clock_offset
             header = _wsse_header(self.user, self.password, now)
+        if include_status:
+            return _soap_response(
+                url,
+                body,
+                header,
+                self.timeout,
+                stop_on_auth_error=True,
+            )
         return _soap_request(url, body, header, self.timeout)
 
+    def _call(self, url: str, body: str, *, authenticated: bool = True) -> str:
+        response = self._request(
+            url,
+            body,
+            authenticated=authenticated,
+            include_status=False,
+        )
+        assert isinstance(response, str)
+        return response
+
+    def _call_response(
+        self, url: str, body: str, *, authenticated: bool = True
+    ) -> _SoapResponse:
+        response = self._request(
+            url,
+            body,
+            authenticated=authenticated,
+            include_status=True,
+        )
+        assert isinstance(response, _SoapResponse)
+        if response.status_code in (401, 403):
+            raise RuntimeError("ONVIF authentication failed")
+        if not 200 <= response.status_code < 300:
+            raise RuntimeError(f"HTTP {response.status_code}")
+        return response
+
     def _system_time(self, url: str) -> datetime.datetime:
-        xml = self._call(
+        xml = self._call_response(
             url,
             f'<GetSystemDateAndTime xmlns="{_DEVICE_NS}"/>',
             authenticated=False,
-        )
-        root = ElementTree.fromstring(xml)
+        ).xml
+        root = _safe_xml_fromstring(xml)
         utc = next(
             (
                 candidate
@@ -699,50 +1039,71 @@ class OnvifDevice:
             tzinfo=datetime.timezone.utc,
         )
 
-    def connect(self) -> None:
-        last_error = None
+    def connect(self) -> DeviceInfo:
+        self.device_url = None
+        self.media_url = None
+        self.clock_offset = datetime.timedelta()
         for url in self._candidates():
             try:
                 camera_time = self._system_time(url)
                 local_time = datetime.datetime.now(datetime.timezone.utc)
                 self.clock_offset = camera_time - local_time
-                info = self._call(
+                info = self._call_response(
                     url,
                     f'<GetDeviceInformation xmlns="{_DEVICE_NS}"/>',
-                )
-                info_root = ElementTree.fromstring(info)
-                if not any(
-                    _local_name(candidate.tag)
-                    == "GetDeviceInformationResponse"
-                    for candidate in info_root.iter()
-                ):
-                    raise RuntimeError("ONVIF authentication failed")
+                ).xml
+                device_info = _parse_device_information(info)
+                media_url = self._media_service_url(url)
                 self.device_url = url
-                self.media_url = self._media_service_url(url)
-                return
-            except Exception as error:
-                last_error = error
-        raise RuntimeError("ONVIF connect failed") from last_error
+                self.media_url = media_url
+                return device_info
+            except _EXPECTED_OPERATION_ERRORS:
+                self.device_url = None
+                self.media_url = None
+                self.clock_offset = datetime.timedelta()
+                continue
+        raise RuntimeError("ONVIF connect failed") from None
 
     def _media_service_url(self, device_url: str) -> str:
-        xml = self._call(
+        xml = self._call_response(
             device_url,
             f'<GetCapabilities xmlns="{_DEVICE_NS}">'
             "<Category>Media</Category></GetCapabilities>",
-        )
-        root = ElementTree.fromstring(xml)
+        ).xml
+        root = _safe_xml_fromstring(xml)
         for candidate in root.iter():
             if _local_name(candidate.tag) != "Media":
                 continue
             xaddr = _first_text(candidate, "XAddr")
             if xaddr:
+                _validate_service_url_against_device(device_url, xaddr)
                 return xaddr
-        return device_url.replace("device_service", "media_service")
+        fallback = device_url.replace("device_service", "media_service")
+        _validate_service_url_against_device(device_url, fallback)
+        return fallback
 
     def _required_media_url(self) -> str:
         if self.media_url is None:
             raise RuntimeError("call connect() first")
         return self.media_url
+
+    def _required_device_url(self) -> str:
+        if self.device_url is None:
+            raise RuntimeError("call connect() first")
+        return self.device_url
+
+    def read_only_call(
+        self, body: str, endpoint: str | None = None
+    ) -> _SoapResponse:
+        device_url = self._required_device_url()
+        response = self._request(
+            endpoint or device_url,
+            body,
+            authenticated=True,
+            include_status=True,
+        )
+        assert isinstance(response, _SoapResponse)
+        return response
 
     def get_profiles(self) -> list[OnvifProfile]:
         xml = self._call(
@@ -761,7 +1122,7 @@ class OnvifDevice:
             "</GetStreamUri>"
         )
         xml = self._call(self._required_media_url(), body)
-        root = ElementTree.fromstring(xml)
+        root = _safe_xml_fromstring(xml)
         for candidate in root.iter():
             if _local_name(candidate.tag) == "Uri" and candidate.text:
                 return _sanitize_stream_uri(candidate.text)
@@ -799,6 +1160,7 @@ def get_stream_uris(
 
 
 __all__ = [
+    "DeviceInfo",
     "DiscoveredDevice",
     "OnvifDevice",
     "OnvifProfile",

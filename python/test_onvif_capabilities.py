@@ -1,0 +1,2214 @@
+from __future__ import annotations
+
+import codecs
+import dataclasses
+import http.server
+import io
+import json
+import threading
+import unittest
+import urllib.error
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+from xml.etree import ElementTree
+
+from rtsp_backchannel.cli import _camera_capability_json
+from rtsp_backchannel.capabilities import (
+    CameraCapabilityProfile,
+    CameraCapabilityReport,
+    CameraCapabilityService,
+    CameraCapabilityVersion,
+    CameraCapabilityWarning,
+    Media2CapabilityReport,
+    PtzCapabilityReport,
+    PtzNode,
+    PtzServiceCapabilities,
+    PtzSpaces,
+    _OnvifResponseError,
+    _parse_capabilities_response,
+    _parse_media1_profiles_response,
+    _parse_media2_options_response,
+    _parse_media2_profiles_response,
+    _parse_ptz_nodes_response,
+    _parse_ptz_service_capabilities_response,
+    _parse_scopes_response,
+    _parse_services_response,
+    _select_service,
+    get_camera_capabilities,
+)
+from rtsp_backchannel import onvif
+from rtsp_backchannel.onvif import DeviceInfo, OnvifDevice, OnvifProfile
+
+
+SOAP12_NS = "http://www.w3.org/2003/05/soap-envelope"
+SOAP11_NS = "http://schemas.xmlsoap.org/soap/envelope/"
+DEVICE_NS = "http://www.onvif.org/ver10/device/wsdl"
+SCHEMA_NS = "http://www.onvif.org/ver10/schema"
+MEDIA1_NS = "http://www.onvif.org/ver10/media/wsdl"
+MEDIA2_NS = "http://www.onvif.org/ver20/media/wsdl"
+PTZ_NS = "http://www.onvif.org/ver20/ptz/wsdl"
+EVENTS_NS = "http://www.onvif.org/ver10/events/wsdl"
+NBSP = "\N{NO-BREAK SPACE}"
+
+GET_SCOPES = f'<GetScopes xmlns="{DEVICE_NS}"/>'
+GET_SERVICES = (
+    f'<GetServices xmlns="{DEVICE_NS}">'
+    "<IncludeCapability>true</IncludeCapability></GetServices>"
+)
+GET_ALL_CAPABILITIES = (
+    f'<GetCapabilities xmlns="{DEVICE_NS}">'
+    "<Category>All</Category></GetCapabilities>"
+)
+MEDIA1_GET_PROFILES = f'<GetProfiles xmlns="{MEDIA1_NS}"/>'
+MEDIA2_GET_PROFILES = (
+    f'<GetProfiles xmlns="{MEDIA2_NS}"><Type>All</Type></GetProfiles>'
+)
+MEDIA2_GET_OPTIONS = (
+    f'<GetVideoEncoderConfigurationOptions xmlns="{MEDIA2_NS}"/>'
+)
+PTZ_GET_CAPABILITIES = f'<GetServiceCapabilities xmlns="{PTZ_NS}"/>'
+PTZ_GET_NODES = f'<GetNodes xmlns="{PTZ_NS}"/>'
+
+
+def soap(body: str) -> str:
+    return (
+        f'<s:Envelope xmlns:s="{SOAP12_NS}" xmlns:tds="{DEVICE_NS}" '
+        f'xmlns:tt="{SCHEMA_NS}" xmlns:trt="{MEDIA1_NS}" '
+        f'xmlns:tr2="{MEDIA2_NS}" xmlns:tptz="{PTZ_NS}" '
+        f'xmlns:vendor="urn:vendor">'
+        f"<s:Body>{body}</s:Body></s:Envelope>"
+    )
+
+
+def soap11(body: str) -> str:
+    return (
+        f'<env:Envelope xmlns:env="{SOAP11_NS}" '
+        'xmlns:ter="http://www.onvif.org/ver10/error">'
+        f"<env:Body>{body}</env:Body></env:Envelope>"
+    )
+
+
+class CapabilityParserTests(unittest.TestCase):
+    def test_public_report_dataclasses_are_frozen_and_deeply_immutable(self):
+        self.assertEqual(
+            [field.name for field in dataclasses.fields(OnvifProfile)],
+            [
+                "token",
+                "name",
+                "has_audio_encoder",
+                "has_audio_output",
+                "has_audio_source",
+            ],
+        )
+        service = CameraCapabilityService(
+            namespace=MEDIA2_NS,
+            xaddr="http://camera/media2",
+            version=CameraCapabilityVersion(major=2, minor=0),
+        )
+        report = CameraCapabilityReport(
+            device=DeviceInfo(manufacturer="Fixture Camera", model="C1"),
+            scopes=("onvif://www.onvif.org/Profile/Streaming",),
+            declared_profiles=("S",),
+            service_discovery="getServices",
+            services=(service,),
+            profiles=(),
+            ptz=PtzCapabilityReport(
+                detected=None,
+                pan_tilt_supported=None,
+                zoom_supported=None,
+                profile_tokens=(),
+                service_capabilities=None,
+                nodes=(),
+            ),
+            media2=Media2CapabilityReport(
+                detected=True,
+                encodings=("H265",),
+                h265_supported=True,
+            ),
+            warnings=(CameraCapabilityWarning("GetScopes", "request timeout"),),
+        )
+
+        for value in (
+            report,
+            report.device,
+            service,
+            service.version,
+            report.ptz,
+            report.media2,
+            report.warnings[0],
+        ):
+            self.assertTrue(dataclasses.is_dataclass(value))
+            self.assertTrue(value.__dataclass_params__.frozen)
+        self.assertIsInstance(report.services, tuple)
+        self.assertIsInstance(report.warnings, tuple)
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            report.service_discovery = "unavailable"
+
+    def test_parses_nested_scopes_with_stable_dedup_and_profile_aliases(self):
+        streaming = "onvif://www.onvif.org/Profile/Streaming"
+        profile_t = "onvif://www.onvif.org/Profile/%74"
+        vendor = "onvif://www.onvif.org/Profile/vendor%2Dplus"
+        hardware = "onvif://www.onvif.org/hardware/Camera%201"
+        parsed = _parse_scopes_response(
+            soap(
+                f"""
+                <tds:GetScopesResponse>
+                  <tds:Scopes><tt:ScopeDef>Fixed</tt:ScopeDef><tt:ScopeItem>{streaming}</tt:ScopeItem></tds:Scopes>
+                  <tds:Scopes><tt:ScopeItem>{hardware}</tt:ScopeItem></tds:Scopes>
+                  <tds:Scopes><tt:ScopeItem>{streaming}</tt:ScopeItem></tds:Scopes>
+                  <tds:Scopes><tt:ScopeItem>{profile_t}</tt:ScopeItem></tds:Scopes>
+                  <tds:Scopes><tt:ScopeItem>{vendor}</tt:ScopeItem></tds:Scopes>
+                  <tds:Scopes><tt:ScopeItem>onvif://www.onvif.org/Profile/%ZZ</tt:ScopeItem></tds:Scopes>
+                  <tds:Scopes><tt:ScopeItem>onvif://www.onvif.org/Profile/T/extra</tt:ScopeItem></tds:Scopes>
+                  <tds:Scopes><tt:ScopeItem>onvif://www.onvif.org/Profile/T?x=1</tt:ScopeItem></tds:Scopes>
+                  <tds:Scopes><tt:ScopeItem>onvif://www.onvif.org/profile/R</tt:ScopeItem></tds:Scopes>
+                  <vendor:Scopes><tt:ScopeItem>onvif://www.onvif.org/Profile/Q</tt:ScopeItem></vendor:Scopes>
+                </tds:GetScopesResponse>
+                """
+            )
+        )
+
+        self.assertEqual(
+            parsed.scopes,
+            (
+                streaming,
+                hardware,
+                profile_t,
+                vendor,
+                "onvif://www.onvif.org/Profile/%ZZ",
+                "onvif://www.onvif.org/Profile/T/extra",
+                "onvif://www.onvif.org/Profile/T?x=1",
+                "onvif://www.onvif.org/profile/R",
+            ),
+        )
+        self.assertEqual(parsed.declared_profiles, ("S", "T", "VENDOR-PLUS"))
+
+
+def service(namespace: str, xaddr: str, major: int = 1, minor: int = 0) -> str:
+    return (
+        f"<tds:Service><tds:Namespace>{namespace}</tds:Namespace>"
+        f"<tds:XAddr>{xaddr}</tds:XAddr><tds:Version>"
+        f"<tt:Major>{major}</tt:Major><tt:Minor>{minor}</tt:Minor>"
+        "</tds:Version></tds:Service>"
+    )
+
+
+def raw_response(body: str, status_code: int = 200):
+    return SimpleNamespace(status_code=status_code, xml=soap(body))
+
+
+class FakeCapabilityDevice:
+    def __init__(self, responder, *, media_url="http://camera/connected-media"):
+        self.responder = responder
+        self.media_url = media_url
+        self.calls = []
+        self.connect_count = 0
+
+    def connect(self):
+        self.connect_count += 1
+        return DeviceInfo(manufacturer="Fixture Camera", model="C1")
+
+    def read_only_call(self, body, endpoint=None):
+        self.calls.append((body, endpoint))
+        return self.responder(body, endpoint)
+
+    def _required_media_url(self):
+        return self.media_url
+
+
+class CapabilityOrchestrationTests(unittest.TestCase):
+    def _run_with_fake(self, fake, **options):
+        constructor_calls = []
+
+        def construct(host, user="", password="", **kwargs):
+            constructor_calls.append((host, user, password, kwargs))
+            return fake
+
+        with patch("rtsp_backchannel.capabilities.OnvifDevice", side_effect=construct):
+            report = get_camera_capabilities(**options)
+        return report, constructor_calls
+
+    def test_routes_exact_read_only_operations_to_selected_service_endpoints(self):
+        def respond(body, endpoint):
+            if body == GET_SCOPES:
+                return raw_response(
+                    "<tds:GetScopesResponse><tds:Scopes><tt:ScopeItem>"
+                    "onvif://www.onvif.org/Profile/Streaming"
+                    "</tt:ScopeItem></tds:Scopes></tds:GetScopesResponse>"
+                )
+            if body == GET_SERVICES:
+                return raw_response(
+                    "<tds:GetServicesResponse>"
+                    + service(MEDIA1_NS, "http://camera/media1", 2, 0)
+                    + service(PTZ_NS, "http://camera/ptz", 2, 0)
+                    + service(EVENTS_NS, "http://camera/events", 2, 0)
+                    + service(MEDIA2_NS, "http://camera/media2", 2, 0)
+                    + "</tds:GetServicesResponse>"
+                )
+            if body == MEDIA1_GET_PROFILES and endpoint == "http://camera/media1":
+                return raw_response(
+                    '<trt:GetProfilesResponse><trt:Profiles token="legacy">'
+                    "<tt:Name>Legacy</tt:Name><tt:PTZConfiguration token=\"ptz-legacy\">"
+                    "<tt:NodeToken>node-1</tt:NodeToken></tt:PTZConfiguration>"
+                    "</trt:Profiles></trt:GetProfilesResponse>"
+                )
+            if body == PTZ_GET_CAPABILITIES and endpoint == "http://camera/ptz":
+                return raw_response(
+                    '<tptz:GetServiceCapabilitiesResponse><tptz:Capabilities EFlip="true"/>'
+                    "</tptz:GetServiceCapabilitiesResponse>"
+                )
+            if body == PTZ_GET_NODES and endpoint == "http://camera/ptz":
+                return raw_response(
+                    '<tptz:GetNodesResponse><tptz:PTZNode token="node-1">'
+                    "<tt:SupportedPTZSpaces><tt:AbsolutePanTiltPositionSpace/>"
+                    "<tt:AbsoluteZoomPositionSpace/></tt:SupportedPTZSpaces>"
+                    "</tptz:PTZNode></tptz:GetNodesResponse>"
+                )
+            if body == MEDIA2_GET_PROFILES and endpoint == "http://camera/media2":
+                return raw_response(
+                    '<tr2:GetProfilesResponse><tr2:Profiles token="modern">'
+                    '<tr2:Configurations><tr2:PTZ token="ptz-modern"/>'
+                    "</tr2:Configurations></tr2:Profiles></tr2:GetProfilesResponse>"
+                )
+            if body == MEDIA2_GET_OPTIONS and endpoint == "http://camera/media2":
+                return raw_response(
+                    "<tr2:GetVideoEncoderConfigurationOptionsResponse>"
+                    "<tr2:Options><tt:Encoding>H264</tt:Encoding></tr2:Options>"
+                    "<tr2:Options><tt:Encoding>H265</tt:Encoding></tr2:Options>"
+                    "</tr2:GetVideoEncoderConfigurationOptionsResponse>"
+                )
+            raise AssertionError(f"unexpected operation {body!r} at {endpoint!r}")
+
+        fake = FakeCapabilityDevice(respond)
+        report, constructor_calls = self._run_with_fake(
+            fake,
+            host="camera",
+            user="admin",
+            password="password",
+            device_urls=["http://camera/device"],
+            timeout=1.25,
+        )
+
+        self.assertEqual(
+            constructor_calls,
+            [
+                (
+                    "camera",
+                    "admin",
+                    "password",
+                    {
+                        "device_urls": ["http://camera/device"],
+                        "timeout": 1.25,
+                    },
+                )
+            ],
+        )
+        self.assertEqual(fake.connect_count, 1)
+        self.assertEqual(
+            fake.calls,
+            [
+                (GET_SCOPES, None),
+                (GET_SERVICES, None),
+                (MEDIA1_GET_PROFILES, "http://camera/media1"),
+                (PTZ_GET_CAPABILITIES, "http://camera/ptz"),
+                (PTZ_GET_NODES, "http://camera/ptz"),
+                (MEDIA2_GET_PROFILES, "http://camera/media2"),
+                (MEDIA2_GET_OPTIONS, "http://camera/media2"),
+            ],
+        )
+        self.assertEqual(report.device, DeviceInfo("Fixture Camera", "C1"))
+        self.assertEqual(report.declared_profiles, ("S",))
+        self.assertEqual(report.service_discovery, "getServices")
+        self.assertEqual(
+            tuple((profile.token, profile.source) for profile in report.profiles),
+            (("legacy", "media1"), ("modern", "media2")),
+        )
+        self.assertEqual(report.ptz.profile_tokens, ("legacy", "modern"))
+        self.assertEqual(report.ptz.detected, True)
+        self.assertEqual(report.ptz.pan_tilt_supported, True)
+        self.assertEqual(report.ptz.zoom_supported, True)
+        self.assertEqual(report.ptz.service_capabilities.e_flip, True)
+        self.assertEqual(report.media2, Media2CapabilityReport(True, ("H264", "H265"), True))
+        self.assertEqual(report.warnings, ())
+
+    def test_falls_back_to_get_capabilities_all_and_preserves_tristate_unknowns(self):
+        def respond(body, endpoint):
+            if body == GET_SCOPES:
+                return raw_response("<tds:GetScopesResponse/>")
+            if body == GET_SERVICES:
+                return raw_response(
+                    "<s:Fault><s:Code><s:Value>s:Sender</s:Value><s:Subcode>"
+                    '<s:Value xmlns:ter="http://www.onvif.org/ver10/error">'
+                    "ter:ActionNotSupported</s:Value></s:Subcode></s:Code></s:Fault>",
+                    500,
+                )
+            if body == GET_ALL_CAPABILITIES:
+                return raw_response(
+                    "<tds:GetCapabilitiesResponse><tds:Capabilities><tt:Media>"
+                    "<tt:XAddr>http://camera/legacy-media</tt:XAddr></tt:Media>"
+                    "</tds:Capabilities></tds:GetCapabilitiesResponse>"
+                )
+            if body == MEDIA1_GET_PROFILES and endpoint == "http://camera/legacy-media":
+                return raw_response("<trt:GetProfilesResponse/>")
+            raise AssertionError(body)
+
+        fake = FakeCapabilityDevice(respond)
+        report, _ = self._run_with_fake(fake, host="camera")
+
+        self.assertEqual(report.service_discovery, "getCapabilities")
+        self.assertEqual(
+            tuple(warning.operation for warning in report.warnings),
+            ("GetServices",),
+        )
+        self.assertEqual(
+            tuple(body for body, _ in fake.calls),
+            (GET_SCOPES, GET_SERVICES, GET_ALL_CAPABILITIES, MEDIA1_GET_PROFILES),
+        )
+        self.assertEqual(report.ptz.detected, False)
+        self.assertIsNone(report.ptz.pan_tilt_supported)
+        self.assertIsNone(report.ptz.zoom_supported)
+        self.assertIsNone(report.media2.detected)
+        self.assertIsNone(report.media2.h265_supported)
+
+    def test_authentication_fault_is_fatal_and_never_runs_fallback(self):
+        secret_fault = soap11(
+            "<env:Fault><faultcode>env:Client</faultcode>"
+            "<faultstring>ter:NotAuthorized viewer url-secret payload-secret</faultstring>"
+            "<detail><Value>ter:ActionNotSupported</Value></detail></env:Fault>"
+        )
+
+        def respond(body, endpoint):
+            if body == GET_SCOPES:
+                return raw_response("<tds:GetScopesResponse/>")
+            if body == GET_SERVICES:
+                return SimpleNamespace(status_code=500, xml=secret_fault)
+            raise AssertionError("fallback must not run")
+
+        fake = FakeCapabilityDevice(respond)
+        with self.assertRaisesRegex(_OnvifResponseError, "SOAP Fault: NotAuthorized") as caught:
+            self._run_with_fake(fake, host="camera")
+        self.assertEqual(str(caught.exception), "SOAP Fault: NotAuthorized")
+        self.assertNotRegex(str(caught.exception), "viewer|secret|payload")
+        self.assertEqual(
+            tuple(body for body, _ in fake.calls), (GET_SCOPES, GET_SERVICES)
+        )
+
+    def test_http_authentication_status_is_fatal_before_parsing(self):
+        def respond(body, endpoint):
+            if body == GET_SCOPES:
+                return raw_response("<tds:GetScopesResponse/>")
+            if body == GET_SERVICES:
+                return SimpleNamespace(
+                    status_code=401,
+                    xml="viewer:top-secret@camera payload-secret",
+                )
+            raise AssertionError("fallback must not run")
+
+        fake = FakeCapabilityDevice(respond)
+        with self.assertRaisesRegex(RuntimeError, "HTTP 401") as caught:
+            self._run_with_fake(fake, host="camera")
+        self.assertEqual(str(caught.exception), "HTTP 401")
+        self.assertNotIn("secret", str(caught.exception))
+
+    def test_http_auth_status_is_fatal_without_reading_an_unusable_body(self):
+        class UnreadableBody(io.BytesIO):
+            def __init__(self):
+                super().__init__(b"payload-secret")
+                self.read_calls = 0
+
+            def read(self, *args, **kwargs):
+                self.read_calls += 1
+                raise TimeoutError("body read must not run")
+
+            def read1(self, *args, **kwargs):
+                self.read_calls += 1
+                raise TimeoutError("body read must not run")
+
+        for headers in (
+            {"Content-Length": str(1024 * 1024 + 1)},
+            {},
+        ):
+            with self.subTest(headers=headers):
+                device = OnvifDevice("camera")
+                device.device_url = "http://camera/onvif/device_service"
+                device.media_url = "http://camera/onvif/media_service"
+                bodies = []
+
+                def reject(*args, **kwargs):
+                    body = UnreadableBody()
+                    bodies.append(body)
+                    raise urllib.error.HTTPError(
+                        "http://camera/onvif/device_service",
+                        401,
+                        "Unauthorized",
+                        headers,
+                        body,
+                    )
+
+                with (
+                    patch(
+                        "rtsp_backchannel.capabilities.OnvifDevice",
+                        return_value=device,
+                    ),
+                    patch.object(
+                        device,
+                        "connect",
+                        return_value=DeviceInfo(manufacturer="Fixture Camera"),
+                    ),
+                    patch.object(
+                        onvif,
+                        "_discovery_opener",
+                    ) as opener,
+                ):
+                    opener.return_value.open.side_effect = reject
+                    with self.assertRaisesRegex(RuntimeError, "HTTP 401"):
+                        get_camera_capabilities(host="camera")
+
+                self.assertEqual(opener.return_value.open.call_count, 1)
+                self.assertEqual(len(bodies), 1)
+                self.assertEqual(bodies[0].read_calls, 0)
+                self.assertTrue(bodies[0].closed)
+
+    def test_discovery_failures_are_sanitized_and_media1_stays_available(self):
+        def respond(body, endpoint):
+            if body == GET_SCOPES:
+                raise RuntimeError(
+                    "request http://viewer:top-secret@camera/scopes used password password"
+                )
+            if body == GET_SERVICES:
+                return raw_response("<tds:GetServicesResponse/>")
+            if body == GET_ALL_CAPABILITIES:
+                raise RuntimeError(
+                    "admin <Password>payload-secret</Password> PasswordDigest digest-token"
+                )
+            if body == MEDIA1_GET_PROFILES and endpoint == "http://camera/connected-media":
+                return raw_response(
+                    '<trt:GetProfilesResponse><trt:Profiles token="fallback"/>'
+                    "</trt:GetProfilesResponse>"
+                )
+            raise AssertionError(body)
+
+        fake = FakeCapabilityDevice(respond)
+        report, _ = self._run_with_fake(
+            fake,
+            host="camera",
+            user="admin",
+            password="password",
+        )
+
+        self.assertEqual(report.service_discovery, "unavailable")
+        self.assertEqual(tuple(profile.token for profile in report.profiles), ("fallback",))
+        self.assertIsNone(report.ptz.detected)
+        self.assertIsNone(report.media2.detected)
+        self.assertEqual(
+            tuple(warning.operation for warning in report.warnings),
+            ("GetScopes", "GetServices", "GetCapabilities"),
+        )
+        warning_text = json.dumps(
+            [dataclasses.asdict(warning) for warning in report.warnings]
+        )
+        self.assertNotRegex(
+            warning_text,
+            "admin|password|viewer|top-secret|@camera|payload-secret|PasswordDigest|digest-token",
+        )
+
+    def test_media2_profiles_recover_after_media1_and_ptz_failures(self):
+        def respond(body, endpoint):
+            if body == GET_SCOPES:
+                return raw_response("<tds:GetScopesResponse/>")
+            if body == GET_SERVICES:
+                return raw_response(
+                    "<tds:GetServicesResponse>"
+                    + service(MEDIA1_NS, "http://camera/media1")
+                    + service(PTZ_NS, "http://camera/ptz")
+                    + service(EVENTS_NS, "http://camera/events")
+                    + service(MEDIA2_NS, "http://camera/media2")
+                    + "</tds:GetServicesResponse>"
+                )
+            if body == MEDIA1_GET_PROFILES:
+                raise RuntimeError(
+                    "media1 failed at http://operator:camera-pass@camera/media1"
+                )
+            if body == PTZ_GET_CAPABILITIES:
+                return raw_response(
+                    '<tptz:GetServiceCapabilitiesResponse><tptz:Capabilities Reverse="1"/>'
+                    "</tptz:GetServiceCapabilitiesResponse>"
+                )
+            if body == PTZ_GET_NODES:
+                raise TimeoutError("request timeout")
+            if body == MEDIA2_GET_PROFILES and endpoint == "http://camera/media2":
+                return raw_response(
+                    '<tr2:GetProfilesResponse><tr2:Profiles token="media2-only">'
+                    "<tr2:Configurations><tr2:AudioEncoder/></tr2:Configurations>"
+                    "</tr2:Profiles></tr2:GetProfilesResponse>"
+                )
+            if body == MEDIA2_GET_OPTIONS and endpoint == "http://camera/media2":
+                return raw_response(
+                    "<tr2:GetVideoEncoderConfigurationOptionsResponse>"
+                    "<tr2:Options><tt:Encoding>H264</tt:Encoding></tr2:Options>"
+                    "</tr2:GetVideoEncoderConfigurationOptionsResponse>"
+                )
+            raise AssertionError(f"unexpected operation {body!r} at {endpoint!r}")
+
+        fake = FakeCapabilityDevice(respond)
+        report, _ = self._run_with_fake(
+            fake,
+            host="camera",
+            user="operator",
+            password="camera-pass",
+        )
+
+        self.assertEqual(
+            tuple((profile.token, profile.source) for profile in report.profiles),
+            (("media2-only", "media2"),),
+        )
+        self.assertTrue(report.profiles[0].has_audio_encoder)
+        self.assertEqual(report.ptz.detected, True)
+        self.assertIsNone(report.ptz.pan_tilt_supported)
+        self.assertIsNone(report.ptz.zoom_supported)
+        self.assertEqual(report.ptz.nodes, ())
+        self.assertEqual(report.ptz.service_capabilities.reverse, True)
+        self.assertEqual(report.media2.detected, True)
+        self.assertEqual(report.media2.encodings, ("H264",))
+        self.assertEqual(report.media2.h265_supported, False)
+        self.assertEqual(
+            tuple(warning.operation for warning in report.warnings),
+            (
+                "Media1 GetProfiles",
+                "PTZ GetNodes",
+            ),
+        )
+        warning_text = json.dumps(
+            [dataclasses.asdict(warning) for warning in report.warnings]
+        )
+        self.assertNotRegex(warning_text, "operator|camera-pass|@camera")
+
+    def test_invalid_getservices_response_also_uses_legacy_fallback(self):
+        def respond(body, endpoint):
+            if body == GET_SCOPES:
+                return raw_response("<tds:GetScopesResponse/>")
+            if body == GET_SERVICES:
+                return raw_response("<tds:GetServicesResponse/>")
+            if body == GET_ALL_CAPABILITIES:
+                return raw_response(
+                    "<tds:GetCapabilitiesResponse><tds:Capabilities><tt:Media>"
+                    "<tt:XAddr>http://camera/media</tt:XAddr></tt:Media>"
+                    "</tds:Capabilities></tds:GetCapabilitiesResponse>"
+                )
+            if body == MEDIA1_GET_PROFILES:
+                return raw_response("<trt:GetProfilesResponse/>")
+            raise AssertionError(body)
+
+        fake = FakeCapabilityDevice(respond)
+        report, _ = self._run_with_fake(fake, host="camera")
+
+        self.assertEqual(report.service_discovery, "getCapabilities")
+        self.assertEqual(report.warnings[0].operation, "GetServices")
+        self.assertEqual(
+            tuple(body for body, _ in fake.calls),
+            (GET_SCOPES, GET_SERVICES, GET_ALL_CAPABILITIES, MEDIA1_GET_PROFILES),
+        )
+
+    def test_authentication_token_substrings_do_not_block_legacy_fallback(self):
+        def respond(body, endpoint):
+            if body == GET_SCOPES:
+                return raw_response("<tds:GetScopesResponse/>")
+            if body == GET_SERVICES:
+                return raw_response(
+                    "<s:Fault><s:Code><s:Value>s:Sender</s:Value><s:Subcode>"
+                    '<s:Value xmlns:ter="http://www.onvif.org/ver10/error">'
+                    "ter:UnauthorizedOperation</s:Value></s:Subcode></s:Code>"
+                    "</s:Fault>",
+                    500,
+                )
+            if body == GET_ALL_CAPABILITIES:
+                return raw_response(
+                    "<tds:GetCapabilitiesResponse><tds:Capabilities><tt:Media>"
+                    "<tt:XAddr>http://camera/media</tt:XAddr></tt:Media>"
+                    "</tds:Capabilities></tds:GetCapabilitiesResponse>"
+                )
+            if body == MEDIA1_GET_PROFILES:
+                return raw_response("<trt:GetProfilesResponse/>")
+            raise AssertionError(body)
+
+        fake = FakeCapabilityDevice(respond)
+        report, _ = self._run_with_fake(fake, host="camera")
+
+        self.assertEqual(report.service_discovery, "getCapabilities")
+        self.assertEqual(report.warnings[0].message, "SOAP Fault: Fault")
+
+    def test_connect_failure_is_fatal_before_any_capability_request(self):
+        class ConnectFailureDevice(FakeCapabilityDevice):
+            def connect(self):
+                self.connect_count += 1
+                raise RuntimeError("ONVIF connect failed")
+
+        fake = ConnectFailureDevice(
+            lambda body, endpoint: (_ for _ in ()).throw(
+                AssertionError("no capability request expected")
+            )
+        )
+        with self.assertRaisesRegex(RuntimeError, "ONVIF connect failed"):
+            self._run_with_fake(fake, host="camera")
+
+        self.assertEqual(fake.connect_count, 1)
+        self.assertEqual(fake.calls, [])
+
+    def test_programming_errors_in_optional_enrichment_propagate(self):
+        for error_type in (AssertionError, TypeError, AttributeError):
+            with self.subTest(error_type=error_type.__name__):
+                def respond(body, endpoint):
+                    if body == GET_SCOPES:
+                        raise error_type("optional programming defect")
+                    raise AssertionError("optional enrichment must stop")
+
+                fake = FakeCapabilityDevice(respond)
+                with self.assertRaisesRegex(
+                    error_type, "optional programming defect"
+                ):
+                    self._run_with_fake(fake, host="camera")
+
+                self.assertEqual(fake.calls, [(GET_SCOPES, None)])
+
+    def test_operational_optional_errors_remain_sanitized_warnings(self):
+        def respond(body, endpoint):
+            if body == GET_SCOPES:
+                raise RuntimeError("runtime payload-secret")
+            if body == GET_SERVICES:
+                raise TimeoutError("deadline payload-secret")
+            if body == GET_ALL_CAPABILITIES:
+                return raw_response(
+                    "<tds:GetCapabilitiesResponse><tds:Capabilities>"
+                    "<tt:Media><tt:XAddr>http://camera/media</tt:XAddr>"
+                    "</tt:Media></tds:Capabilities></tds:GetCapabilitiesResponse>"
+                )
+            if body == MEDIA1_GET_PROFILES:
+                return raw_response("<trt:GetProfilesResponse/>")
+            raise AssertionError("unexpected optional operation")
+
+        report, _ = self._run_with_fake(
+            FakeCapabilityDevice(respond), host="camera"
+        )
+
+        self.assertEqual(
+            tuple(
+                (warning.operation, warning.message)
+                for warning in report.warnings
+            ),
+            (
+                ("GetScopes", "request failed"),
+                ("GetServices", "request timeout"),
+            ),
+        )
+        self.assertNotIn("payload-secret", repr(report.warnings))
+
+
+class OnvifDeviceInformationTests(unittest.TestCase):
+    @staticmethod
+    def _system_time_response():
+        return soap(
+            "<tds:GetSystemDateAndTimeResponse><tds:SystemDateAndTime>"
+            "<tt:UTCDateTime><tt:Date><tt:Year>2026</tt:Year><tt:Month>8</tt:Month>"
+            "<tt:Day>6</tt:Day></tt:Date><tt:Time><tt:Hour>12</tt:Hour>"
+            "<tt:Minute>0</tt:Minute><tt:Second>0</tt:Second></tt:Time>"
+            "</tt:UTCDateTime></tds:SystemDateAndTime></tds:GetSystemDateAndTimeResponse>"
+        )
+
+    def test_device_information_uses_exact_response_and_direct_device_children(self):
+        information = soap(
+            "<vendor:GetDeviceInformationResponse>"
+            "<vendor:Manufacturer>Vendor Response Decoy</vendor:Manufacturer>"
+            "</vendor:GetDeviceInformationResponse>"
+            "<tds:GetDeviceInformationResponse>"
+            "<vendor:Manufacturer>Vendor Child Decoy</vendor:Manufacturer>"
+            "<tds:Manufacturer>Real Camera</tds:Manufacturer>"
+            "<tds:Model>C1</tds:Model>"
+            "</tds:GetDeviceInformationResponse>"
+        )
+        media = soap(
+            "<tds:GetCapabilitiesResponse><tds:Capabilities><tt:Media>"
+            "<tt:XAddr>http://camera/media</tt:XAddr></tt:Media>"
+            "</tds:Capabilities></tds:GetCapabilitiesResponse>"
+        )
+        device = OnvifDevice(
+            "camera", device_urls=["http://camera/onvif/device_service"]
+        )
+
+        with patch.object(
+            onvif,
+            "_soap_response",
+            side_effect=[
+                onvif._SoapResponse(200, self._system_time_response()),
+                onvif._SoapResponse(200, information),
+                onvif._SoapResponse(200, media),
+            ],
+        ):
+            info = device.connect()
+
+        self.assertEqual(
+            info,
+            DeviceInfo(manufacturer="Real Camera", model="C1"),
+        )
+
+    def test_vendor_local_name_response_cannot_satisfy_device_authentication(self):
+        device = OnvifDevice(
+            "camera", device_urls=["http://camera/onvif/device_service"]
+        )
+        vendor_response = soap(
+            "<vendor:GetDeviceInformationResponse>"
+            "<vendor:Manufacturer>Decoy</vendor:Manufacturer>"
+            "</vendor:GetDeviceInformationResponse>"
+        )
+
+        with patch.object(
+            onvif,
+            "_soap_response",
+            side_effect=[
+                onvif._SoapResponse(200, self._system_time_response()),
+                onvif._SoapResponse(200, vendor_response),
+            ],
+        ) as request:
+            with self.assertRaisesRegex(RuntimeError, "ONVIF connect failed"):
+                device.connect()
+
+        self.assertEqual(request.call_count, 2)
+
+    def test_connect_programming_errors_propagate_without_candidate_retry(self):
+        for error_type in (AssertionError, TypeError, AttributeError):
+            with self.subTest(error_type=error_type.__name__):
+                candidates = [
+                    "http://camera/first/device_service",
+                    "http://camera/second/device_service",
+                ]
+                device = OnvifDevice(
+                    "camera",
+                    device_urls=candidates,
+                )
+                with patch.object(
+                    device,
+                    "_system_time",
+                    side_effect=error_type("connect programming defect"),
+                ) as system_time:
+                    with self.assertRaisesRegex(
+                        error_type, "connect programming defect"
+                    ):
+                        device.connect()
+
+                system_time.assert_called_once_with(candidates[0])
+
+    def test_connect_operational_error_remains_sanitized(self):
+        device = OnvifDevice(
+            "camera",
+            device_urls=["http://camera/onvif/device_service"],
+        )
+        with patch.object(
+            device,
+            "_system_time",
+            side_effect=RuntimeError("connect payload-secret"),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "^ONVIF connect failed$"
+            ) as caught:
+                device.connect()
+
+        self.assertNotIn("payload-secret", str(caught.exception))
+
+
+class OnvifLegacyXmlParserTests(unittest.TestCase):
+    def test_safe_xml_scanner_respects_utf16_code_unit_boundaries(self):
+        false_marker_text = {
+            "utf-16-le": "\u213c\u4f44\u5443\u5059E",
+            "utf-16-be": "\u3c21\u444f\u4354\u5950\u4500",
+        }
+        byte_order_marks = {
+            "utf-16-le": codecs.BOM_UTF16_LE,
+            "utf-16-be": codecs.BOM_UTF16_BE,
+        }
+        forbidden = (
+            '<!DOCTYPE root [<!ENTITY injected "entity-payload-marker">]>'
+            "<root>&injected;</root>"
+        )
+
+        for encoding, text in false_marker_text.items():
+            valid = f"<root>{text}</root>".encode(encoding)
+            flattened = valid.replace(b"\x00", b"").decode("latin-1")
+            self.assertIn("<!DOCTYPE", flattened)
+            for kind, prefix in (
+                ("valid-bom", byte_order_marks[encoding]),
+                ("valid-bomless", b""),
+            ):
+                with self.subTest(encoding=encoding, kind=kind):
+                    parsed = onvif._safe_xml_fromstring(prefix + valid)
+                    self.assertEqual(parsed.text, text)
+
+            with self.subTest(encoding=encoding, kind="forbidden"):
+                xml = byte_order_marks[encoding] + forbidden.encode(encoding)
+                with self.assertRaises(ElementTree.ParseError) as caught:
+                    onvif._safe_xml_fromstring(xml)
+                self.assertNotIn(
+                    "entity-payload-marker", str(caught.exception)
+                )
+
+            with self.subTest(
+                encoding=encoding, kind="forbidden-bomless"
+            ):
+                xml = (" \n" + forbidden).encode(encoding)
+                with self.assertRaises(ElementTree.ParseError) as caught:
+                    onvif._safe_xml_fromstring(xml)
+                self.assertNotIn(
+                    "entity-payload-marker", str(caught.exception)
+                )
+
+        single_byte = (
+            '<?xml version="1.0" encoding="iso-8859-1"?>' + forbidden
+        ).encode("iso-8859-1")
+        with self.assertRaises(ElementTree.ParseError) as caught:
+            onvif._safe_xml_fromstring(single_byte)
+        self.assertNotIn("entity-payload-marker", str(caught.exception))
+
+    def test_safe_xml_scanner_sanitizes_known_encoding_decode_errors(self):
+        malformed = (
+            codecs.BOM_UTF8 + b"<root>\xff</root>",
+            codecs.BOM_UTF16_LE + b"<\x00r",
+            codecs.BOM_UTF32_BE + b"\x00\x00\x00<\x00",
+        )
+
+        for xml in malformed:
+            with self.subTest(signature=xml[:4]):
+                with self.assertRaisesRegex(
+                    ElementTree.ParseError, "^invalid XML document$"
+                ):
+                    onvif._safe_xml_fromstring(xml)
+
+    def test_probe_profile_and_stream_parsers_reject_dtd_entities(self):
+        payload_marker = "entity-payload-marker"
+        profile_xml = (
+            "<!DOCTYPE s:Envelope ["
+            f'<!ENTITY injected "{payload_marker}">]>'
+            + soap(
+                '<trt:GetProfilesResponse><trt:Profiles token="main">'
+                "<tt:Name>&injected;</tt:Name>"
+                "</trt:Profiles></trt:GetProfilesResponse>"
+            )
+        )
+        probe_xml = (
+            "<!DOCTYPE s:Envelope ["
+            '<!ENTITY injected "http://camera/entity-payload-marker">]>'
+            + soap(
+                "<vendor:ProbeMatch>"
+                "<vendor:Types>NetworkVideoTransmitter</vendor:Types>"
+                "<vendor:XAddrs>&injected;</vendor:XAddrs>"
+                "</vendor:ProbeMatch>"
+            )
+        )
+        stream_xml = (
+            "<!DOCTYPE s:Envelope ["
+            '<!ENTITY injected "rtsp://camera/entity-payload-marker">]>'
+            + soap(
+                "<trt:GetStreamUriResponse><trt:MediaUri>"
+                "<tt:Uri>&injected;</tt:Uri>"
+                "</trt:MediaUri></trt:GetStreamUriResponse>"
+            )
+        )
+
+        cases = (
+            ("profiles", lambda: onvif.parse_profiles(profile_xml.encode("utf-16"))),
+            ("probe", lambda: onvif.parse_probe_matches(probe_xml, "192.0.2.1")),
+        )
+        for name, parse in cases:
+            with self.subTest(parser=name):
+                with self.assertRaises(ElementTree.ParseError) as caught:
+                    parse()
+                self.assertNotIn(payload_marker, str(caught.exception))
+
+        device = OnvifDevice("camera")
+        device.media_url = "http://camera/onvif/media_service"
+        with patch.object(device, "_call", return_value=stream_xml):
+            with self.assertRaises(ElementTree.ParseError) as caught:
+                device.get_stream_uri("main")
+        self.assertNotIn(payload_marker, str(caught.exception))
+
+
+class _OnvifFixtureHandler(http.server.BaseHTTPRequestHandler):
+    requests = []
+    device_information_status = 200
+    forbidden_declaration_stage = None
+    connected_media_xaddr = None
+    capability_service_xaddr = None
+    capability_legacy_fallback = False
+    redirect_status = None
+    redirect_match = None
+    redirect_location = None
+
+    def log_message(self, format, *args):
+        return
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length).decode("utf-8")
+        type(self).requests.append((self.path, body))
+        redirect_match = type(self).redirect_match
+        if (
+            type(self).redirect_status is not None
+            and redirect_match is not None
+            and redirect_match in body
+        ):
+            payload = b"<camera-redirect-body-marker/>"
+            self.send_response(type(self).redirect_status)
+            self.send_header("Location", type(self).redirect_location)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+        if "GetSystemDateAndTime" in body:
+            stage = "system-time"
+            payload = soap(
+                "<tds:GetSystemDateAndTimeResponse><tds:SystemDateAndTime>"
+                "<tt:UTCDateTime><tt:Time><tt:Hour>12</tt:Hour><tt:Minute>30</tt:Minute>"
+                "<tt:Second>0</tt:Second></tt:Time><tt:Date><tt:Year>2026</tt:Year>"
+                "<tt:Month>8</tt:Month><tt:Day>6</tt:Day></tt:Date>"
+                "</tt:UTCDateTime></tds:SystemDateAndTime></tds:GetSystemDateAndTimeResponse>"
+            )
+            status = 200
+        elif "GetDeviceInformation" in body:
+            stage = "device-info"
+            payload = soap(
+                "<tds:GetDeviceInformationResponse><tds:Manufacturer>Test Camera</tds:Manufacturer>"
+                "<tds:Model>C1</tds:Model><tds:FirmwareVersion>1.2.3</tds:FirmwareVersion>"
+                "<tds:SerialNumber>serial-1</tds:SerialNumber>"
+                "</tds:GetDeviceInformationResponse>"
+            )
+            status = type(self).device_information_status
+        elif "<Category>Media</Category>" in body:
+            stage = "media-capabilities"
+            port = self.server.server_port
+            media_xaddr = type(self).connected_media_xaddr or (
+                f"http://127.0.0.1:{port}/advertised/media"
+            )
+            payload = soap(
+                "<tds:GetCapabilitiesResponse><tds:Capabilities><tt:Media><tt:XAddr>"
+                f"{media_xaddr}"
+                "</tt:XAddr></tt:Media></tds:Capabilities></tds:GetCapabilitiesResponse>"
+            )
+            status = 200
+        elif "GetServices" in body and type(self).capability_service_xaddr:
+            stage = None
+            if type(self).capability_legacy_fallback:
+                payload = soap("<tds:GetServicesResponse/>")
+            else:
+                payload = soap(
+                    "<tds:GetServicesResponse>"
+                    + service(
+                        MEDIA1_NS,
+                        type(self).capability_service_xaddr,
+                    )
+                    + "</tds:GetServicesResponse>"
+                )
+            status = 200
+        elif (
+            "<Category>All</Category>" in body
+            and type(self).capability_service_xaddr
+        ):
+            stage = None
+            payload = soap(
+                "<tds:GetCapabilitiesResponse><tds:Capabilities>"
+                "<tt:Media><tt:XAddr>"
+                f"{type(self).capability_service_xaddr}"
+                "</tt:XAddr></tt:Media></tds:Capabilities>"
+                "</tds:GetCapabilitiesResponse>"
+            )
+            status = 200
+        elif self.path == "/auth-fault":
+            stage = None
+            payload = soap(
+                "<s:Fault><s:Reason><s:Text>Not authorized payload-secret</s:Text>"
+                "</s:Reason></s:Fault>"
+            )
+            status = 401
+        else:
+            stage = None
+            payload = soap("<tds:GetScopesResponse/>")
+            status = 200
+        forbidden_stage = type(self).forbidden_declaration_stage
+        if forbidden_stage is not None and forbidden_stage == stage:
+            entity_value, original = {
+                "system-time": ("2026", "<tt:Year>2026</tt:Year>"),
+                "device-info": (
+                    "entity-payload-marker",
+                    "<tds:Manufacturer>Test Camera</tds:Manufacturer>",
+                ),
+                "media-capabilities": (
+                    f"http://127.0.0.1:{self.server.server_port}/"
+                    "entity-payload-marker",
+                    f"http://127.0.0.1:{self.server.server_port}/"
+                    "advertised/media",
+                ),
+            }[stage]
+            replacement = {
+                "system-time": "<tt:Year>&injected;</tt:Year>",
+                "device-info": (
+                    "<tds:Manufacturer>&injected;</tds:Manufacturer>"
+                ),
+                "media-capabilities": "&injected;",
+            }[stage]
+            payload = (
+                "<!DOCTYPE s:Envelope ["
+                f'<!ENTITY injected "{entity_value}">'
+                '<!ENTITY secret "entity-payload-marker">]>'
+                + payload.replace(original, replacement, 1)
+            )
+        encoded = payload.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/soap+xml")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+
+class _OnvifRedirectTargetHandler(http.server.BaseHTTPRequestHandler):
+    requests = []
+    response_payload = b""
+
+    def log_message(self, format, *args):
+        return
+
+    def _respond(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length)
+        type(self).requests.append((self.command, self.path, body))
+        payload = type(self).response_payload
+        self.send_response(200)
+        self.send_header("Content-Type", "application/soap+xml")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    do_GET = _respond
+    do_POST = _respond
+
+
+class CapabilityParityFixtureTests(unittest.TestCase):
+    def test_capability_report_matches_shared_cross_language_fixture(self):
+        fixture_path = (
+            Path(__file__).resolve().parents[1]
+            / "rust"
+            / "tests"
+            / "fixtures"
+            / "capability-parity.json"
+        )
+        self.assertTrue(
+            fixture_path.is_file(),
+            "shared capability parity fixture is missing",
+        )
+        raw_fixture = fixture_path.read_text(encoding="utf-8")
+        fixture = json.loads(raw_fixture)
+        expected_operations = [
+            "GetSystemDateAndTime",
+            "GetDeviceInformation",
+            "GetCapabilitiesMedia",
+            "GetScopes",
+            "GetServices",
+            "Media1GetProfiles",
+            "PtzGetServiceCapabilities",
+            "PtzGetNodes",
+            "Media2GetProfiles",
+            "Media2GetVideoEncoderConfigurationOptions",
+        ]
+        operations_seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                return
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length).decode("utf-8")
+                path = self.path
+                if "GetSystemDateAndTime" in body:
+                    operation = "GetSystemDateAndTime"
+                elif "GetDeviceInformation" in body:
+                    operation = "GetDeviceInformation"
+                elif (
+                    "GetCapabilities" in body
+                    and "<Category>Media</Category>" in body
+                ):
+                    operation = "GetCapabilitiesMedia"
+                elif "GetScopes" in body:
+                    operation = "GetScopes"
+                elif "GetServices" in body:
+                    operation = "GetServices"
+                elif "GetVideoEncoderConfigurationOptions" in body:
+                    operation = "Media2GetVideoEncoderConfigurationOptions"
+                elif "GetNodes" in body:
+                    operation = "PtzGetNodes"
+                elif "GetProfiles" in body and path.endswith("/media1"):
+                    operation = "Media1GetProfiles"
+                elif "GetProfiles" in body and path.endswith("/media2"):
+                    operation = "Media2GetProfiles"
+                elif (
+                    "GetServiceCapabilities" in body
+                    and path.endswith("/ptz")
+                ):
+                    operation = "PtzGetServiceCapabilities"
+                else:
+                    operation = None
+
+                if operation is None or operation not in fixture["operations"]:
+                    payload = soap("<s:Fault/>").encode("utf-8")
+                    self.send_response(500)
+                else:
+                    operations_seen.append(operation)
+                    payload = soap(
+                        fixture["operations"][operation]
+                    ).encode("utf-8")
+                    self.send_response(200)
+                self.send_header("Content-Type", "application/soap+xml")
+                self.send_header("Content-Length", str(len(payload)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(payload)
+
+        with http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+            base_url = f"http://127.0.0.1:{server.server_port}"
+            fixture.clear()
+            fixture.update(
+                json.loads(
+                    raw_fixture.replace("{{BASE_URL}}", base_url)
+                )
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                report = get_camera_capabilities(
+                    host="camera",
+                    user="viewer",
+                    password="camera-secret",
+                    device_urls=[f"{base_url}/device"],
+                    timeout=2.0,
+                )
+
+                self.assertEqual(operations_seen, expected_operations)
+                self.assertEqual(
+                    _camera_capability_json(report), fixture["expectedReport"]
+                )
+            finally:
+                server.shutdown()
+                thread.join(timeout=2)
+                self.assertFalse(thread.is_alive(), "fixture server thread leaked")
+
+
+class OnvifCapabilityTransportTests(unittest.TestCase):
+    def setUp(self):
+        _OnvifFixtureHandler.requests = []
+        _OnvifFixtureHandler.device_information_status = 200
+        _OnvifFixtureHandler.forbidden_declaration_stage = None
+        _OnvifFixtureHandler.connected_media_xaddr = None
+        _OnvifFixtureHandler.capability_service_xaddr = None
+        _OnvifFixtureHandler.capability_legacy_fallback = False
+        _OnvifFixtureHandler.redirect_status = None
+        _OnvifFixtureHandler.redirect_match = None
+        _OnvifFixtureHandler.redirect_location = None
+        self.server = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), _OnvifFixtureHandler
+        )
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+
+    def test_connect_return_and_status_aware_calls_keep_the_three_call_sequence(self):
+        port = self.server.server_port
+        selected_url = f"http://127.0.0.1:{port}/selected/device"
+        device = OnvifDevice(
+            "camera",
+            "admin",
+            "password",
+            device_urls=[selected_url],
+        )
+
+        info = device.connect()
+        selected = device.read_only_call(GET_SCOPES)
+        auth_fault = device.read_only_call(
+            GET_SCOPES, f"http://127.0.0.1:{port}/auth-fault"
+        )
+
+        self.assertEqual(
+            info,
+            DeviceInfo(
+                manufacturer="Test Camera",
+                model="C1",
+                firmware="1.2.3",
+                serial="serial-1",
+            ),
+        )
+        requests = _OnvifFixtureHandler.requests
+        self.assertEqual(
+            [path for path, _ in requests],
+            [
+                "/selected/device",
+                "/selected/device",
+                "/selected/device",
+                "/selected/device",
+                "/auth-fault",
+            ],
+        )
+        self.assertEqual(
+            [
+                next(part.split("</s:Body>", 1) for part in body.split("<s:Body>") if "</s:Body>" in part)[0]
+                for _, body in requests[:3]
+            ],
+            [
+                f'<GetSystemDateAndTime xmlns="{DEVICE_NS}"/>',
+                f'<GetDeviceInformation xmlns="{DEVICE_NS}"/>',
+                f'<GetCapabilities xmlns="{DEVICE_NS}"><Category>Media</Category></GetCapabilities>',
+            ],
+        )
+        self.assertEqual(selected.status_code, 200)
+        self.assertRegex(selected.xml, "GetScopesResponse")
+        self.assertEqual(auth_fault.status_code, 401)
+        self.assertEqual(auth_fault.xml, "")
+        self.assertRegex(requests[3][1], "wsse:Security")
+        self.assertRegex(requests[4][1], "wsse:Security")
+
+    def test_connect_rejects_success_shaped_http_error_responses(self):
+        for status in (401, 403, 500):
+            with self.subTest(status=status):
+                _OnvifFixtureHandler.requests = []
+                _OnvifFixtureHandler.device_information_status = status
+                selected_url = (
+                    f"http://127.0.0.1:{self.server.server_port}/selected/device"
+                )
+                device = OnvifDevice(
+                    "camera",
+                    "admin",
+                    "password",
+                    device_urls=[selected_url],
+                )
+
+                with self.assertRaisesRegex(RuntimeError, "ONVIF connect failed"):
+                    device.connect()
+
+                self.assertEqual(
+                    [path for path, _ in _OnvifFixtureHandler.requests],
+                    ["/selected/device", "/selected/device"],
+                )
+
+    def test_optional_capability_redirects_are_not_followed_and_are_sanitized(self):
+        marker = "attacker-response-body-marker"
+        _OnvifRedirectTargetHandler.response_payload = soap(
+            "<tds:GetScopesResponse><tds:Scopes>"
+            f"<tt:ScopeItem>{marker}</tt:ScopeItem>"
+            "</tds:Scopes></tds:GetScopesResponse>"
+        ).encode("utf-8")
+        attacker = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), _OnvifRedirectTargetHandler
+        )
+        attacker_thread = threading.Thread(
+            target=attacker.serve_forever, daemon=True
+        )
+        attacker_thread.start()
+        _OnvifFixtureHandler.redirect_match = "GetScopes"
+        _OnvifFixtureHandler.redirect_location = (
+            f"http://localhost:{attacker.server_port}/substitute"
+        )
+        selected_url = (
+            f"http://127.0.0.1:{self.server.server_port}/selected/device"
+        )
+
+        try:
+            for status in (301, 302, 303):
+                with self.subTest(status=status):
+                    _OnvifFixtureHandler.redirect_status = status
+                    _OnvifFixtureHandler.requests = []
+                    _OnvifRedirectTargetHandler.requests = []
+
+                    report = get_camera_capabilities(
+                        host="camera",
+                        device_urls=[selected_url],
+                        timeout=2.0,
+                    )
+
+                    self.assertEqual(_OnvifRedirectTargetHandler.requests, [])
+                    self.assertIn(
+                        CameraCapabilityWarning("GetScopes", f"HTTP {status}"),
+                        report.warnings,
+                    )
+                    self.assertNotIn(marker, repr(report))
+                    self.assertNotIn("camera-redirect-body-marker", repr(report))
+        finally:
+            attacker.shutdown()
+            attacker.server_close()
+            attacker_thread.join(timeout=2)
+
+    def test_connect_redirects_are_not_followed_and_remain_fixed_fatal_errors(self):
+        marker = "attacker-system-time-body-marker"
+        _OnvifRedirectTargetHandler.response_payload = soap(
+            "<tds:GetSystemDateAndTimeResponse><tds:SystemDateAndTime>"
+            "<tt:UTCDateTime><tt:Time><tt:Hour>12</tt:Hour>"
+            "<tt:Minute>30</tt:Minute><tt:Second>0</tt:Second></tt:Time>"
+            "<tt:Date><tt:Year>2026</tt:Year><tt:Month>8</tt:Month>"
+            "<tt:Day>6</tt:Day></tt:Date></tt:UTCDateTime>"
+            f"<tt:Extension>{marker}</tt:Extension>"
+            "</tds:SystemDateAndTime></tds:GetSystemDateAndTimeResponse>"
+        ).encode("utf-8")
+        attacker = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), _OnvifRedirectTargetHandler
+        )
+        attacker_thread = threading.Thread(
+            target=attacker.serve_forever, daemon=True
+        )
+        attacker_thread.start()
+        _OnvifFixtureHandler.redirect_match = "GetSystemDateAndTime"
+        _OnvifFixtureHandler.redirect_location = (
+            f"http://localhost:{attacker.server_port}/substitute"
+        )
+        selected_url = (
+            f"http://127.0.0.1:{self.server.server_port}/selected/device"
+        )
+
+        try:
+            for status in (301, 302, 303):
+                with self.subTest(status=status):
+                    _OnvifFixtureHandler.redirect_status = status
+                    _OnvifFixtureHandler.requests = []
+                    _OnvifRedirectTargetHandler.requests = []
+                    device = OnvifDevice(
+                        "camera", device_urls=[selected_url], timeout=2.0
+                    )
+
+                    with self.assertRaisesRegex(
+                        RuntimeError, "^ONVIF connect failed$"
+                    ) as caught:
+                        device.connect()
+
+                    self.assertEqual(_OnvifRedirectTargetHandler.requests, [])
+                    self.assertNotIn(marker, str(caught.exception))
+                    self.assertNotIn(
+                        "camera-redirect-body-marker", str(caught.exception)
+                    )
+        finally:
+            attacker.shutdown()
+            attacker.server_close()
+            attacker_thread.join(timeout=2)
+
+    def test_connect_rejects_dtd_entities_at_every_mandatory_parse_stage(self):
+        expected_request_count = {
+            "system-time": 1,
+            "device-info": 2,
+            "media-capabilities": 3,
+        }
+        for stage, request_count in expected_request_count.items():
+            with self.subTest(stage=stage):
+                _OnvifFixtureHandler.requests = []
+                _OnvifFixtureHandler.forbidden_declaration_stage = stage
+                selected_url = (
+                    f"http://127.0.0.1:{self.server.server_port}/selected/device"
+                )
+                device = OnvifDevice(
+                    "camera",
+                    device_urls=[selected_url],
+                )
+
+                with self.assertRaisesRegex(
+                    RuntimeError, "^ONVIF connect failed$"
+                ) as caught:
+                    device.connect()
+
+                self.assertNotIn(
+                    "entity-payload-marker", str(caught.exception)
+                )
+                self.assertEqual(
+                    len(_OnvifFixtureHandler.requests), request_count
+                )
+
+    def test_rejects_unsafe_service_urls_before_wsse_or_network(self):
+        device = OnvifDevice("camera", "viewer", "camera-secret")
+        device.device_url = f"http://127.0.0.1:{self.server.server_port}/selected/device"
+        endpoints = (
+            f"ftp://127.0.0.1:{self.server.server_port}/must-not-reach",
+            f"http://viewer:url-secret@127.0.0.1:{self.server.server_port}/must-not-reach",
+            f"http://127.0.0.1:{self.server.server_port}/must-not-reach\n",
+            "/relative/onvif/device_service",
+        )
+
+        with patch.object(onvif, "_wsse_header", wraps=onvif._wsse_header) as wsse:
+            messages = []
+            for endpoint in endpoints:
+                with self.assertRaises(RuntimeError) as caught:
+                    device.read_only_call(GET_SCOPES, endpoint)
+                messages.append(str(caught.exception))
+
+        self.assertEqual(messages, ["invalid ONVIF service URL"] * len(endpoints))
+        self.assertEqual(wsse.call_count, 0)
+        self.assertEqual(_OnvifFixtureHandler.requests, [])
+        self.assertNotRegex(
+            json.dumps(messages), "viewer|camera-secret|url-secret|must-not-reach"
+        )
+
+    def test_rejects_a_connected_cross_origin_endpoint_before_wsse_or_network(self):
+        device = OnvifDevice("connected-camera", "admin", "password")
+        device.device_url = "http://connected-camera.invalid/onvif/device_service"
+        endpoint = f"http://127.0.0.1:{self.server.server_port}/foreign-service"
+
+        with patch.object(
+            onvif, "_wsse_header", wraps=onvif._wsse_header
+        ) as wsse:
+            with self.assertRaisesRegex(
+                RuntimeError, "^invalid ONVIF service URL$"
+            ):
+                device.read_only_call(GET_SCOPES, endpoint)
+
+        self.assertEqual(wsse.call_count, 0)
+        self.assertEqual(_OnvifFixtureHandler.requests, [])
+
+    def test_connect_rejects_media_xaddr_outside_the_selected_device_origin(self):
+        port = self.server.server_port
+        _OnvifFixtureHandler.connected_media_xaddr = (
+            f"https://127.0.0.1:{port}/advertised/media"
+        )
+        device = OnvifDevice(
+            "camera",
+            "admin",
+            "password",
+            device_urls=[f"http://127.0.0.1:{port}/selected/device"],
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "^ONVIF connect failed$"):
+            device.connect()
+
+        self.assertIsNone(device.device_url)
+        self.assertIsNone(device.media_url)
+        self.assertEqual(len(_OnvifFixtureHandler.requests), 3)
+
+    def test_service_origin_binding_canonicalizes_hosts_and_allows_ports_and_paths(self):
+        allowed = (
+            (
+                "https://Camera.Example./onvif/device_service",
+                "https://camera.example:8443/vendor/media?opaque=value",
+            ),
+            ("http://127.0.0.1:80/device", "http://127.0.0.1:9000/media"),
+            ("http://127.1/device", "http://127.0.0.1:9000/media"),
+            ("http://[0:0:0:0:0:0:0:1]/device", "http://[::1]:9000/media"),
+        )
+        rejected = (
+            (
+                "https://camera.example/device",
+                "http://camera.example/media",
+            ),
+            (
+                "https://camera.example/device",
+                "https://other.example/media",
+            ),
+            ("https://camera.example/device", "https://127.0.0.1/media"),
+            ("http://127.0.0.1/device", "http://127.0.0.2/media"),
+            ("http://[::1]/device", "http://[::2]/media"),
+            ("http://4294967296/device", "http://0.0.0.0/media"),
+        )
+
+        with (
+            patch.object(
+                onvif,
+                "_soap_response",
+                return_value=onvif._SoapResponse(200, soap("<tds:GetScopesResponse/>")),
+            ) as request,
+            patch.object(
+                onvif, "_wsse_header", return_value="<security/>"
+            ) as wsse,
+        ):
+            for device_url, endpoint in allowed:
+                with self.subTest(kind="allowed", endpoint=endpoint):
+                    device = OnvifDevice("camera", "admin", "password")
+                    device.device_url = device_url
+                    device.read_only_call(GET_SCOPES, endpoint)
+            allowed_calls = request.call_count
+            allowed_wsse = wsse.call_count
+            for device_url, endpoint in rejected:
+                with self.subTest(kind="rejected", endpoint=endpoint):
+                    device = OnvifDevice("camera", "admin", "password")
+                    device.device_url = device_url
+                    with self.assertRaisesRegex(
+                        RuntimeError, "^invalid ONVIF service URL$"
+                    ):
+                        device.read_only_call(GET_SCOPES, endpoint)
+
+        self.assertEqual(allowed_calls, len(allowed))
+        self.assertEqual(allowed_wsse, len(allowed))
+        self.assertEqual(request.call_count, len(allowed))
+        self.assertEqual(wsse.call_count, len(allowed))
+
+    def test_malformed_numeric_service_hosts_are_fixed_invalid_urls(self):
+        for hostname in ("4294967296", "9" * 5000):
+            with self.subTest(digits=len(hostname)):
+                error = None
+                try:
+                    onvif._validate_service_url_against_device(
+                        f"http://{hostname}/device",
+                        f"http://{hostname}/media",
+                    )
+                except Exception as caught:
+                    error = caught
+
+                self.assertIs(type(error), RuntimeError)
+                self.assertEqual(str(error), "invalid ONVIF service URL")
+
+    def test_giant_numeric_advertised_host_becomes_an_optional_warning(self):
+        giant_xaddr = f"http://{'9' * 5000}/media"
+        _OnvifFixtureHandler.capability_service_xaddr = giant_xaddr
+        selected_url = (
+            f"http://127.0.0.1:{self.server.server_port}/selected/device"
+        )
+
+        try:
+            report = get_camera_capabilities(
+                host="camera",
+                device_urls=[selected_url],
+                timeout=2.0,
+            )
+        except Exception as error:
+            self.fail(
+                f"capability operation leaked {type(error).__name__}"
+            )
+
+        self.assertEqual(report.services[0].xaddr, giant_xaddr)
+        self.assertEqual(
+            report.warnings,
+            (
+                CameraCapabilityWarning(
+                    "Media1 GetProfiles", "invalid ONVIF service URL"
+                ),
+            ),
+        )
+        self.assertEqual(
+            [path for path, _ in _OnvifFixtureHandler.requests],
+            ["/selected/device"] * 5,
+        )
+
+    def test_cross_origin_discovered_service_is_retained_warned_and_never_contacted(self):
+        class AttackerHandler(http.server.BaseHTTPRequestHandler):
+            requests = []
+
+            def log_message(self, format, *args):
+                return
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                type(self).requests.append(self.rfile.read(length))
+                payload = soap("<trt:GetProfilesResponse/>").encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+        attacker = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), AttackerHandler
+        )
+        attacker_thread = threading.Thread(
+            target=attacker.serve_forever, daemon=True
+        )
+        attacker_thread.start()
+        attacker_xaddr = (
+            f"http://localhost:{attacker.server_port}/must-not-reach"
+        )
+        _OnvifFixtureHandler.capability_service_xaddr = attacker_xaddr
+        selected_url = (
+            f"http://127.0.0.1:{self.server.server_port}/selected/device"
+        )
+
+        try:
+            for legacy_fallback in (False, True):
+                with self.subTest(legacy_fallback=legacy_fallback):
+                    AttackerHandler.requests = []
+                    _OnvifFixtureHandler.requests = []
+                    _OnvifFixtureHandler.capability_legacy_fallback = (
+                        legacy_fallback
+                    )
+                    report = get_camera_capabilities(
+                        host="camera",
+                        user="admin",
+                        password="camera-secret",
+                        device_urls=[selected_url],
+                        timeout=2.0,
+                    )
+
+                    self.assertEqual(AttackerHandler.requests, [])
+                    self.assertEqual(report.services[0].xaddr, attacker_xaddr)
+                    self.assertEqual(
+                        report.service_discovery,
+                        "getCapabilities" if legacy_fallback else "getServices",
+                    )
+                    self.assertIn(
+                        CameraCapabilityWarning(
+                            "Media1 GetProfiles",
+                            "invalid ONVIF service URL",
+                        ),
+                        report.warnings,
+                    )
+        finally:
+            attacker.shutdown()
+            attacker.server_close()
+            attacker_thread.join(timeout=2)
+
+    def test_connect_failure_does_not_expose_credential_like_candidates(self):
+        devices = (
+            OnvifDevice("viewer:top-secret@camera", "admin", "camera-secret"),
+            OnvifDevice(
+                "camera",
+                "admin",
+                "camera-secret",
+                device_urls=[
+                    "http://viewer:url-secret@camera/onvif/device_service"
+                ],
+            ),
+        )
+        messages = []
+
+        with patch.object(onvif, "_wsse_header", wraps=onvif._wsse_header) as wsse:
+            for device in devices:
+                with self.assertRaises(RuntimeError) as caught:
+                    device.connect()
+                messages.append(str(caught.exception))
+
+        self.assertEqual(messages, ["ONVIF connect failed"] * len(devices))
+        self.assertEqual(wsse.call_count, 0)
+        self.assertEqual(_OnvifFixtureHandler.requests, [])
+        self.assertNotRegex(
+            json.dumps(messages), "viewer|secret|@camera|url-secret"
+        )
+
+
+class CapabilityProtocolParserTests(unittest.TestCase):
+
+    def test_rejects_dtd_and_entity_declarations_without_payload_leakage(self):
+        payload_marker = "entity-payload-marker"
+        forbidden = (
+            "<!DOCTYPE s:Envelope ["
+            f'<!ENTITY camera "{payload_marker}">]>'
+            + soap(
+                "<tds:GetServicesResponse><tds:Service>"
+                "<tds:Namespace>urn:test</tds:Namespace>"
+                "<tds:XAddr>&camera;</tds:XAddr>"
+                "</tds:Service></tds:GetServicesResponse>"
+            )
+        )
+
+        for forbidden_input in (forbidden, forbidden.encode("utf-16")):
+            with self.subTest(input_type=type(forbidden_input).__name__):
+                with self.assertRaisesRegex(
+                    _OnvifResponseError, "invalid XML document"
+                ) as caught:
+                    _parse_services_response(forbidden_input)
+                self.assertNotIn(payload_marker, str(caught.exception))
+
+    def test_declaration_words_in_comments_cdata_and_pi_are_not_rejected(self):
+        parsed = _parse_services_response(
+            soap(
+                "<tds:GetServicesResponse>"
+                "<!-- <!DOCTYPE decoy> -->"
+                '<?probe <!ENTITY decoy "value">?>'
+                "<vendor:Ignored><![CDATA[<!DOCTYPE cdata-decoy>]]>"
+                "</vendor:Ignored><tds:Service>"
+                "<tds:Namespace>urn:test</tds:Namespace>"
+                "<tds:XAddr>http://camera/service</tds:XAddr>"
+                "</tds:Service></tds:GetServicesResponse>"
+            )
+        )
+
+        self.assertEqual(
+            parsed.services,
+            (CameraCapabilityService("urn:test", "http://camera/service"),),
+        )
+
+    def test_extremely_large_integer_lexemes_are_treated_as_out_of_range(self):
+        huge = "9" * 5000
+        padded_one = "0" * 5000 + "1"
+        parsed = _parse_services_response(
+            soap(
+                "<tds:GetServicesResponse><tds:Service>"
+                f"<tds:Namespace>urn:huge</tds:Namespace>"
+                "<tds:XAddr>http://camera/huge</tds:XAddr><tds:Version>"
+                f"<tt:Major>{huge}</tt:Major><tt:Minor>0</tt:Minor>"
+                "</tds:Version></tds:Service><tds:Service>"
+                "<tds:Namespace>urn:padded</tds:Namespace>"
+                "<tds:XAddr>http://camera/padded</tds:XAddr><tds:Version>"
+                f"<tt:Major>{padded_one}</tt:Major><tt:Minor>0</tt:Minor>"
+                "</tds:Version></tds:Service><tds:Service>"
+                "<tds:Namespace>urn:unicode</tds:Namespace>"
+                "<tds:XAddr>http://camera/unicode</tds:XAddr><tds:Version>"
+                "<tt:Major>\N{ARABIC-INDIC DIGIT ONE}</tt:Major>"
+                "<tt:Minor>0</tt:Minor></tds:Version></tds:Service>"
+                "</tds:GetServicesResponse>"
+            )
+        )
+
+        versions = {
+            service.namespace: service.version for service in parsed.services
+        }
+        self.assertIsNone(versions["urn:huge"])
+        self.assertEqual(versions["urn:padded"], CameraCapabilityVersion(1, 0))
+        self.assertIsNone(versions["urn:unicode"])
+
+    def test_services_use_direct_association_strict_scalars_and_stable_selection(self):
+        parsed = _parse_services_response(
+            soap(
+                f"""
+                <tds:GetServicesResponse>
+                  <tds:Service><tds:Namespace>{MEDIA1_NS}</tds:Namespace><tds:XAddr>http://camera/media-z</tds:XAddr>
+                    <tds:Version><tt:Major>2</tt:Major><tt:Minor>9</tt:Minor></tds:Version></tds:Service>
+                  <tds:Service><tds:Namespace>{MEDIA1_NS}</tds:Namespace><tds:XAddr>http://camera/media-b</tds:XAddr>
+                    <tds:Version><tt:Major>2</tt:Major><tt:Minor>10</tt:Minor></tds:Version></tds:Service>
+                  <tds:Service><tds:Namespace>{MEDIA1_NS}</tds:Namespace><tds:XAddr>http://camera/media-a</tds:XAddr>
+                    <tds:Version><tt:Major>2</tt:Major><tt:Minor>10</tt:Minor></tds:Version></tds:Service>
+                  <tds:Service><tds:Namespace>urn:plus</tds:Namespace><tds:XAddr>http://camera/plus</tds:XAddr>
+                    <tds:Version><tt:Major> \t+1\r\n</tt:Major><tt:Minor>+2</tt:Minor></tds:Version></tds:Service>
+                  <tds:Service><tds:Namespace>urn:nbsp</tds:Namespace><tds:XAddr>http://camera/nbsp</tds:XAddr>
+                    <tds:Version><tt:Major>{NBSP}+1{NBSP}</tt:Major><tt:Minor>2</tt:Minor></tds:Version></tds:Service>
+                  <tds:Service><tds:Namespace>urn:overflow</tds:Namespace><tds:XAddr>http://camera/overflow</tds:XAddr>
+                    <tds:Version><tt:Major>2147483648</tt:Major><tt:Minor>0</tt:Minor></tds:Version></tds:Service>
+                  <tds:Wrapper><tds:Service><tds:Namespace>urn:decoy</tds:Namespace>
+                    <tds:XAddr>http://camera/decoy</tds:XAddr></tds:Service></tds:Wrapper>
+                </tds:GetServicesResponse>
+                """
+            )
+        )
+
+        self.assertEqual(
+            tuple((item.namespace, item.xaddr, item.version) for item in parsed.services),
+            (
+                (
+                    MEDIA1_NS,
+                    "http://camera/media-a",
+                    CameraCapabilityVersion(2, 10),
+                ),
+                (
+                    MEDIA1_NS,
+                    "http://camera/media-b",
+                    CameraCapabilityVersion(2, 10),
+                ),
+                (
+                    MEDIA1_NS,
+                    "http://camera/media-z",
+                    CameraCapabilityVersion(2, 9),
+                ),
+                ("urn:nbsp", "http://camera/nbsp", None),
+                ("urn:overflow", "http://camera/overflow", None),
+                ("urn:plus", "http://camera/plus", CameraCapabilityVersion(1, 2)),
+            ),
+        )
+        self.assertEqual(
+            _select_service(parsed.services, MEDIA1_NS),
+            CameraCapabilityService(
+                MEDIA1_NS,
+                "http://camera/media-a",
+                CameraCapabilityVersion(2, 10),
+            ),
+        )
+
+        for malformed in (
+            f"<tds:GetServicesResponse><tds:Service><tds:Namespace>{MEDIA1_NS}</tds:Namespace></tds:Service></tds:GetServicesResponse>",
+            '<tds:GetServicesResponse><tds:Service><tds:XAddr>http://camera/media</tds:XAddr></tds:Service></tds:GetServicesResponse>',
+        ):
+            with self.subTest(malformed=malformed):
+                with self.assertRaisesRegex(_OnvifResponseError, "invalid GetServices"):
+                    _parse_services_response(soap(malformed))
+
+    def test_maps_all_legacy_services(self):
+        parsed = _parse_capabilities_response(
+            soap(
+                """
+                <tds:GetCapabilitiesResponse><tds:Capabilities>
+                  <tt:Device><tt:XAddr>http://camera/device</tt:XAddr></tt:Device>
+                  <tt:Media><tt:XAddr>http://camera/media</tt:XAddr></tt:Media>
+                  <tt:PTZ><tt:XAddr>http://camera/ptz</tt:XAddr></tt:PTZ>
+                  <tt:Events><tt:XAddr>http://camera/events</tt:XAddr></tt:Events>
+                  <tt:Imaging><tt:XAddr>http://camera/imaging</tt:XAddr></tt:Imaging>
+                  <tt:Analytics><tt:XAddr>http://camera/analytics</tt:XAddr></tt:Analytics>
+                  <tt:Extension>
+                    <tt:DeviceIO><tt:XAddr>http://camera/deviceio</tt:XAddr></tt:DeviceIO>
+                    <tt:Recording><tt:XAddr>http://camera/recording</tt:XAddr></tt:Recording>
+                    <tt:Search><tt:XAddr>http://camera/search</tt:XAddr></tt:Search>
+                    <tt:Replay><tt:XAddr>http://camera/replay</tt:XAddr></tt:Replay>
+                    <tt:Receiver><tt:XAddr>http://camera/receiver</tt:XAddr></tt:Receiver>
+                    <tt:Display><tt:XAddr>http://camera/display</tt:XAddr></tt:Display>
+                  </tt:Extension>
+                  <vendor:Media><tt:XAddr>http://camera/decoy</tt:XAddr></vendor:Media>
+                </tds:Capabilities></tds:GetCapabilitiesResponse>
+                """
+            )
+        )
+
+        self.assertEqual(
+            {service.namespace: service.xaddr for service in parsed.services},
+            {
+                "http://www.onvif.org/ver20/analytics/wsdl": "http://camera/analytics",
+                DEVICE_NS: "http://camera/device",
+                "http://www.onvif.org/ver10/deviceIO/wsdl": "http://camera/deviceio",
+                "http://www.onvif.org/ver10/display/wsdl": "http://camera/display",
+                EVENTS_NS: "http://camera/events",
+                "http://www.onvif.org/ver20/imaging/wsdl": "http://camera/imaging",
+                MEDIA1_NS: "http://camera/media",
+                PTZ_NS: "http://camera/ptz",
+                "http://www.onvif.org/ver10/receiver/wsdl": "http://camera/receiver",
+                "http://www.onvif.org/ver10/recording/wsdl": "http://camera/recording",
+                "http://www.onvif.org/ver10/replay/wsdl": "http://camera/replay",
+                "http://www.onvif.org/ver10/search/wsdl": "http://camera/search",
+            },
+        )
+
+    def test_validates_soap_operations_faults_and_malformed_xml_without_payloads(self):
+        cases = (
+            ("<broken>", "invalid XML document"),
+            (soap("<tds:GetScopesResponse/>"), "invalid GetServices response"),
+            (soap("<tds:GetServicesResponse/>"), "no services"),
+        )
+        for payload, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(_OnvifResponseError, message) as caught:
+                    _parse_services_response(payload)
+                self.assertNotIn(payload, str(caught.exception))
+
+        action_fault = soap(
+            """
+            <s:Fault><s:Code><s:Value>s:Sender</s:Value><s:Subcode>
+              <s:Value xmlns:ter="http://www.onvif.org/ver10/error">ter:ActionNotSupported</s:Value>
+            </s:Subcode></s:Code><s:Reason><s:Text>detail marker</s:Text></s:Reason></s:Fault>
+            """
+        )
+        with self.assertRaisesRegex(_OnvifResponseError, "SOAP Fault: ActionNotSupported") as caught:
+            _parse_services_response(action_fault)
+        self.assertEqual(caught.exception.kind, "fault")
+        self.assertEqual(caught.exception.fault_code, "ActionNotSupported")
+        self.assertNotIn("detail marker", str(caught.exception))
+
+        auth_fault = soap11(
+            """
+            <env:Fault><faultcode>env:Client</faultcode>
+              <faultstring>Request rejected: notauthorized; detail marker</faultstring>
+            </env:Fault>
+            """
+        )
+        with self.assertRaisesRegex(_OnvifResponseError, "SOAP Fault: NotAuthorized") as caught:
+            _parse_services_response(auth_fault)
+        self.assertEqual(caught.exception.fault_code, "NotAuthorized")
+        self.assertNotIn("detail marker", str(caught.exception))
+
+        for code in (
+            "UnauthorizedOperation",
+            "NotAuthorized2",
+            "foo.NotAuthorized",
+            "camera-password-marker",
+        ):
+            with self.subTest(code=code):
+                non_auth_fault = soap(
+                    "<s:Fault><s:Code><s:Value>s:Sender</s:Value><s:Subcode>"
+                    f"<s:Value>{code}</s:Value></s:Subcode></s:Code>"
+                    "<s:Reason><s:Text>viewer-marker</s:Text></s:Reason>"
+                    "</s:Fault>"
+                )
+                with self.assertRaises(_OnvifResponseError) as non_auth:
+                    _parse_services_response(non_auth_fault)
+                self.assertEqual(non_auth.exception.fault_code, "Fault")
+                self.assertEqual(str(non_auth.exception), "SOAP Fault: Fault")
+                self.assertNotRegex(
+                    str(non_auth.exception),
+                    "camera-password-marker|viewer-marker",
+                )
+
+        soap11_sensitive = soap11(
+            "<env:Fault><faultcode>camera-password-marker</faultcode>"
+            "<faultstring>viewer-marker</faultstring>"
+            "<detail>PasswordDigestABC123</detail></env:Fault>"
+        )
+        with self.assertRaises(_OnvifResponseError) as soap11_unknown:
+            _parse_services_response(soap11_sensitive)
+        self.assertEqual(soap11_unknown.exception.fault_code, "Fault")
+        self.assertEqual(str(soap11_unknown.exception), "SOAP Fault: Fault")
+
+        protocol_codes = {
+            SOAP12_NS: (
+                "VersionMismatch",
+                "MustUnderstand",
+                "DataEncodingUnknown",
+                "Sender",
+                "Receiver",
+            ),
+            SOAP11_NS: (
+                "VersionMismatch",
+                "MustUnderstand",
+                "Client",
+                "Server",
+            ),
+        }
+        for namespace, codes in protocol_codes.items():
+            for code in codes:
+                with self.subTest(namespace=namespace, code=code):
+                    if namespace == SOAP12_NS:
+                        protocol_fault = soap(
+                            "<s:Fault><s:Code>"
+                            f"<s:Value>s:{code}</s:Value>"
+                            "</s:Code></s:Fault>"
+                        )
+                    else:
+                        protocol_fault = soap11(
+                            "<env:Fault>"
+                            f"<faultcode>env:{code}</faultcode>"
+                            "<faultstring>request failed</faultstring>"
+                            "</env:Fault>"
+                        )
+                    with self.assertRaises(_OnvifResponseError) as allowed:
+                        _parse_services_response(protocol_fault)
+                    self.assertEqual(allowed.exception.fault_code, code)
+                    self.assertEqual(
+                        str(allowed.exception), f"SOAP Fault: {code}"
+                    )
+
+    def test_parses_media1_and_media2_profiles_with_namespace_association(self):
+        media1 = _parse_media1_profiles_response(
+            soap(
+                """
+                <trt:GetProfilesResponse>
+                  <trt:Profiles token="main&amp;special"><tt:Name>Main</tt:Name>
+                    <tt:AudioSourceConfiguration/><tt:AudioEncoderConfiguration/><tt:AudioOutputConfiguration/>
+                    <tt:PTZConfiguration token="ptz-one"><tt:NodeToken>node-one</tt:NodeToken></tt:PTZConfiguration>
+                  </trt:Profiles>
+                  <trt:Profiles token="vendor-only"><vendor:AudioEncoderConfiguration/>
+                    <vendor:PTZConfiguration token="decoy"/></trt:Profiles>
+                  <trt:Wrapper><trt:Profiles token="nested"/></trt:Wrapper>
+                </trt:GetProfilesResponse>
+                """
+            )
+        )
+        self.assertEqual(
+            media1,
+            (
+                CameraCapabilityProfile(
+                    token="main&special",
+                    source="media1",
+                    has_audio_encoder=True,
+                    has_audio_output=True,
+                    has_audio_source=True,
+                    name="Main",
+                    ptz_configuration_token="ptz-one",
+                    ptz_node_token="node-one",
+                ),
+                CameraCapabilityProfile(
+                    token="vendor-only",
+                    source="media1",
+                    has_audio_encoder=False,
+                    has_audio_output=False,
+                    has_audio_source=False,
+                ),
+            ),
+        )
+
+        media2 = _parse_media2_profiles_response(
+            soap(
+                """
+                <tr2:GetProfilesResponse>
+                  <tr2:Profiles token="main"><tr2:Name>Media2 Main</tr2:Name><tr2:Configurations>
+                    <tr2:AudioSource/><tr2:AudioEncoder/><tr2:AudioOutput/>
+                    <tr2:PTZ token="ptz-two"><tt:NodeToken>node-two</tt:NodeToken></tr2:PTZ>
+                  </tr2:Configurations></tr2:Profiles>
+                  <tr2:Profiles token="vendor-only"><tr2:Configurations>
+                    <vendor:AudioEncoder/><vendor:PTZ token="decoy"/>
+                  </tr2:Configurations></tr2:Profiles>
+                </tr2:GetProfilesResponse>
+                """
+            )
+        )
+        self.assertEqual(
+            media2,
+            (
+                CameraCapabilityProfile(
+                    token="main",
+                    source="media2",
+                    has_audio_encoder=True,
+                    has_audio_output=True,
+                    has_audio_source=True,
+                    name="Media2 Main",
+                    ptz_configuration_token="ptz-two",
+                    ptz_node_token="node-two",
+                ),
+                CameraCapabilityProfile(
+                    token="vendor-only",
+                    source="media2",
+                    has_audio_encoder=False,
+                    has_audio_output=False,
+                    has_audio_source=False,
+                ),
+            ),
+        )
+
+        with self.assertRaisesRegex(_OnvifResponseError, "invalid Media1 GetProfiles"):
+            _parse_media1_profiles_response(
+                soap("<trt:GetProfilesResponse><trt:Profiles/></trt:GetProfilesResponse>")
+            )
+
+    def test_profile_reference_tokens_are_preserved_and_results_are_sorted(self):
+        profiles = _parse_media1_profiles_response(
+            soap(
+                "<trt:GetProfilesResponse>"
+                '<trt:Profiles token="z-token"/>'
+                '<trt:Profiles token=" a-token "><tt:PTZConfiguration token=" ptz-token "/>'
+                "</trt:Profiles></trt:GetProfilesResponse>"
+            )
+        )
+
+        self.assertEqual(
+            tuple(
+                (profile.token, profile.ptz_configuration_token)
+                for profile in profiles
+            ),
+            ((" a-token ", " ptz-token "), ("z-token", None)),
+        )
+
+    def test_strict_ptz_capabilities_and_nodes_keep_zoom_distinct(self):
+        capabilities = _parse_ptz_service_capabilities_response(
+            soap(
+                f"""
+                <tptz:GetServiceCapabilitiesResponse><tptz:Capabilities
+                  EFlip="true" Reverse="false" GetCompatibleConfigurations="1"
+                  MoveStatus="0" StatusPosition="TRUE" vendor:EFlip="true"/>
+                </tptz:GetServiceCapabilitiesResponse>
+                """
+            )
+        )
+        self.assertEqual(
+            capabilities,
+            PtzServiceCapabilities(
+                e_flip=True,
+                reverse=False,
+                get_compatible_configurations=True,
+                move_status=False,
+            ),
+        )
+        whitespace = _parse_ptz_service_capabilities_response(
+            soap(
+                f'<tptz:GetServiceCapabilitiesResponse><tptz:Capabilities '
+                f'EFlip="{NBSP}true{NBSP}" Reverse=" \tfalse\r\n"/>'
+                "</tptz:GetServiceCapabilitiesResponse>"
+            )
+        )
+        self.assertEqual(whitespace, PtzServiceCapabilities(reverse=False))
+
+        parsed = _parse_ptz_nodes_response(
+            soap(
+                f"""
+                <tptz:GetNodesResponse>
+                  <tptz:PTZNode token="pan"><tt:Name>Pan</tt:Name><tt:SupportedPTZSpaces>
+                    <tt:AbsolutePanTiltPositionSpace/><tt:ContinuousPanTiltVelocitySpace/>
+                  </tt:SupportedPTZSpaces><tt:MaximumNumberOfPresets>+8</tt:MaximumNumberOfPresets>
+                    <tt:HomeSupported>true</tt:HomeSupported><tt:AuxiliaryCommands>LightOn</tt:AuxiliaryCommands>
+                    <tt:AuxiliaryCommands>LightOff</tt:AuxiliaryCommands><tt:AuxiliaryCommands>LightOn</tt:AuxiliaryCommands>
+                  </tptz:PTZNode>
+                  <tptz:PTZNode token="zoom"><tt:SupportedPTZSpaces>
+                    <tt:RelativeZoomTranslationSpace/><tt:ContinuousZoomVelocitySpace/>
+                  </tt:SupportedPTZSpaces><tt:MaximumNumberOfPresets>2147483648</tt:MaximumNumberOfPresets>
+                    <tt:HomeSupported>0</tt:HomeSupported></tptz:PTZNode>
+                  <tptz:PTZNode token="nbsp"><tt:SupportedPTZSpaces/>
+                    <tt:MaximumNumberOfPresets>{NBSP}+1{NBSP}</tt:MaximumNumberOfPresets>
+                    <tt:HomeSupported>{NBSP}true{NBSP}</tt:HomeSupported></tptz:PTZNode>
+                </tptz:GetNodesResponse>
+                """
+            )
+        )
+        self.assertTrue(parsed.pan_tilt_supported)
+        self.assertTrue(parsed.zoom_supported)
+        self.assertEqual(
+            parsed.nodes[0],
+            PtzNode(
+                token="nbsp",
+                spaces=PtzSpaces(),
+            ),
+        )
+        self.assertEqual(parsed.nodes[1].maximum_presets, 8)
+        self.assertEqual(parsed.nodes[1].auxiliary_commands, ("LightOff", "LightOn"))
+        self.assertEqual(parsed.nodes[2].home_supported, False)
+        self.assertIsNone(parsed.nodes[2].maximum_presets)
+
+        zoom_only = _parse_ptz_nodes_response(
+            soap(
+                """
+                <tptz:GetNodesResponse><tptz:PTZNode token="zoom-only"><tt:SupportedPTZSpaces>
+                  <tt:AbsoluteZoomPositionSpace/>
+                </tt:SupportedPTZSpaces></tptz:PTZNode></tptz:GetNodesResponse>
+                """
+            )
+        )
+        self.assertFalse(zoom_only.pan_tilt_supported)
+        self.assertTrue(zoom_only.zoom_supported)
+
+        for malformed in (
+            "<tptz:GetNodesResponse><tptz:PTZNode><tt:SupportedPTZSpaces/></tptz:PTZNode></tptz:GetNodesResponse>",
+            '<tptz:GetNodesResponse><tptz:PTZNode token="missing"/></tptz:GetNodesResponse>',
+        ):
+            with self.subTest(malformed=malformed):
+                with self.assertRaisesRegex(_OnvifResponseError, "invalid PTZ GetNodes"):
+                    _parse_ptz_nodes_response(soap(malformed))
+
+    def test_generic_response_parsing_is_iterative_within_the_xml_depth_limit(
+        self,
+    ):
+        # This shared guard lives in onvif._safe_xml_fromstring and applies
+        # to every SOAP response, not just one parser; GetScopes is used
+        # here only as a convenient, non-event vehicle for it.
+        maximum_xml_depth = 64
+        envelope_body_response_depth = 3
+        nested_depth = maximum_xml_depth - envelope_body_response_depth
+        within_limit = soap(
+            "<tds:GetScopesResponse>"
+            + "<tds:Scopes>" * (nested_depth - 1)
+            + "<tt:ScopeItem>onvif://www.onvif.org/Profile/Streaming</tt:ScopeItem>"
+            + "</tds:Scopes>" * (nested_depth - 1)
+            + "</tds:GetScopesResponse>"
+        )
+        parsed = _parse_scopes_response(within_limit)
+        self.assertEqual(parsed.scopes, ())
+
+        beyond_limit = soap(
+            "<tds:GetScopesResponse>"
+            + "<tds:Scopes>" * nested_depth
+            + "<tt:ScopeItem>onvif://www.onvif.org/Profile/Streaming</tt:ScopeItem>"
+            + "</tds:Scopes>" * nested_depth
+            + "</tds:GetScopesResponse>"
+        )
+        with self.assertRaisesRegex(
+            _OnvifResponseError, "^invalid XML document$"
+        ):
+            _parse_scopes_response(beyond_limit)
+
+    def test_media2_options_are_standard_namespace_aware_sorted_and_deduplicated(self):
+        encodings = _parse_media2_options_response(
+            soap(
+                """
+                <tr2:GetVideoEncoderConfigurationOptionsResponse>
+                  <tr2:Options><tt:Encoding>H264</tt:Encoding></tr2:Options>
+                  <tr2:Options Encoding="h265"><tt:Encoding>H264</tt:Encoding></tr2:Options>
+                  <tr2:Options Encoding="VP9"><tt:Encoding>h265</tt:Encoding></tr2:Options>
+                  <tr2:Options vendor:Encoding="H266"><vendor:Encoding>H267</vendor:Encoding></tr2:Options>
+                </tr2:GetVideoEncoderConfigurationOptionsResponse>
+                """
+            )
+        )
+        self.assertEqual(encodings, ("H264", "H265", "VP9"))
+
+        with self.assertRaisesRegex(
+            _OnvifResponseError,
+            "invalid Media2 GetVideoEncoderConfigurationOptions",
+        ):
+            _parse_media2_options_response(
+                soap(
+                    """
+                    <tr2:GetVideoEncoderConfigurationOptionsResponse>
+                      <tr2:Options><vendor:Encoding>H267</vendor:Encoding></tr2:Options>
+                    </tr2:GetVideoEncoderConfigurationOptionsResponse>
+                    """
+                )
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()

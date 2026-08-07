@@ -6,7 +6,39 @@ import pathlib
 import tomllib
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
+
+
+def _minimal_capability_report():
+    from rtsp_backchannel.capabilities import (
+        CameraCapabilityReport,
+        Media2CapabilityReport,
+        PtzCapabilityReport,
+    )
+    from rtsp_backchannel.onvif import DeviceInfo
+
+    return CameraCapabilityReport(
+        device=DeviceInfo(),
+        scopes=(),
+        declared_profiles=(),
+        service_discovery="unavailable",
+        services=(),
+        profiles=(),
+        ptz=PtzCapabilityReport(
+            detected=None,
+            pan_tilt_supported=None,
+            zoom_supported=None,
+            profile_tokens=(),
+            service_capabilities=None,
+            nodes=(),
+        ),
+        media2=Media2CapabilityReport(
+            detected=None,
+            encodings=(),
+            h265_supported=None,
+        ),
+        warnings=(),
+    )
 
 
 class LibraryApiTests(unittest.TestCase):
@@ -31,6 +63,127 @@ class LibraryApiTests(unittest.TestCase):
         self.assertTrue(callable(getattr(library, "get_stream_uris", None)))
         self.assertIsNotNone(getattr(library, "DiscoveredDevice", None))
         self.assertIsNotNone(getattr(library, "StreamUri", None))
+
+    def test_exports_complete_camera_capability_reporting_contract(self):
+        library = importlib.import_module("rtsp_backchannel")
+        capabilities = importlib.import_module(
+            "rtsp_backchannel.capabilities"
+        )
+        onvif = importlib.import_module("rtsp_backchannel.onvif")
+        capability_exports = (
+            "CameraCapabilityVersion",
+            "CameraCapabilityService",
+            "CameraCapabilityWarning",
+            "CameraCapabilityProfile",
+            "PtzSpaces",
+            "PtzNode",
+            "PtzServiceCapabilities",
+            "PtzCapabilityReport",
+            "Media2CapabilityReport",
+            "CameraCapabilityReport",
+            "get_camera_capabilities",
+        )
+
+        for name in capability_exports:
+            with self.subTest(name=name):
+                self.assertIs(
+                    getattr(library, name, None),
+                    getattr(capabilities, name),
+                )
+                self.assertIn(name, library.__all__)
+        self.assertIs(getattr(library, "DeviceInfo", None), onvif.DeviceInfo)
+        self.assertIn("DeviceInfo", library.__all__)
+
+    def test_capabilities_parser_preserves_defaults_and_repeatable_values(self):
+        cli = importlib.import_module("rtsp_backchannel.cli")
+        parser_factory = getattr(cli, "_capabilities_parser", None)
+        self.assertTrue(callable(parser_factory))
+        parser = parser_factory()
+
+        defaults = parser.parse_args(["--host", "camera.local"])
+        explicit = parser.parse_args(
+            [
+                "--host",
+                "camera.local",
+                "--user",
+                "operator",
+                "--pass",
+                "",
+                "--device-url",
+                "http://camera.local/onvif/device_service",
+                "--device-url",
+                "http://camera.local:8000/onvif/device_service",
+                "--timeout-ms",
+                "2500.5",
+            ]
+        )
+
+        self.assertEqual(defaults.host, "camera.local")
+        self.assertEqual(defaults.user, "")
+        self.assertIsNone(defaults.password)
+        self.assertIsNone(defaults.device_urls)
+        self.assertIsNone(defaults.timeout_ms)
+        self.assertEqual(explicit.user, "operator")
+        self.assertEqual(explicit.password, "")
+        self.assertEqual(
+            explicit.device_urls,
+            [
+                "http://camera.local/onvif/device_service",
+                "http://camera.local:8000/onvif/device_service",
+            ],
+        )
+        self.assertEqual(explicit.timeout_ms, 2500.5)
+
+        for timeout_arguments in (
+            ["--timeout-ms", "86400000"],
+            ["--timeout-ms=86400000"],
+            ["--timeout-ms", "86400000.000000001"],
+            ["--timeout-ms=86400000.000000001"],
+        ):
+            with self.subTest(timeout_arguments=timeout_arguments):
+                boundary = parser.parse_args(
+                    ["--host", "camera.local", *timeout_arguments]
+                )
+                self.assertEqual(boundary.timeout_ms, 86_400_000.0)
+
+    def test_capabilities_help_is_specific_and_never_opens_network(self):
+        cli = importlib.import_module("rtsp_backchannel.cli")
+
+        with (
+            patch.object(
+                cli, "get_camera_capabilities", create=True
+            ) as capabilities,
+            redirect_stdout(io.StringIO()) as output,
+            redirect_stderr(io.StringIO()) as errors,
+            self.assertRaises(SystemExit) as stopped,
+        ):
+            cli.main(
+                [
+                    "capabilities",
+                    "--help",
+                    "--pass",
+                    "help-only-secret",
+                ]
+            )
+
+        self.assertEqual(stopped.exception.code, 0)
+        capabilities.assert_not_called()
+        help_text = output.getvalue()
+        for expected in (
+            "rtsp-backchannel capabilities",
+            "--host",
+            "--user",
+            "--pass",
+            "--device-url",
+            "--timeout-ms",
+            "per-request",
+            "repeatable",
+        ):
+            self.assertIn(expected, help_text)
+        self.assertIn("capabilities", cli._parser().format_help())
+        self.assertNotRegex(
+            help_text + errors.getvalue(), "help-only-secret"
+        )
 
     def test_plays_pcma_in_40ms_packets_and_closes_the_session(self):
         from rtsp_backchannel import PlaybackResult, play_file
@@ -754,6 +907,682 @@ class LibraryApiTests(unittest.TestCase):
                 "profileName": "Main Stream",
                 "uri": "rtsp://camera/live?channel=1&stream=main",
             },
+        )
+
+    def test_capabilities_cli_applies_environment_password_only_when_omitted(self):
+        cli = importlib.import_module("rtsp_backchannel.cli")
+        report = _minimal_capability_report()
+
+        with (
+            patch.object(
+                cli,
+                "get_camera_capabilities",
+                return_value=report,
+                create=True,
+            ) as capabilities,
+            patch.dict(
+                os.environ,
+                {"ONVIF_PASSWORD": "environment-only-secret"},
+                clear=True,
+            ),
+            redirect_stdout(io.StringIO()) as output,
+        ):
+            cli.main(["capabilities", "--host", "camera.local"])
+            cli.main(
+                [
+                    "capabilities",
+                    "--host",
+                    "camera.local",
+                    "--pass",
+                    "explicit-secret",
+                ]
+            )
+            cli.main(
+                [
+                    "capabilities",
+                    "--host",
+                    "camera.local",
+                    "--pass",
+                    "",
+                ]
+            )
+            del os.environ["ONVIF_PASSWORD"]
+            cli.main(["capabilities", "--host", "camera.local"])
+
+        self.assertEqual(
+            capabilities.call_args_list,
+            [
+                call(
+                    host="camera.local",
+                    user="",
+                    password="environment-only-secret",
+                ),
+                call(
+                    host="camera.local",
+                    user="",
+                    password="explicit-secret",
+                ),
+                call(host="camera.local", user="", password=""),
+                call(host="camera.local", user="", password=""),
+            ],
+        )
+        self.assertEqual(len(output.getvalue().splitlines()), 4)
+        self.assertNotRegex(
+            output.getvalue(), "environment-only-secret|explicit-secret"
+        )
+
+    def test_capabilities_cli_calls_once_and_prints_shared_camel_case_json(self):
+        cli = importlib.import_module("rtsp_backchannel.cli")
+        from rtsp_backchannel.capabilities import (
+            CameraCapabilityProfile,
+            CameraCapabilityReport,
+            CameraCapabilityService,
+            CameraCapabilityVersion,
+            CameraCapabilityWarning,
+            Media2CapabilityReport,
+            PtzCapabilityReport,
+            PtzNode,
+            PtzServiceCapabilities,
+            PtzSpaces,
+        )
+        from rtsp_backchannel.onvif import DeviceInfo
+
+        report = CameraCapabilityReport(
+            device=DeviceInfo(
+                manufacturer="예시 제조사",
+                firmware="1.2.3",
+            ),
+            scopes=("onvif://www.onvif.org/Profile/Streaming",),
+            declared_profiles=("S", "T"),
+            service_discovery="getServices",
+            services=(
+                CameraCapabilityService(
+                    namespace="http://www.onvif.org/ver20/media/wsdl",
+                    xaddr="http://camera.local/onvif/media2",
+                    version=CameraCapabilityVersion(2, 0),
+                ),
+                CameraCapabilityService(
+                    namespace="urn:vendor",
+                    xaddr="http://camera.local/vendor",
+                ),
+            ),
+            profiles=(
+                CameraCapabilityProfile(
+                    token="main",
+                    source="media1",
+                    has_audio_encoder=True,
+                    has_audio_output=False,
+                    has_audio_source=True,
+                    ptz_configuration_token="ptz-main",
+                ),
+            ),
+            ptz=PtzCapabilityReport(
+                detected=None,
+                pan_tilt_supported=False,
+                zoom_supported=True,
+                profile_tokens=("main",),
+                service_capabilities=PtzServiceCapabilities(
+                    e_flip=False,
+                    move_status=True,
+                ),
+                nodes=(
+                    PtzNode(
+                        token="zoom-node",
+                        spaces=PtzSpaces(
+                            absolute_zoom=True,
+                            continuous_zoom=True,
+                        ),
+                        maximum_presets=0,
+                        home_supported=False,
+                        auxiliary_commands=("LightOn",),
+                    ),
+                ),
+            ),
+            media2=Media2CapabilityReport(
+                detected=None,
+                encodings=("H264",),
+                h265_supported=None,
+            ),
+            warnings=(
+                CameraCapabilityWarning(
+                    operation="Media2 GetProfiles",
+                    message="request timeout",
+                ),
+            ),
+        )
+
+        with (
+            patch.object(
+                cli,
+                "get_camera_capabilities",
+                return_value=report,
+                create=True,
+            ) as capabilities,
+            redirect_stdout(io.StringIO()) as output,
+        ):
+            cli.main(
+                [
+                    "capabilities",
+                    "--host",
+                    "camera.local",
+                    "--user",
+                    "operator",
+                    "--pass",
+                    "command-only-secret",
+                    "--device-url",
+                    "http://camera.local/onvif/device_service",
+                    "--device-url",
+                    "http://camera.local:8000/onvif/device_service",
+                    "--timeout-ms",
+                    "2500",
+                ]
+            )
+
+        capabilities.assert_called_once_with(
+            host="camera.local",
+            user="operator",
+            password="command-only-secret",
+            device_urls=[
+                "http://camera.local/onvif/device_service",
+                "http://camera.local:8000/onvif/device_service",
+            ],
+            timeout=2.5,
+        )
+        self.assertEqual(len(output.getvalue().splitlines()), 1)
+        self.assertIn("예시 제조사", output.getvalue())
+        self.assertNotIn("command-only-secret", output.getvalue())
+        self.assertEqual(
+            json.loads(output.getvalue()),
+            {
+                "device": {
+                    "manufacturer": "예시 제조사",
+                    "firmware": "1.2.3",
+                },
+                "scopes": ["onvif://www.onvif.org/Profile/Streaming"],
+                "declaredProfiles": ["S", "T"],
+                "serviceDiscovery": "getServices",
+                "services": [
+                    {
+                        "namespace": "http://www.onvif.org/ver20/media/wsdl",
+                        "xaddr": "http://camera.local/onvif/media2",
+                        "version": {"major": 2, "minor": 0},
+                    },
+                    {
+                        "namespace": "urn:vendor",
+                        "xaddr": "http://camera.local/vendor",
+                    },
+                ],
+                "profiles": [
+                    {
+                        "token": "main",
+                        "source": "media1",
+                        "hasAudioEncoder": True,
+                        "hasAudioOutput": False,
+                        "hasAudioSource": True,
+                        "ptzConfigurationToken": "ptz-main",
+                    }
+                ],
+                "ptz": {
+                    "detected": None,
+                    "panTiltSupported": False,
+                    "zoomSupported": True,
+                    "profileTokens": ["main"],
+                    "serviceCapabilities": {
+                        "eFlip": False,
+                        "moveStatus": True,
+                    },
+                    "nodes": [
+                        {
+                            "token": "zoom-node",
+                            "spaces": {
+                                "absolutePanTilt": False,
+                                "absoluteZoom": True,
+                                "relativePanTilt": False,
+                                "relativeZoom": False,
+                                "continuousPanTilt": False,
+                                "continuousZoom": True,
+                            },
+                            "maximumPresets": 0,
+                            "homeSupported": False,
+                            "auxiliaryCommands": ["LightOn"],
+                        }
+                    ],
+                },
+                "media2": {
+                    "detected": None,
+                    "encodings": ["H264"],
+                    "h265Supported": None,
+                },
+                "warnings": [
+                    {
+                        "operation": "Media2 GetProfiles",
+                        "message": "request timeout",
+                    }
+                ],
+            },
+        )
+
+    def test_capability_json_omits_only_optional_members(self):
+        cli = importlib.import_module("rtsp_backchannel.cli")
+        mapper = getattr(cli, "_camera_capability_json", None)
+        self.assertTrue(callable(mapper))
+
+        self.assertEqual(
+            mapper(_minimal_capability_report()),
+            {
+                "device": {},
+                "scopes": [],
+                "declaredProfiles": [],
+                "serviceDiscovery": "unavailable",
+                "services": [],
+                "profiles": [],
+                "ptz": {
+                    "detected": None,
+                    "panTiltSupported": None,
+                    "zoomSupported": None,
+                    "profileTokens": [],
+                    "nodes": [],
+                },
+                "media2": {
+                    "detected": None,
+                    "encodings": [],
+                    "h265Supported": None,
+                },
+                "warnings": [],
+            },
+        )
+
+    def test_capabilities_cli_rejects_unsafe_argument_shapes_before_dispatch(self):
+        cli = importlib.import_module("rtsp_backchannel.cli")
+        cases = (
+            (["--pass", "validation-only-secret"], "--host"),
+            (
+                [
+                    "--host",
+                    "camera.local",
+                    "--pass",
+                    "--timeout-ms",
+                    "50",
+                ],
+                "missing value for --pass",
+            ),
+            (
+                ["--host", "camera.local", "--device-url"],
+                "expected one argument",
+            ),
+            (
+                ["--host", "camera.local", "--user", "--timeout-ms", "50"],
+                "expected one argument",
+            ),
+            (
+                ["--host", "camera.local", "--timeout-ms", "--user", "admin"],
+                "expected one argument",
+            ),
+            (["--host", ""], "must not be empty"),
+            (["--host", "camera.local", "--user", ""], "must not be empty"),
+            (
+                ["--host", "camera.local", "--device-url", ""],
+                "must not be empty",
+            ),
+        )
+        cases += tuple(
+            (
+                [
+                    "--host",
+                    "camera.local",
+                    "--pass",
+                    "validation-only-secret",
+                    "--timeout-ms",
+                    value,
+                ],
+                "timeout-ms must be finite and greater than 0",
+            )
+            for value in ("0", "-1", "5e-324", "NaN", "Infinity")
+        )
+
+        with (
+            patch.object(
+                cli, "get_camera_capabilities", create=True
+            ) as capabilities,
+            patch.dict(
+                os.environ,
+                {"ONVIF_PASSWORD": "environment-only-secret"},
+                clear=True,
+            ),
+        ):
+            for arguments, expected in cases:
+                with self.subTest(arguments=arguments):
+                    with (
+                        redirect_stdout(io.StringIO()) as output,
+                        redirect_stderr(io.StringIO()) as errors,
+                        self.assertRaises(SystemExit) as stopped,
+                    ):
+                        cli.main(["capabilities", *arguments])
+                    self.assertEqual(stopped.exception.code, 2)
+                    diagnostic = output.getvalue() + errors.getvalue()
+                    self.assertIn(expected, diagnostic)
+                    self.assertNotRegex(
+                        diagnostic,
+                        "validation-only-secret|environment-only-secret",
+                    )
+
+        capabilities.assert_not_called()
+
+    def test_capabilities_cli_enforces_inclusive_24_hour_timeout_before_seconds_conversion(self):
+        cli = importlib.import_module("rtsp_backchannel.cli")
+        report = _minimal_capability_report()
+
+        with (
+            patch.object(
+                cli,
+                "get_camera_capabilities",
+                return_value=report,
+                create=True,
+            ) as capabilities,
+            patch.dict(
+                os.environ,
+                {"ONVIF_PASSWORD": "environment-only-secret"},
+                clear=True,
+            ),
+            redirect_stdout(io.StringIO()),
+        ):
+            cli.main(
+                [
+                    "capabilities",
+                    "--host",
+                    "camera.local",
+                    "--timeout-ms",
+                    "86400000",
+                ]
+            )
+            cli.main(
+                [
+                    "capabilities",
+                    "--host",
+                    "camera.local",
+                    "--timeout-ms=86400000",
+                ]
+            )
+
+        self.assertEqual(
+            capabilities.call_args_list,
+            [
+                call(
+                    host="camera.local",
+                    user="",
+                    password="environment-only-secret",
+                    timeout=86_400.0,
+                ),
+                call(
+                    host="camera.local",
+                    user="",
+                    password="environment-only-secret",
+                    timeout=86_400.0,
+                ),
+            ],
+        )
+
+        rejected = (
+            (["--timeout-ms", "86400000.00000001"], "86400000.00000001"),
+            (["--timeout-ms=86400000.00000001"], "86400000.00000001"),
+            (["--timeout-ms", "86400000.00000049"], "86400000.00000049"),
+            (["--timeout-ms=86400000.00000049"], "86400000.00000049"),
+            (["--timeout-ms", "86400001"], "86400001"),
+            (["--timeout-ms=86400001"], "86400001"),
+            (["--timeout-ms", "1e22"], "1e22"),
+            (["--timeout-ms=1e22"], "1e22"),
+        )
+        with (
+            patch.object(
+                cli,
+                "get_camera_capabilities",
+                return_value=report,
+                create=True,
+            ) as rejected_capabilities,
+            patch.dict(
+                os.environ,
+                {"ONVIF_PASSWORD": "environment-only-secret"},
+                clear=True,
+            ),
+        ):
+            for timeout_arguments, reflected in rejected:
+                with self.subTest(timeout_arguments=timeout_arguments):
+                    with (
+                        redirect_stdout(io.StringIO()) as output,
+                        redirect_stderr(io.StringIO()) as errors,
+                        self.assertRaises(SystemExit) as stopped,
+                    ):
+                        cli.main(
+                            [
+                                "capabilities",
+                                "--host",
+                                "camera.local",
+                                "--pass",
+                                "argv-password-secret",
+                                *timeout_arguments,
+                            ]
+                        )
+                    self.assertEqual(stopped.exception.code, 2)
+                    diagnostic = output.getvalue() + errors.getvalue()
+                    self.assertIn(
+                        "timeout-ms exceeds the 24-hour maximum",
+                        diagnostic,
+                    )
+                    self.assertNotIn(reflected, diagnostic)
+                    self.assertNotRegex(
+                        diagnostic,
+                        "argv-password-secret|environment-only-secret",
+                    )
+        rejected_capabilities.assert_not_called()
+
+    def test_capabilities_cli_rejects_bare_terminator_without_reflecting_values(self):
+        cli = importlib.import_module("rtsp_backchannel.cli")
+        cases = (
+            (
+                [
+                    "--host",
+                    "camera.local",
+                    "--pass",
+                    "control-password-secret",
+                    "--",
+                ],
+                "capabilities does not accept an argument terminator",
+            ),
+            (
+                [
+                    "--host",
+                    "camera.local",
+                    "--pass",
+                    "--",
+                    "--pass=trailing-equals-secret",
+                ],
+                "missing value for --pass",
+            ),
+            (
+                ["--host", "camera.local", "--"],
+                "capabilities does not accept an argument terminator",
+            ),
+        )
+
+        with (
+            patch.object(
+                cli, "get_camera_capabilities", create=True
+            ) as capabilities,
+            patch.dict(
+                os.environ,
+                {"ONVIF_PASSWORD": "environment-only-secret"},
+                clear=True,
+            ),
+        ):
+            for arguments, expected in cases:
+                with self.subTest(arguments=arguments):
+                    with (
+                        redirect_stdout(io.StringIO()) as output,
+                        redirect_stderr(io.StringIO()) as errors,
+                        self.assertRaises(SystemExit) as stopped,
+                    ):
+                        cli.main(["capabilities", *arguments])
+                    self.assertEqual(stopped.exception.code, 2)
+                    diagnostic = output.getvalue() + errors.getvalue()
+                    self.assertIn(expected, diagnostic)
+                    self.assertNotRegex(
+                        diagnostic,
+                        "control-password-secret|trailing-equals-secret|environment-only-secret",
+                    )
+
+        capabilities.assert_not_called()
+
+    def test_capabilities_cli_keeps_hyphen_prefixed_passwords_opaque(self):
+        cli = importlib.import_module("rtsp_backchannel.cli")
+        report = _minimal_capability_report()
+        password_arguments = (
+            (["--pass", "--separate-password-secret"], "--separate-password-secret"),
+            (["--pass=--equals-password-secret"], "--equals-password-secret"),
+            (["--pass=--"], "--"),
+        )
+
+        with (
+            patch.object(
+                cli,
+                "get_camera_capabilities",
+                return_value=report,
+                create=True,
+            ) as capabilities,
+            patch.dict(
+                os.environ,
+                {"ONVIF_PASSWORD": "environment-only-secret"},
+                clear=True,
+            ),
+            redirect_stdout(io.StringIO()) as output,
+        ):
+            for arguments, expected_password in password_arguments:
+                with self.subTest(arguments=arguments):
+                    try:
+                        cli.main(
+                            [
+                                "capabilities",
+                                "--host",
+                                "camera.local",
+                                *arguments,
+                            ]
+                        )
+                    except SystemExit as error:
+                        self.fail(
+                            "opaque password form was rejected with "
+                            f"exit {error.code}"
+                        )
+                    self.assertEqual(
+                        capabilities.call_args.kwargs["password"],
+                        expected_password,
+                    )
+
+        self.assertEqual(capabilities.call_count, len(password_arguments))
+        self.assertNotRegex(
+            output.getvalue(),
+            "separate-password-secret|equals-password-secret|environment-only-secret",
+        )
+
+        capabilities.reset_mock()
+        with (
+            redirect_stdout(io.StringIO()) as output,
+            redirect_stderr(io.StringIO()) as errors,
+            self.assertRaises(SystemExit) as stopped,
+        ):
+            cli.main(
+                [
+                    "capabilities",
+                    "--host",
+                    "camera.local",
+                    "--pass",
+                    "--timeout-ms",
+                    "50",
+                ]
+            )
+        self.assertEqual(stopped.exception.code, 2)
+        self.assertIn(
+            "missing value for --pass",
+            output.getvalue() + errors.getvalue(),
+        )
+        capabilities.assert_not_called()
+
+    def test_documents_camera_capabilities_in_both_python_readmes(self):
+        english = pathlib.Path("python/README.md").read_text(
+            encoding="utf-8"
+        )
+        korean = pathlib.Path("python/README.ko.md").read_text(
+            encoding="utf-8"
+        )
+
+        for readme in (english, korean):
+            for expected in (
+                "get_camera_capabilities",
+                "CameraCapabilityReport",
+                "CameraCapabilityVersion",
+                "declared_profiles",
+                "declaredProfiles",
+                "service_discovery",
+                "Profile T",
+                "media2.detected",
+                "media2.h265Supported",
+                "pan_tilt_supported",
+                "profile_tokens",
+                "warnings",
+                "warning.message",
+                "true",
+                "false",
+                "null",
+                "GetServices",
+                "GetCapabilities",
+                "ONVIF_PASSWORD",
+                '`--pass ""`',
+                "rtsp-backchannel capabilities",
+                "--device-url",
+                "--timeout-ms",
+                "XAddr",
+                "86,400,000",
+                "4,096",
+            ):
+                self.assertIn(expected, readme)
+            self.assertRegex(
+                readme,
+                r"warning\.message[\s\S]{0,500}generic canonical",
+            )
+            for excluded in (
+                "credentials",
+                "WSSE digest material",
+                "URL userinfo",
+                "raw or real camera response payload",
+            ):
+                self.assertIn(excluded, readme)
+
+        self.assertRegex(
+            english,
+            r"Initial connection and authentication failures are fatal",
+        )
+        self.assertRegex(korean, r"최초 연결 또는\s+인증 실패는 치명적")
+        self.assertRegex(
+            english,
+            r"same-origin[\s\S]{0,500}scheme[\s\S]{0,500}hostname",
+        )
+        self.assertRegex(
+            korean,
+            r"동일 출처[\s\S]{0,500}스킴[\s\S]{0,500}호스트",
+        )
+        self.assertRegex(
+            english,
+            r"permits at most 64\s+element levels",
+        )
+        self.assertRegex(
+            korean,
+            r"최대 64단계",
+        )
+        self.assertRegex(
+            english,
+            r"inclusive 24-hour\s+maximum \(86,400,000 ms\)",
+        )
+        self.assertRegex(
+            korean,
+            r"24시간 상한\(86,400,000ms\)",
         )
 
 

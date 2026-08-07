@@ -68,5 +68,8 @@
   "devDependencies": {
     "@types/node": "^22.10.0",
     "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "saxes": "^6.0.0"
   }
 }

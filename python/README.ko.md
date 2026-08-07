@@ -3,9 +3,9 @@
 [English](https://github.com/GagaKor/rtsp-backchannel/blob/master/python/README.md) |
 [한국어](https://github.com/GagaKor/rtsp-backchannel/blob/master/python/README.ko.md)
 
-ONVIF 카메라 검색, 프로필별 RTSP URI 조회, ONVIF RTSP 백채널을 통한 음원 파일
-재생을 지원하는 Python 라이브러리 및 CLI입니다. 파일 재생에만 별도 설치한 FFmpeg가
-필요하며 GStreamer는 사용하지 않습니다.
+ONVIF 카메라 검색과 기능 확인, 프로필별 RTSP URI 조회, ONVIF RTSP 백채널을 통한
+음원 파일 재생을 지원하는 Python 라이브러리 및 CLI입니다. 파일 재생에만 별도 설치한
+FFmpeg가 필요하며 GStreamer는 사용하지 않습니다.
 
 다른 구현체:
 
@@ -23,7 +23,7 @@ ONVIF 카메라 검색, 프로필별 RTSP URI 조회, ONVIF RTSP 백채널을 �
 - 파일 재생 시 `PATH`에서 실행할 수 있는 `ffmpeg`
 - ONVIF `sendonly` 오디오 백채널을 제공하는 카메라
 
-카메라 검색과 스트림 URI 조회에는 FFmpeg가 필요하지 않습니다.
+카메라 검색, 기능 보고서, 스트림 URI 조회에는 FFmpeg가 필요하지 않습니다.
 
 ## 설치
 
@@ -177,6 +177,211 @@ ONVIF Device 및 Media 서비스에 인증하고 각 Media Profile의 `profile_t
 선택적인 `profile_name`, `uri`를 반환합니다. 반환되는 RTSP URI에는 인증정보를
 삽입하지 않습니다.
 
+### `get_camera_capabilities`
+
+```python
+get_camera_capabilities(
+    *,
+    host: str,
+    user: str = "",
+    password: str = "",
+    device_urls: list[str] | None = None,
+    timeout: float = 8.0,
+) -> CameraCapabilityReport
+```
+
+이 읽기 전용 API는 장치 식별 정보, scope, 광고된 서비스, Media profile, PTZ 사실,
+Media2 encoder 근거를 하나의 보고서로 수집합니다. 패키지 root에서
+`CameraCapabilityReport`, `CameraCapabilityVersion` 및 중첩 보고서 dataclass를
+공개하므로 타입이 있는 결과로 확인할 수 있습니다.
+
+```python
+import os
+
+from rtsp_backchannel import get_camera_capabilities
+
+report = get_camera_capabilities(
+    host="camera.local",
+    user="operator",
+    password=os.environ["ONVIF_PASSWORD"],
+    device_urls=["http://camera.local/onvif/device_service"],
+    timeout=8.0,
+)
+
+print(report.declared_profiles, report.media2.h265_supported)
+```
+
+다음은 Profile S와 T를 선언하고 PTZ 서비스를 광고하는 카메라에 대해
+`capabilities` CLI 명령이 출력하는 JSON입니다. CLI는 한 줄로 출력하며
+아래에서는 읽기 쉽도록 줄바꿈했습니다. `pan-node`는
+`continuousPanTilt: true`이지만 `zoom-node`는 `absoluteZoom: true`만 가지고
+있어, PTZ 서비스
+광고만으로 pan/tilt 지원이 보장되지 않는다는 점과 최상위
+`ptz.panTiltSupported`/`ptz.zoomSupported`가 두 node를 종합한 값이라는 점을
+보여줍니다. 여기의 `declaredProfiles`도 장치 scope에서 얻은 자기 보고일 뿐
+독립적인 ONVIF 인증 결과가 아닙니다.
+
+```json
+{
+  "device": {
+    "manufacturer": "Parity Camera",
+    "model": "PX-1",
+    "firmware": "1.2.3",
+    "serial": "parity-001"
+  },
+  "scopes": [
+    "onvif://www.onvif.org/Profile/Streaming",
+    "onvif://www.onvif.org/Profile/T"
+  ],
+  "declaredProfiles": [
+    "S",
+    "T"
+  ],
+  "serviceDiscovery": "getServices",
+  "services": [
+    {
+      "namespace": "http://www.onvif.org/ver10/media/wsdl",
+      "xaddr": "http://camera.local/onvif/media1",
+      "version": {
+        "major": 1,
+        "minor": 0
+      }
+    },
+    {
+      "namespace": "http://www.onvif.org/ver20/media/wsdl",
+      "xaddr": "http://camera.local/onvif/media2",
+      "version": {
+        "major": 2,
+        "minor": 0
+      }
+    },
+    {
+      "namespace": "http://www.onvif.org/ver20/ptz/wsdl",
+      "xaddr": "http://camera.local/onvif/ptz",
+      "version": {
+        "major": 2,
+        "minor": 2
+      }
+    }
+  ],
+  "profiles": [
+    {
+      "token": "shared",
+      "source": "media2",
+      "name": "Modern Shared",
+      "hasAudioEncoder": true,
+      "hasAudioOutput": false,
+      "hasAudioSource": true,
+      "ptzConfigurationToken": "ptz-config-m2",
+      "ptzNodeToken": "pan-node"
+    }
+  ],
+  "ptz": {
+    "detected": true,
+    "panTiltSupported": true,
+    "zoomSupported": true,
+    "profileTokens": [
+      "shared"
+    ],
+    "serviceCapabilities": {
+      "eFlip": true,
+      "reverse": false,
+      "getCompatibleConfigurations": true,
+      "moveStatus": false,
+      "statusPosition": true
+    },
+    "nodes": [
+      {
+        "token": "pan-node",
+        "name": "Pan only",
+        "spaces": {
+          "absolutePanTilt": false,
+          "absoluteZoom": false,
+          "relativePanTilt": false,
+          "relativeZoom": false,
+          "continuousPanTilt": true,
+          "continuousZoom": false
+        },
+        "maximumPresets": 4,
+        "homeSupported": true,
+        "auxiliaryCommands": [
+          "IrisClose",
+          "IrisOpen"
+        ]
+      },
+      {
+        "token": "zoom-node",
+        "name": "Zoom only",
+        "spaces": {
+          "absolutePanTilt": false,
+          "absoluteZoom": true,
+          "relativePanTilt": false,
+          "relativeZoom": false,
+          "continuousPanTilt": false,
+          "continuousZoom": false
+        },
+        "maximumPresets": 2,
+        "homeSupported": false,
+        "auxiliaryCommands": []
+      }
+    ]
+  },
+  "media2": {
+    "detected": true,
+    "encodings": [
+      "H264",
+      "H265"
+    ],
+    "h265Supported": true
+  },
+  "warnings": []
+}
+```
+
+보고서 필드의 의미는 다음과 같습니다.
+
+- `device`는 카메라가 보고한 제조사, 모델, 펌웨어, 일련번호이고 `scopes`는 중복을
+  제거한 원본 ONVIF scope 값입니다.
+- `declared_profiles`는 장치 scope에서 정규화한 profile 이름입니다. 장치의 자기
+  보고일 뿐 독립적인 ONVIF 인증 결과가 아닙니다. CLI에서는 `declaredProfiles`로
+  표기합니다.
+- `service_discovery`는 서비스 목록을 `GetServices`, 기존 `GetCapabilities`
+  fallback 중 어디에서 얻었는지 또는 얻지 못했는지를 나타냅니다. `services`에는
+  namespace, XAddr, 선택적인 `CameraCapabilityVersion` 정보가 있습니다.
+- `profiles`는 Media1/Media2 binding 및 선택적인 PTZ configuration/node token을
+  설명합니다. 광고된 PTZ 서비스, `profile_tokens`의 profile binding,
+  `pan_tilt_supported`, `zoom_supported`, PTZ node의 실제 movement space는 서로 다른
+  사실이며 어느 하나가 나머지를 보장하지 않습니다.
+- `media2.detected`는 성공한 `GetServices` 응답이 Media2를 광고했는지만 나타냅니다.
+  접근 가능 여부가 아니며 Media2 보강에 실패해도 `true`로 남을 수 있습니다. 기존
+  fallback 또는 서비스 검색 실패에서는 `null`입니다. CLI의 `media2.encodings`와
+  `media2.h265Supported`는 성공한 encoder option 보강의 근거입니다.
+- `warnings`에는 선택적인 보강 요청 실패가 들어갑니다. 각 `warning.message`는
+  generic canonical text만 사용하며 credentials, WSSE digest material,
+  URL userinfo, raw or real camera response payload를 포함하지 않습니다. 최초 연결 또는
+  인증 실패는 치명적이며 예외로 전달되므로 warning으로 바뀌지 않습니다.
+
+3상 boolean에는 의도가 있습니다. `true`는 성공한 응답에서 해당 사실을 찾았다는
+뜻이고, `false`는 성공한 응답이 부재를 확인했다는 뜻이며, `null`은 사실을 확인할
+수 없었다는 뜻입니다. Python dataclass에서는 각각 `True`, `False`, `None`이고 CLI는
+JSON 표기를 출력합니다. 장치가 보고하지 않은 선택적인 JSON object member는
+생략합니다. Media2 광고와 성공한 H.265 보강은 유용한 Profile T 근거이지만 Profile T
+인증의 증명은 아닙니다.
+
+서비스 검색에 성공하면 선택적인 Media, PTZ 보강 요청은 각각 일치하는 광고된
+서비스 XAddr로 routing됩니다. 반환된 서비스 URL은 WSSE 생성이나 네트워크 I/O 전에
+동일 출처 규칙으로 검증합니다. 스킴과 정규화한 호스트 이름은 선택된 Device 서비스와
+같아야 하며 port, path, query는 달라도 됩니다. 다른 출처의 XAddr도 `services`에는
+그대로 남지만 보강 요청은 보내지 않고 `invalid ONVIF service URL` warning을 기록합니다.
+연결 과정에서 반환된 Media XAddr에도 같은 규칙을 적용합니다.
+
+XML은 encoding-aware DTD/entity 차단을 유지하며 element 깊이는 최대 64단계입니다.
+SOAP fault는 `ActionNotSupported`를 포함한 고정 인증/프로토콜 allowlist만 출력하며
+알 수 없는 code는 항상 `SOAP Fault: Fault`로 정규화합니다.
+
+`timeout`은 요청마다 적용되므로 여러 요청을 수행하는 보고서의 전체 시간은 한 timeout
+구간보다 길 수 있습니다.
+
 ### `play_file`
 
 ```python
@@ -230,6 +435,13 @@ rtsp-backchannel streams \
   --host camera.local \
   --user admin
 
+# camelCase 카메라 기능 보고서 하나를 JSON 한 줄로 출력합니다.
+rtsp-backchannel capabilities \
+  --host camera.local \
+  --user operator \
+  --device-url http://camera.local/onvif/device_service \
+  --timeout-ms 8000
+
 # 음원 한 파일을 재생하고 RTSP 세션을 종료합니다.
 rtsp-backchannel play \
   --host camera.local \
@@ -238,8 +450,24 @@ rtsp-backchannel play \
   --volume 0.05
 ```
 
-하위 호환성을 위해 `play` 단어는 생략할 수 있습니다. Python CLI의 `--user`와
-`--pass` 기본값은 빈 문자열이며 카메라 인증이 필요할 때 `--pass`를 명시하십시오.
+하위 호환성을 위해 `play` 단어는 생략할 수 있습니다. `streams`와 재생 명령은 기존의
+빈 문자열 인증정보 기본값을 유지합니다. `capabilities`에서 `--pass`를 생략하면
+`ONVIF_PASSWORD`를 읽고, 환경변수가 없으면 빈 비밀번호를 사용합니다. 명시적인
+`--pass ""`는 환경변수보다 우선하여 빈 비밀번호를 사용합니다.
+
+`capabilities`에는 비어 있지 않은 `--host`가 필요하고 비어 있지 않은 `--user`를
+지정할 수 있습니다. 반복된 `--device-url`은 입력 순서를 보존합니다. API를 한 번
+호출하고 native camelCase JSON object를 정확히 한 줄 출력합니다. `--timeout-ms`를
+생략하면 API 기본값을 사용하고, 지정한 값은 소수도 가능하지만 0보다 큰 유한한
+요청별 millisecond 값이어야 하며 24시간 상한(86,400,000ms)을 포함하여 그 이하여야
+합니다. 파싱한 millisecond 숫자를 second로 변환하기 전에 검증합니다. 잘못되었거나
+상한을 넘는 값은 API 또는 네트워크 호출 전에 값이 포함되지 않은 고정 진단과 종료
+상태 2로 거부합니다.
+
+capability CLI는 bare `--` argument terminator를 값이 포함되지 않은 고정 진단으로
+거부합니다. `--pass=--value` 또는 `--pass` 다음의 별도 값으로 전달한 hyphen-prefixed
+password는 opaque 값으로 유지하고, 알려진 capability flag는 비밀번호 누락으로
+처리합니다. 명시적인 `--pass ""`의 환경변수 override 동작은 그대로입니다.
 
 ## 재생 동작
 

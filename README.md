@@ -126,6 +126,7 @@ console.log({ packetsSent });
 | --- | --- | --- |
 | `discoverDevices(options?)` | `timeoutMs?`, `interfaces?`, `cidrs?`, `ports?`, `concurrency?` | `Promise<DiscoveredDevice[]>` |
 | `getStreamUris(options)` | `host`, `user`, `pass`, `deviceUrls?`, `timeoutMs?` | `Promise<StreamUri[]>` |
+| `getCameraCapabilities(options)` | `host`, `user?`, `pass?`, `deviceUrls?`, `timeoutMs?` | `Promise<CameraCapabilityReport>` |
 | `playFile(options)` | `host`, `user`, `pass`, `file`, `volume`, `codec` | RTP packet count as `Promise<number>` |
 
 `DiscoveredDevice` contains `ip`, `xaddrs`, `scopes`, and optional `name`,
@@ -176,6 +177,213 @@ PasswordDigest, while RTSP authentication is sent only after a server
 challenge. WS-Security digest authenticates the request but does not encrypt
 transport. HTTP and HTTPS cameras, including self-signed TLS endpoints, are
 supported for compatibility; use a trusted network or VPN.
+
+### Camera Capability Reports
+
+`getCameraCapabilities` collects the device identity, scopes, advertised
+services, Media profiles, PTZ facts, and Media2 encoder evidence in one
+report. Supply passwords through `ONVIF_PASSWORD` rather than source code:
+
+```typescript
+import {
+  getCameraCapabilities,
+  type CameraCapabilityReport,
+} from 'rtsp-backchannel';
+
+const password = process.env.ONVIF_PASSWORD;
+if (!password) throw new Error('ONVIF_PASSWORD is required');
+
+const report: CameraCapabilityReport = await getCameraCapabilities({
+  host: 'camera.local',
+  user: 'operator',
+  pass: password,
+  deviceUrls: ['http://camera.local/onvif/device_service'],
+  timeoutMs: 8000,
+});
+
+console.log(report.declaredProfiles, report.media2.h265Supported);
+```
+
+Here is what a report looks like for a camera that declares Profile S and T
+support and advertises a PTZ service. The CLI's `capabilities` command prints
+this as a single JSON line; it is pretty-printed below for readability. The
+two PTZ nodes make the point: `pan-node` reports `continuousPanTilt: true`
+while `zoom-node` reports only `absoluteZoom: true`, so an advertised PTZ
+service does not by itself mean pan/tilt support, and the top-level
+`ptz.panTiltSupported`/`ptz.zoomSupported` summarize across both nodes.
+`declaredProfiles` here is a self-report drawn from the device's own scopes,
+not an ONVIF certification.
+
+```json
+{
+  "device": {
+    "manufacturer": "Parity Camera",
+    "model": "PX-1",
+    "firmware": "1.2.3",
+    "serial": "parity-001"
+  },
+  "scopes": [
+    "onvif://www.onvif.org/Profile/Streaming",
+    "onvif://www.onvif.org/Profile/T"
+  ],
+  "declaredProfiles": [
+    "S",
+    "T"
+  ],
+  "serviceDiscovery": "getServices",
+  "services": [
+    {
+      "namespace": "http://www.onvif.org/ver10/media/wsdl",
+      "xaddr": "http://camera.local/onvif/media1",
+      "version": {
+        "major": 1,
+        "minor": 0
+      }
+    },
+    {
+      "namespace": "http://www.onvif.org/ver20/media/wsdl",
+      "xaddr": "http://camera.local/onvif/media2",
+      "version": {
+        "major": 2,
+        "minor": 0
+      }
+    },
+    {
+      "namespace": "http://www.onvif.org/ver20/ptz/wsdl",
+      "xaddr": "http://camera.local/onvif/ptz",
+      "version": {
+        "major": 2,
+        "minor": 2
+      }
+    }
+  ],
+  "profiles": [
+    {
+      "token": "shared",
+      "source": "media2",
+      "name": "Modern Shared",
+      "hasAudioEncoder": true,
+      "hasAudioOutput": false,
+      "hasAudioSource": true,
+      "ptzConfigurationToken": "ptz-config-m2",
+      "ptzNodeToken": "pan-node"
+    }
+  ],
+  "ptz": {
+    "detected": true,
+    "panTiltSupported": true,
+    "zoomSupported": true,
+    "profileTokens": [
+      "shared"
+    ],
+    "serviceCapabilities": {
+      "eFlip": true,
+      "reverse": false,
+      "getCompatibleConfigurations": true,
+      "moveStatus": false,
+      "statusPosition": true
+    },
+    "nodes": [
+      {
+        "token": "pan-node",
+        "name": "Pan only",
+        "spaces": {
+          "absolutePanTilt": false,
+          "absoluteZoom": false,
+          "relativePanTilt": false,
+          "relativeZoom": false,
+          "continuousPanTilt": true,
+          "continuousZoom": false
+        },
+        "maximumPresets": 4,
+        "homeSupported": true,
+        "auxiliaryCommands": [
+          "IrisClose",
+          "IrisOpen"
+        ]
+      },
+      {
+        "token": "zoom-node",
+        "name": "Zoom only",
+        "spaces": {
+          "absolutePanTilt": false,
+          "absoluteZoom": true,
+          "relativePanTilt": false,
+          "relativeZoom": false,
+          "continuousPanTilt": false,
+          "continuousZoom": false
+        },
+        "maximumPresets": 2,
+        "homeSupported": false,
+        "auxiliaryCommands": []
+      }
+    ]
+  },
+  "media2": {
+    "detected": true,
+    "encodings": [
+      "H264",
+      "H265"
+    ],
+    "h265Supported": true
+  },
+  "warnings": []
+}
+```
+
+The public report fields have these meanings:
+
+- `device` is the reported manufacturer, model, firmware, and serial identity;
+  `scopes` preserves the deduplicated raw ONVIF scope values.
+- `declaredProfiles` contains normalized profile names from device scopes. These
+  are device self-reports, not independent ONVIF certification results.
+- `serviceDiscovery` says whether the inventory came from `GetServices`, the
+  legacy `GetCapabilities` fallback, or was unavailable. `services` contains
+  namespace, XAddr, and optional version facts.
+- `profiles` describes Media1/Media2 profile bindings, including audio presence
+  and optional PTZ configuration/node tokens.
+- `ptz` separates three different facts: an advertised PTZ service
+  (`detected`), profile-to-PTZ bindings (`profileTokens`), and actual movement
+  spaces (`panTiltSupported`, `zoomSupported`, and `nodes`). One does not imply
+  the others.
+- `media2.detected` reports only whether a successful `GetServices` response advertised a Media2 service.
+  It is not a reachability result and can remain `true` when Media2 enrichment
+  requests fail. It is `null` after the legacy `GetCapabilities` fallback or
+  unavailable service discovery. `media2.encodings` and
+  `media2.h265Supported` come from encoder-option enrichment when available.
+- `warnings` contains failures from optional enrichment requests. Each
+  `warning.message` uses generic canonical text and contains no credentials,
+  WSSE digest material, URL userinfo, or raw or real camera response payload.
+  Initial connection and authentication failures are fatal; they reject the
+  promise instead of becoming warnings.
+
+Authenticated service routing is anchored to the selected Device Service URL.
+The connected Media endpoint and every advertised Media1, Media2, or PTZ
+XAddr must use the same scheme and canonical hostname or IP address. Ports,
+paths, and query strings may differ. Camera-reported XAddr values remain in
+`services` as evidence, but a mismatched endpoint receives neither WS-Security
+material nor a network request; optional enrichment records a generic warning
+and leaves the corresponding evidence empty or unknown.
+
+ONVIF response headers are limited to 64 KiB and response bodies/XML input to
+1 MiB. Parsed XML is limited to 64 element levels. Exceeding an optional
+enrichment budget leaves its result empty/unknown and adds a credential-safe
+warning. SOAP faults expose only canonical authentication and protocol codes;
+unknown camera codes become `Fault` without payload reflection.
+
+Tri-state booleans are deliberate: `true` means a successful response found the
+fact, `false` means a successful response established its absence, and `null`
+means the fact could not be established. Optional object members are omitted
+when the device did not report them. In particular, a legacy
+`GetCapabilities`-only result leaves `media2.detected` and
+`media2.h265Supported` as `null`. A Media2 service advertisement and successful
+H.265 option enrichment are useful evidence, but are not proof of Profile T
+certification.
+
+`timeoutMs` is a per-request timeout. Capability reporting performs multiple
+requests, so total elapsed time can exceed one timeout interval. Optional
+enrichment failures can add warnings and continue; they do not extend a single
+request's timeout.
 
 ### Low-Level Backchannel API
 
@@ -269,6 +477,13 @@ rtsp-backchannel streams \
   --host camera.local \
   --user admin
 
+# Print one camelCase camera capability report as one JSON line.
+rtsp-backchannel capabilities \
+  --host camera.local \
+  --user operator \
+  --device-url http://camera.local/onvif/device_service \
+  --timeout-ms 8000
+
 # Play one file and close the RTSP session.
 rtsp-backchannel play \
   --host camera.local \
@@ -289,7 +504,16 @@ rtsp-backchannel play \
 
 The `play` word is optional for backward compatibility. `--pass` is available
 for manual use, but `ONVIF_PASSWORD` avoids exposing the password in the
-process argument list.
+process argument list. `capabilities` accepts repeatable `--device-url` values
+in the supplied order and prints exactly one native camelCase JSON report.
+Omitting `--timeout-ms` uses the client default; when supplied, it must be a
+finite number greater than zero and no greater than 86,400,000 milliseconds
+(24 hours), inclusively. Capability argument validation uses fixed diagnostics
+that do not echo option values or credentials, rejects a bare `--`, and accepts
+hyphen-leading passwords through `--pass <value>` when they are not known
+flags or through the unambiguous `--pass=<value>` form. An explicit empty
+password remains distinct from an omitted password; prefer `ONVIF_PASSWORD` so
+secrets do not appear in the process argument list.
 
 ## Playback Behavior
 
