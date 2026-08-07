@@ -884,6 +884,10 @@ test('rejects missing or flag-shaped values for every capability option', async 
       argv: ['capabilities', '--host', 'camera.local', '--pass', '--timeout-ms', '50'],
     },
     {
+      option: 'pass',
+      argv: ['capabilities', '--host', 'camera.local', '--pass', '-h'],
+    },
+    {
       option: 'device-url',
       argv: ['capabilities', '--host', 'camera.local', '--device-url'],
     },
@@ -907,6 +911,10 @@ test('rejects missing or flag-shaped values for every capability option', async 
       ],
     },
     {
+      option: 'device-url',
+      argv: ['capabilities', '--host', 'camera.local', '--device-url', '-h'],
+    },
+    {
       option: 'host',
       argv: ['capabilities', '--host'],
     },
@@ -917,6 +925,10 @@ test('rejects missing or flag-shaped values for every capability option', async 
     {
       option: 'host',
       argv: ['capabilities', '--host', '--timeout-ms', '50'],
+    },
+    {
+      option: 'host',
+      argv: ['capabilities', '--host', '-h'],
     },
     {
       option: 'user',
@@ -931,6 +943,10 @@ test('rejects missing or flag-shaped values for every capability option', async 
       argv: ['capabilities', '--host', 'camera.local', '--user', '--timeout-ms', '50'],
     },
     {
+      option: 'user',
+      argv: ['capabilities', '--host', 'camera.local', '--user', '-h'],
+    },
+    {
       option: 'timeout-ms',
       argv: ['capabilities', '--host', 'camera.local', '--timeout-ms'],
     },
@@ -941,6 +957,10 @@ test('rejects missing or flag-shaped values for every capability option', async 
     {
       option: 'timeout-ms',
       argv: ['capabilities', '--host', 'camera.local', '--timeout-ms', '--user', 'operator'],
+    },
+    {
+      option: 'timeout-ms',
+      argv: ['capabilities', '--host', 'camera.local', '--timeout-ms', '-h'],
     },
   ];
 
@@ -967,6 +987,45 @@ test('rejects missing or flag-shaped values for every capability option', async 
   } finally {
     if (previous === undefined) delete process.env.ONVIF_PASSWORD;
     else process.env.ONVIF_PASSWORD = previous;
+  }
+
+  assert.equal(calls, 0);
+  assert.deepEqual(logs, []);
+});
+
+test('rejects unknown capability options and positionals before dispatch without reflection', async () => {
+  const logs: string[] = [];
+  const dependencies = commandDependencies(logs);
+  let calls = 0;
+  dependencies.getCameraCapabilities = async () => {
+    calls++;
+    return {};
+  };
+  const cases = [
+    ['--unknown=attached-control-secret'],
+    ['--timeout-mss', 'misspelled-control-secret'],
+    ['positional-control-secret'],
+  ];
+
+  for (const unknownArguments of cases) {
+    await assert.rejects(
+      commandMain()(
+        [
+          'capabilities', '--host', 'camera.local', '--pass', 'password-control-secret',
+          ...unknownArguments,
+        ],
+        dependencies,
+      ),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.equal(error.message, 'unknown capabilities argument');
+        assert.doesNotMatch(
+          error.message,
+          /attached-control-secret|misspelled-control-secret|positional-control-secret|password-control-secret|camera\.local/,
+        );
+        return true;
+      },
+    );
   }
 
   assert.equal(calls, 0);

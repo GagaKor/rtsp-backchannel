@@ -63,6 +63,7 @@ const CODEC_PREFERENCES: readonly CodecPreference[] = [
 const MAX_CAPABILITY_TIMEOUT_MS = 86_400_000;
 const CAPABILITY_TIMEOUT_RANGE_ERROR = 'timeout-ms exceeds the 24-hour maximum';
 const CAPABILITY_TERMINATOR_ERROR = 'capabilities does not accept an argument terminator';
+const UNKNOWN_CAPABILITY_ARGUMENT_ERROR = 'unknown capabilities argument';
 
 function arg(argv: string[], name: string, def?: string): string {
   const i = argv.indexOf(`--${name}`);
@@ -192,12 +193,17 @@ function parseCapabilityArguments(argv: string[]): ParsedCapabilityArguments {
     }
 
     const name = exactCapabilityOptionName(argv[index]);
-    if (!name) continue;
+    if (!name) {
+      if (argv[index] === '-h' || argv[index] === '--help') continue;
+      throw new Error(UNKNOWN_CAPABILITY_ARGUMENT_ERROR);
+    }
     const value = argv[index + 1];
     if (
       value === undefined
       || (name !== 'pass' && value === '')
-      || (name === 'pass' ? isKnownCapabilityFlag(value) : value.startsWith('--'))
+      || (name === 'pass'
+        ? isKnownCapabilityFlag(value)
+        : value === '-h' || value.startsWith('--'))
     ) {
       throw missingCapabilityValue(name);
     }
