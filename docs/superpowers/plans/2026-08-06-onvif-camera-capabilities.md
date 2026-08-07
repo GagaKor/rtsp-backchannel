@@ -210,7 +210,7 @@ and runs all three read-only CLIs only after the private route becomes available
 - Modify: `package-lock.json`
 - Modify: `THIRD_PARTY_NOTICES.md`
 
-- [ ] **Step 1: Write failing XML-tree tests**
+- [x] **Step 1: Write failing XML-tree tests**
 
 Test a namespaced document whose prefixes change, repeated sibling elements, namespaced attributes, text/entity decoding, malformed XML, and explicit rejection of `DOCTYPE`/`ENTITY`. The wished-for internal API is:
 
@@ -222,23 +222,23 @@ attribute(node, WSTOP_NS, 'topic');
 textOf(firstChild(node, DEV_NS, 'Namespace'));
 ```
 
-- [ ] **Step 2: Run the focused test and verify RED**
+- [x] **Step 2: Run the focused test and verify RED**
 
 Run: `npm test -- src/onvif/xml.test.ts`
 
 Expected: FAIL because `src/onvif/xml.ts` does not exist.
 
-- [ ] **Step 3: Add `saxes` as a runtime dependency**
+- [x] **Step 3: Add `saxes` as a runtime dependency**
 
 Run: `npm install saxes@^6.0.0`
 
 Record `saxes` (ISC) and its `xmlchars` dependency in `THIRD_PARTY_NOTICES.md`. Do not configure or resolve external entities.
 
-- [ ] **Step 4: Implement the minimal immutable XML tree**
+- [x] **Step 4: Implement the minimal immutable XML tree**
 
 Use `SaxesParser({ xmlns: true })`, retain `{ uri, local, attributes, children, text }`, reject DTD/entity declarations before parsing, cap parser input at the existing SOAP body limit, and surface parse errors with operation-neutral messages.
 
-- [ ] **Step 5: Run focused tests, typecheck, and build**
+- [x] **Step 5: Run focused tests, typecheck, and build**
 
 Run:
 
@@ -250,7 +250,7 @@ npm run build
 
 Expected: all pass.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/onvif/xml.ts src/onvif/xml.test.ts package.json package-lock.json THIRD_PARTY_NOTICES.md
@@ -265,7 +265,7 @@ git commit -m "feat(ts): add namespace-aware ONVIF XML parsing"
 - Modify: `src/onvif/deviceClient.ts`
 - Modify: `src/onvif/deviceClient.test.ts`
 
-- [ ] **Step 1: Write failing pure-parser tests**
+- [x] **Step 1: Write failing pure-parser tests**
 
 Fixtures must cover:
 
@@ -277,23 +277,23 @@ Fixtures must cover:
 - arbitrary-depth WS-Topics elements with prefix changes and schema-description descendants;
 - repeated Media2 `Options/Encoding` values for H264 and H265.
 
-- [ ] **Step 2: Run parser tests and verify RED**
+- [x] **Step 2: Run parser tests and verify RED**
 
 Run: `npm test -- src/onvif/capabilities.test.ts`
 
 Expected: FAIL because report types and parsers are absent.
 
-- [ ] **Step 3: Implement report types and pure parsers**
+- [x] **Step 3: Implement report types and pure parsers**
 
 Implement the shared shape exactly. Parse direct children where association matters, parse optional booleans and integers strictly, normalize/deduplicate without losing unknown vendor namespaces, and add operation-response validation that distinguishes SOAP faults from malformed responses.
 
-- [ ] **Step 4: Run parser tests and verify GREEN**
+- [x] **Step 4: Run parser tests and verify GREEN**
 
 Run: `npm test -- src/onvif/capabilities.test.ts`
 
 Expected: parser cases pass.
 
-- [ ] **Step 5: Write failing device and orchestrator tests**
+- [x] **Step 5: Write failing device and orchestrator tests**
 
 Use the existing local HTTP server style and a fake-device seam. Assert:
 
@@ -306,7 +306,7 @@ Use the existing local HTTP server style and a fake-device seam. Assert:
 - optional endpoint failures yield sanitized structured warnings and `null`, while initial connect/auth failure rejects;
 - Media1 profile failure can still produce Media2 profiles.
 
-- [ ] **Step 6: Run device/orchestrator tests and verify RED**
+- [x] **Step 6: Run device/orchestrator tests and verify RED**
 
 Run:
 
@@ -316,11 +316,11 @@ npm test -- src/onvif/deviceClient.test.ts src/onvif/capabilities.test.ts
 
 Expected: new routing/orchestration assertions fail.
 
-- [ ] **Step 7: Implement minimal device calls and `getCameraCapabilities`**
+- [x] **Step 7: Implement minimal device calls and `getCameraCapabilities`**
 
 Do not move capability calls into `connect()`. Add internal raw read-only calls after connection, preserve the existing response-size and timeout limits, select enrichment endpoints deterministically, merge legacy Event capability fields, and make warnings credential-free.
 
-- [ ] **Step 8: Run focused and full TypeScript checks**
+- [x] **Step 8: Run focused and full TypeScript checks**
 
 Run:
 
@@ -333,7 +333,7 @@ npm run build
 
 Expected: all pass.
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add src/onvif/capabilities.ts src/onvif/capabilities.test.ts src/onvif/deviceClient.ts src/onvif/deviceClient.test.ts
@@ -350,23 +350,23 @@ git commit -m "feat(ts): report ONVIF camera capabilities"
 - Modify: `README.md`
 - Modify: `README.ko.md`
 
-- [ ] **Step 1: Write failing export and CLI tests**
+- [x] **Step 1: Write failing export and CLI tests**
 
 Assert root exports for `getCameraCapabilities` and all public report types, clean generated declarations without dependency-injection seams, `capabilities --help`, repeated `--device-url`, finite positive `--timeout-ms`, `ONVIF_PASSWORD` fallback, one JSON log line, and unchanged discover/streams/direct-play behavior.
 
-- [ ] **Step 2: Run tests and verify RED**
+- [x] **Step 2: Run tests and verify RED**
 
 Run: `npm test -- src/index.test.ts src/cli.test.ts`
 
-- [ ] **Step 3: Implement exports and CLI dispatch**
+- [x] **Step 3: Implement exports and CLI dispatch**
 
 Add `getCameraCapabilities` to `CommandDependencies`, print one native camelCase report object, and keep credentials out of help/errors/logs.
 
-- [ ] **Step 4: Document API and interpretation**
+- [x] **Step 4: Document API and interpretation**
 
 Add equivalent English/Korean examples, field meanings, tri-state behavior, Profile T certification caveat, per-request timeout semantics, and `capabilities` CLI usage.
 
-- [ ] **Step 5: Verify TypeScript packaging**
+- [x] **Step 5: Verify TypeScript packaging**
 
 Run:
 
@@ -377,7 +377,7 @@ npm run build
 npm pack --dry-run --json
 ```
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/index.ts src/index.test.ts src/cli.ts src/cli.test.ts README.md README.ko.md
@@ -391,11 +391,11 @@ git commit -m "feat(ts): expose camera capability reporting"
 - Create: `python/test_onvif_capabilities.py`
 - Modify: `python/rtsp_backchannel/onvif.py`
 
-- [ ] **Step 1: Write failing parser tests**
+- [x] **Step 1: Write failing parser tests**
 
 Port the TypeScript semantic fixtures, not its implementation. Cover service association/version selection, legacy mapping, both profile formats, PTZ booleans/nodes, namespace-aware event topics, Media2 encodings, SOAP faults, and malformed XML.
 
-- [ ] **Step 2: Run focused tests and verify RED**
+- [x] **Step 2: Run focused tests and verify RED**
 
 Run:
 
@@ -404,27 +404,27 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=python:. \
   python3 -m unittest python.test_onvif_capabilities -v
 ```
 
-- [ ] **Step 3: Implement dataclasses and `ElementTree` parsers**
+- [x] **Step 3: Implement dataclasses and `ElementTree` parsers**
 
 Keep `OnvifProfile` unchanged. Use a report-specific profile dataclass, namespace URI/local-name splitting, direct-child helpers, strict optional boolean/integer parsers, and deterministic sorting.
 
-- [ ] **Step 4: Run parser tests and verify GREEN**
+- [x] **Step 4: Run parser tests and verify GREEN**
 
 Run the focused command again; parser cases pass.
 
-- [ ] **Step 5: Write failing orchestration tests**
+- [x] **Step 5: Write failing orchestration tests**
 
 Patch/fake `OnvifDevice` and also use one local HTTP server test to verify exact request bodies (including Media2 `GetProfiles` with `<Type>All</Type>`), advertised endpoint routing, unsupported `GetServices` fallback, auth-fault propagation, Media2 profile recovery, warning sanitization, and no change to existing stream request order.
 
-- [ ] **Step 6: Run tests and verify RED**
+- [x] **Step 6: Run tests and verify RED**
 
 Run the focused command; new orchestration cases fail.
 
-- [ ] **Step 7: Implement device information return and `get_camera_capabilities`**
+- [x] **Step 7: Implement device information return and `get_camera_capabilities`**
 
 Make `OnvifDevice.connect()` return a new immutable `DeviceInfo` while preserving callers that ignore its return. Add `_required_device_url()` and reuse `_call`; do not duplicate WSSE or HTTP code. Keep every optional enrichment best-effort and every initial connection/authentication failure fatal.
 
-- [ ] **Step 8: Run focused and full Python tests**
+- [x] **Step 8: Run focused and full Python tests**
 
 Run:
 
@@ -435,7 +435,7 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=python:. \
   python3 -m unittest discover -s python -p 'test_*.py'
 ```
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add python/rtsp_backchannel/capabilities.py python/test_onvif_capabilities.py python/rtsp_backchannel/onvif.py
@@ -451,23 +451,23 @@ git commit -m "feat(python): report ONVIF camera capabilities"
 - Modify: `python/README.md`
 - Modify: `python/README.ko.md`
 
-- [ ] **Step 1: Write failing package and CLI tests**
+- [x] **Step 1: Write failing package and CLI tests**
 
 Assert package-root exports, `capabilities` parsing, `ONVIF_PASSWORD` fallback, timeout validation, repeated device URLs, one camelCase JSON object, help text, and unchanged existing dispatch.
 
-- [ ] **Step 2: Run tests and verify RED**
+- [x] **Step 2: Run tests and verify RED**
 
 Run: `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=python:. python3 -m unittest python.test_library_api -v`
 
-- [ ] **Step 3: Implement export, JSON conversion, and CLI dispatch**
+- [x] **Step 3: Implement export, JSON conversion, and CLI dispatch**
 
 Keep Python dataclasses snake_case while producing the shared camelCase CLI object. Do not use `dataclasses.asdict()` without an explicit recursive key mapping.
 
-- [ ] **Step 4: Document Python API and CLI**
+- [x] **Step 4: Document Python API and CLI**
 
 Mirror the shared semantic guidance in both Python READMEs. Update the repository changelog once in Task 8 after all three implementations pass.
 
-- [ ] **Step 5: Verify Python package**
+- [x] **Step 5: Verify Python package**
 
 Run:
 
@@ -480,7 +480,7 @@ python3 -m twine check python/dist/*
 
 If `build` or `twine` is not installed, create a temporary virtual environment and install only those packaging tools; do not add them to runtime dependencies.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add python/rtsp_backchannel/__init__.py python/rtsp_backchannel/cli.py python/test_library_api.py python/README.md python/README.ko.md
@@ -494,23 +494,23 @@ git commit -m "feat(python): expose camera capability reporting"
 - Modify: `rust/src/onvif.rs`
 - Modify: `rust/tests/onvif_api.rs`
 
-- [ ] **Step 1: Write failing `roxmltree` parser tests**
+- [x] **Step 1: Write failing `roxmltree` parser tests**
 
 Port the shared semantic fixtures. Assert `Option`/`null` unknown semantics, stable service ordering, Media1/Media2 profile parsing, zoom-only PTZ behavior, exact namespace URIs in event topics, and H.265 detection.
 
-- [ ] **Step 2: Run focused tests and verify RED**
+- [x] **Step 2: Run focused tests and verify RED**
 
 Run: `cargo +1.86.0 test --manifest-path rust/Cargo.toml onvif::capabilities::tests`
 
-- [ ] **Step 3: Implement serializable report types and pure parsers**
+- [x] **Step 3: Implement serializable report types and pure parsers**
 
 Derive `Debug`, `Clone`, `PartialEq`, `Eq`, and `Serialize`, use `#[serde(rename_all = "camelCase")]`, skip optional object members but serialize tri-state `Option<bool>` fields as JSON `null`, and use stable sorting/BTree collections.
 
-- [ ] **Step 4: Run parser tests and verify GREEN**
+- [x] **Step 4: Run parser tests and verify GREEN**
 
 Run the focused command again; parser cases pass.
 
-- [ ] **Step 5: Write failing client integration tests**
+- [x] **Step 5: Write failing client integration tests**
 
 Use the existing sequential mock-camera server to verify:
 
@@ -521,15 +521,15 @@ Use the existing sequential mock-camera server to verify:
 - optional probe failures return sanitized warnings and unknowns;
 - `get_camera_capabilities` is usable through `rtsp_backchannel::onvif`.
 
-- [ ] **Step 6: Run integration tests and verify RED**
+- [x] **Step 6: Run integration tests and verify RED**
 
 Run: `cargo +1.86.0 test --manifest-path rust/Cargo.toml --test onvif_api capability`
 
-- [ ] **Step 7: Implement `get_camera_capabilities` and parent-module plumbing**
+- [x] **Step 7: Implement `get_camera_capabilities` and parent-module plumbing**
 
 Add Media2/PTZ/Events constants, `DeviceInfo`, selected `device_url`, and child-module re-exports. Reuse `soap_response()` so strict operation validation can inspect status/faults; do not loosen the 1 MiB limit or TLS/redirect policy.
 
-- [ ] **Step 8: Run focused and full Rust tests**
+- [x] **Step 8: Run focused and full Rust tests**
 
 Run:
 
@@ -539,7 +539,7 @@ cargo +1.86.0 test --manifest-path rust/Cargo.toml --locked
 cargo +1.86.0 clippy --manifest-path rust/Cargo.toml --all-targets --locked -- -D warnings
 ```
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add rust/src/onvif/capabilities.rs rust/src/onvif.rs rust/tests/onvif_api.rs
@@ -555,19 +555,19 @@ git commit -m "feat(rust): report ONVIF camera capabilities"
 - Modify: `rust/README.md`
 - Modify: `rust/README.ko.md`
 
-- [ ] **Step 1: Write failing CLI and JSON tests**
+- [x] **Step 1: Write failing CLI and JSON tests**
 
 Assert `CapabilitiesCli`, environment password behavior, timeout/device URL arguments, help output, one camelCase JSON object with explicit null tri-state fields, and existing command compatibility.
 
-- [ ] **Step 2: Run tests and verify RED**
+- [x] **Step 2: Run tests and verify RED**
 
 Run: `cargo +1.86.0 test --manifest-path rust/Cargo.toml --test onvif_api capabilities_cli`
 
-- [ ] **Step 3: Implement CLI dispatch and documentation**
+- [x] **Step 3: Implement CLI dispatch and documentation**
 
 Add the command to help/dispatch, build `CameraCapabilityOptions`, serialize once with `serde_json`, and mirror the shared interpretation guidance in both Rust READMEs.
 
-- [ ] **Step 4: Verify Rust packaging**
+- [x] **Step 4: Verify Rust packaging**
 
 Run:
 
@@ -578,7 +578,7 @@ cargo +1.86.0 clippy --manifest-path rust/Cargo.toml --all-targets --locked -- -
 cargo +1.86.0 package --manifest-path rust/Cargo.toml --locked
 ```
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add rust/src/cli.rs rust/src/main.rs rust/tests/onvif_api.rs rust/README.md rust/README.ko.md
@@ -591,11 +591,11 @@ git commit -m "feat(rust): expose camera capability reporting"
 - Modify `CHANGELOG.md` once for the complete cross-language feature.
 - Modify only other files required by failures found during this task.
 
-- [ ] **Step 1: Add/compare one shared semantic fixture**
+- [x] **Step 1: Add/compare one shared semantic fixture**
 
 Ensure all three implementations produce equivalent facts from semantically identical XML: declared S/T, Media1 and Media2 services, one zoom-only PTZ node plus one pan/tilt node, nested motion/tamper topics, and H264/H265 encodings. Language-native object naming may differ; CLI JSON must match the shared camelCase contract.
 
-- [ ] **Step 2: Run all repository checks**
+- [x] **Step 2: Run all repository checks**
 
 Run:
 
@@ -610,11 +610,19 @@ cargo +1.86.0 test --manifest-path rust/Cargo.toml --locked
 cargo +1.86.0 clippy --manifest-path rust/Cargo.toml --all-targets --locked -- -D warnings
 ```
 
-- [ ] **Step 3: Inspect release artifacts**
+- [x] **Step 3: Inspect release artifacts**
 
 Run npm dry-run packing, build/check the Python wheel, and
 `cargo +1.86.0 package --manifest-path rust/Cargo.toml --locked`. Inspect file lists for local
 paths, real device data, passwords, and fixture captures.
+
+  > Note (2026-08-07): Ran `npm pack --dry-run --json`, `cargo package --manifest-path
+  > rust/Cargo.toml --locked --allow-dirty`, and `python3 -m build python` followed by
+  > `python3 -m twine check python/dist/*` directly in this session. All three succeeded;
+  > `twine check` reported `PASSED` for both the wheel and sdist. File lists contained only
+  > source/dist paths relative to each package root, with no local filesystem paths,
+  > credentials, or real device captures. Build artifacts land in gitignored `python/dist/`,
+  > `python/build/`, and `rust/target/package/`.
 
 - [ ] **Step 4: Run live read-only probes when the private route exists**
 
@@ -641,7 +649,14 @@ cargo +1.86.0 run --quiet --manifest-path rust/Cargo.toml -- capabilities \
 
 If the route is still unavailable, record the route/traceroute evidence and leave live validation explicitly pending rather than fabricating a camera result.
 
-- [ ] **Step 5: Scan and review the final diff**
+  > Note (2026-08-07): Route is still unavailable; live validation remains explicitly pending,
+  > not fabricated. This machine's `en0` is `172.168.43.205/21` with default gateway
+  > `172.168.40.3`. `traceroute 10.128.10.141` does not stay on a private/VPN path — it leaves
+  > for the public internet (observed hop 3 in the `112.189.13.0/24`–`112.189.14.0/24` public
+  > ISP range across separate runs). `ping 10.128.10.141` showed 100% packet loss and
+  > `nc -G 2 -z 10.128.10.141 80` did not connect. No credentialed ONVIF request was sent.
+
+- [x] **Step 5: Scan and review the final diff**
 
 Run:
 
@@ -653,7 +668,15 @@ git grep -n -I -E 'qwer' -- . ':!.context' || true
 
 Request final spec-compliance and code-quality reviews. Fix and re-run the relevant checks for every accepted issue.
 
-- [ ] **Step 6: Commit integration fixes, if any**
+  > Note (2026-08-07): The three scan commands were run and came back clean — `git diff --check`
+  > reported no whitespace errors, `git diff --stat origin/master...` shows only the expected
+  > 35 files across the three languages plus docs, and the `qwer` grep has no hits outside this
+  > plan file's own command text. The only `10.128.10.141` hits are pre-existing test fixtures
+  > that already existed identically in `origin/master`. The formal "request final
+  > spec-compliance and code-quality reviews" step (an actual human/reviewer review request) has
+  > not been performed and remains outstanding.
+
+- [x] **Step 6: Commit integration fixes, if any**
 
 ```bash
 git add CHANGELOG.md <only-related-files>
