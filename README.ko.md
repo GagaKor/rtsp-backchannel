@@ -192,6 +192,118 @@ const report: CameraCapabilityReport = await getCameraCapabilities({
 console.log(report.declaredProfiles, report.media2.h265Supported);
 ```
 
+다음은 Profile S와 T를 선언하고 PTZ 서비스를 갖춘 카메라의 보고서 예시입니다.
+CLI는 이 내용을 한 줄의 JSON으로 출력하며, 아래에서는 읽기 쉽도록
+줄바꿈했습니다. `pan-node`는 `continuousPanTilt: true`이지만 `zoom-node`는
+`absoluteZoom: true`만 가지고 있어, PTZ 서비스 광고만으로 pan/tilt 지원이
+보장되지 않는다는 점과 최상위 `ptz.panTiltSupported`/`ptz.zoomSupported`가 두
+node를 종합한 값이라는 점을 보여줍니다. 여기의 `declaredProfiles`도 장치
+scope에서 얻은 자기 보고일 뿐 독립적인 ONVIF 인증 결과가 아닙니다.
+
+```json
+{
+  "device": {
+    "manufacturer": "Parity Camera",
+    "model": "PX-1",
+    "firmware": "1.2.3",
+    "serial": "parity-001"
+  },
+  "scopes": [
+    "onvif://www.onvif.org/Profile/Streaming",
+    "onvif://www.onvif.org/Profile/T"
+  ],
+  "declaredProfiles": ["S", "T"],
+  "serviceDiscovery": "getServices",
+  "services": [
+    {
+      "namespace": "http://www.onvif.org/ver10/media/wsdl",
+      "xaddr": "http://camera.local/onvif/media1",
+      "version": { "major": 1, "minor": 0 }
+    },
+    {
+      "namespace": "http://www.onvif.org/ver20/media/wsdl",
+      "xaddr": "http://camera.local/onvif/media2",
+      "version": { "major": 2, "minor": 0 }
+    },
+    {
+      "namespace": "http://www.onvif.org/ver20/ptz/wsdl",
+      "xaddr": "http://camera.local/onvif/ptz",
+      "version": { "major": 2, "minor": 2 }
+    }
+  ],
+  "profiles": [
+    {
+      "token": "shared",
+      "source": "media2",
+      "name": "Modern Shared",
+      "hasAudioEncoder": true,
+      "hasAudioOutput": false,
+      "hasAudioSource": true,
+      "ptzConfigurationToken": "ptz-config-m2",
+      "ptzNodeToken": "pan-node"
+    }
+  ],
+  "ptz": {
+    "detected": true,
+    "panTiltSupported": true,
+    "zoomSupported": true,
+    "profileTokens": ["shared"],
+    "serviceCapabilities": {
+      "eFlip": true,
+      "reverse": false,
+      "getCompatibleConfigurations": true,
+      "moveStatus": false,
+      "statusPosition": true
+    },
+    "nodes": [
+      {
+        "token": "pan-node",
+        "name": "Pan only",
+        "spaces": {
+          "absolutePanTilt": false,
+          "absoluteZoom": false,
+          "relativePanTilt": false,
+          "relativeZoom": false,
+          "continuousPanTilt": true,
+          "continuousZoom": false
+        },
+        "maximumPresets": 4,
+        "homeSupported": true,
+        "auxiliaryCommands": ["IrisClose", "IrisOpen"]
+      },
+      {
+        "token": "zoom-node",
+        "name": "Zoom only",
+        "spaces": {
+          "absolutePanTilt": false,
+          "absoluteZoom": true,
+          "relativePanTilt": false,
+          "relativeZoom": false,
+          "continuousPanTilt": false,
+          "continuousZoom": false
+        },
+        "maximumPresets": 2,
+        "homeSupported": false,
+        "auxiliaryCommands": []
+      }
+    ]
+  },
+  "events": {
+    "detected": true,
+    "serviceCapabilities": { "wsPullPointSupport": true },
+    "topics": [
+      { "namespace": "urn:onvif:topics:motion", "path": "Device/Tamper/Motion" }
+    ]
+  },
+  "media2": {
+    "detected": true,
+    "encodings": ["H264", "H265"],
+    "h265Supported": true
+  },
+  "warnings": []
+}
+```
+
 공개 보고서 필드의 의미는 다음과 같습니다.
 
 - `device`는 카메라가 보고한 제조사, 모델, 펌웨어, 일련번호이고, `scopes`는

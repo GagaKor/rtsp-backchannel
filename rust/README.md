@@ -174,6 +174,120 @@ println!("{:?}", report.declared_profiles);
 # Ok::<(), String>(())
 ```
 
+Here is the JSON a camera that declares Profile S and T support and exposes
+a PTZ service produces; the `capabilities` command prints it as one line, and
+it is pretty-printed below for readability. The two PTZ nodes are why an
+advertised PTZ service does not by itself establish pan/tilt support:
+`pan-node` reports `continuousPanTilt: true` while `zoom-node` reports only
+`absoluteZoom: true`, and the top-level
+`ptz.panTiltSupported`/`ptz.zoomSupported` summarize across both nodes.
+`declaredProfiles` here is a self-report drawn from the device's own scopes,
+not an ONVIF certification.
+
+```json
+{
+  "device": {
+    "manufacturer": "Parity Camera",
+    "model": "PX-1",
+    "firmware": "1.2.3",
+    "serial": "parity-001"
+  },
+  "scopes": [
+    "onvif://www.onvif.org/Profile/Streaming",
+    "onvif://www.onvif.org/Profile/T"
+  ],
+  "declaredProfiles": ["S", "T"],
+  "serviceDiscovery": "getServices",
+  "services": [
+    {
+      "namespace": "http://www.onvif.org/ver10/media/wsdl",
+      "xaddr": "http://camera.local/onvif/media1",
+      "version": { "major": 1, "minor": 0 }
+    },
+    {
+      "namespace": "http://www.onvif.org/ver20/media/wsdl",
+      "xaddr": "http://camera.local/onvif/media2",
+      "version": { "major": 2, "minor": 0 }
+    },
+    {
+      "namespace": "http://www.onvif.org/ver20/ptz/wsdl",
+      "xaddr": "http://camera.local/onvif/ptz",
+      "version": { "major": 2, "minor": 2 }
+    }
+  ],
+  "profiles": [
+    {
+      "token": "shared",
+      "source": "media2",
+      "name": "Modern Shared",
+      "hasAudioEncoder": true,
+      "hasAudioOutput": false,
+      "hasAudioSource": true,
+      "ptzConfigurationToken": "ptz-config-m2",
+      "ptzNodeToken": "pan-node"
+    }
+  ],
+  "ptz": {
+    "detected": true,
+    "panTiltSupported": true,
+    "zoomSupported": true,
+    "profileTokens": ["shared"],
+    "serviceCapabilities": {
+      "eFlip": true,
+      "reverse": false,
+      "getCompatibleConfigurations": true,
+      "moveStatus": false,
+      "statusPosition": true
+    },
+    "nodes": [
+      {
+        "token": "pan-node",
+        "name": "Pan only",
+        "spaces": {
+          "absolutePanTilt": false,
+          "absoluteZoom": false,
+          "relativePanTilt": false,
+          "relativeZoom": false,
+          "continuousPanTilt": true,
+          "continuousZoom": false
+        },
+        "maximumPresets": 4,
+        "homeSupported": true,
+        "auxiliaryCommands": ["IrisClose", "IrisOpen"]
+      },
+      {
+        "token": "zoom-node",
+        "name": "Zoom only",
+        "spaces": {
+          "absolutePanTilt": false,
+          "absoluteZoom": true,
+          "relativePanTilt": false,
+          "relativeZoom": false,
+          "continuousPanTilt": false,
+          "continuousZoom": false
+        },
+        "maximumPresets": 2,
+        "homeSupported": false,
+        "auxiliaryCommands": []
+      }
+    ]
+  },
+  "events": {
+    "detected": true,
+    "serviceCapabilities": { "wsPullPointSupport": true },
+    "topics": [
+      { "namespace": "urn:onvif:topics:motion", "path": "Device/Tamper/Motion" }
+    ]
+  },
+  "media2": {
+    "detected": true,
+    "encodings": ["H264", "H265"],
+    "h265Supported": true
+  },
+  "warnings": []
+}
+```
+
 Interpret the report as evidence, not certification:
 
 - `scopes` preserves the camera's raw scopes. `declared_profiles` (JSON
