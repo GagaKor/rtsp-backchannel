@@ -409,7 +409,8 @@ test('preserves the keepalive deadline across encoding and paced RTP send', asyn
   const server = net.createServer((socket) => {
     let input = Buffer.alloc(0);
     socket.on('data', (chunk) => {
-      input = Buffer.concat([input, chunk]);
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      input = Buffer.concat([input, buffer]);
       while (true) {
         if (input[0] === 0x24) {
           if (input.length < 4) return;
