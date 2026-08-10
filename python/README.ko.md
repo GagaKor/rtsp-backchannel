@@ -30,7 +30,7 @@ FFmpeg가 필요하며 GStreamer는 사용하지 않습니다.
 PyPI에 게시된 버전을 설치합니다.
 
 ```bash
-python3 -m pip install 'rtsp-backchannel>=0.2,<0.3'
+python3 -m pip install 'rtsp-backchannel>=0.3,<0.4'
 ```
 
 Registry 릴리스 대신 현재 `master` 소스를 설치하려면 다음 명령을 사용합니다.

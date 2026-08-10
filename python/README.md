@@ -30,7 +30,7 @@ Discovery, capability reporting, and stream URI lookup do not require FFmpeg.
 Install a released version from PyPI:
 
 ```bash
-python3 -m pip install 'rtsp-backchannel>=0.2,<0.3'
+python3 -m pip install 'rtsp-backchannel>=0.3,<0.4'
 ```
 
 To install the current `master` source instead of a registry release:

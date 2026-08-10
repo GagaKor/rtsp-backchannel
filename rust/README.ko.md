@@ -33,7 +33,7 @@ crate는 백채널 세션을 열고 음원 파일 전체를 실시간 속도로 
 ```toml
 [dependencies]
 anyhow = "1"
-rtsp-backchannel = "0.2"
+rtsp-backchannel = "0.3"
 ```
 
 Registry 릴리스 대신 현재 `master` 소스를 사용하려면 다음과 같이 지정합니다.

@@ -34,7 +34,7 @@ npm install rtsp-backchannel
 The current release line is `0.2`:
 
 ```bash
-npm install rtsp-backchannel@^0.2
+npm install rtsp-backchannel@^0.3
 ```
 
 To install the current `master` source instead of a registry release:
