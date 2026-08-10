@@ -382,6 +382,72 @@ SOAP fault는 `ActionNotSupported`를 포함한 고정 인증/프로토콜 allow
 `timeout`은 요청마다 적용되므로 여러 요청을 수행하는 보고서의 전체 시간은 한 timeout
 구간보다 길 수 있습니다.
 
+### `open_ptz_session`
+
+```python
+open_ptz_session(options: PtzSessionOptions) -> PtzSession
+
+PtzSessionOptions(
+    host: str,
+    user: str = "",
+    password: str = "",
+    profile_token: str | None = None,
+    device_urls: list[str] | None = None,
+    timeout: float = 8.0,
+    default_move_timeout_ms: float = 1000.0,
+)
+```
+
+`open_ptz_session`은 카메라 한 대에 대한 PTZ 제어 세션을 엽니다. 먼저 연결한
+뒤 `GetServices`와 `GetNodes`를 실행해 PTZ 서비스와 그 node를 찾고, Media
+Profile token을 정합니다. `profile_token`을 직접 지정하지 않으면 PTZ를
+지원하는 첫 번째 profile을 사용합니다. 이어서 해당 node가 지원하는 PTZ
+space를 캐시해 두어, 이후의 모든 호출을 카메라가 실제로 광고한 기능과
+대조해 검사합니다. 반환되는 `PtzSession`은 `get_camera_capabilities`와
+`get_stream_uris`가 사용하는 것과 같은 인증된 transport를 재사용합니다.
+PTZ 요청은 새 연결이 아니라 기존 연결 위의 또 다른 SOAP body일 뿐입니다.
+
+`PtzSession`은 `continuous_move`, `absolute_move`, `relative_move`,
+`stop`, `get_status`와 `close`를 제공합니다. 각 move 메서드는 카메라의 PTZ
+node가 해당 space를 광고하지 않았다면 요청을 보내기 전에 예외를
+발생시킵니다. 예를 들어 `continuous_zoom=False`를 보고한 node에서
+`continuous_move(zoom=...)`을 호출하면 예외가 발생합니다. Pan/tilt 값과
+대부분의 zoom 값은 `-1.0`~`1.0`이며, 절대 zoom *위치*만 `0.0`~`1.0`입니다.
+`close()`는 세션을 닫힌 상태로 표시하기 전에 pan/tilt와 zoom 모두에 대해
+best-effort로 `stop()`을 호출하므로, 호출자가 종료 시점에 movement 정지를
+따로 챙기지 않아도 됩니다.
+
+비밀번호는 소스 코드에 넣지 말고 `ONVIF_PASSWORD`로 전달하십시오.
+
+```python
+import os
+
+from rtsp_backchannel import PtzSessionOptions, PtzVector, open_ptz_session
+
+password = os.environ["ONVIF_PASSWORD"]
+
+session = open_ptz_session(
+    PtzSessionOptions(
+        host="camera.local",
+        user="operator",
+        password=password,
+        device_urls=["http://camera.local/onvif/device_service"],
+        timeout=8.0,
+    )
+)
+
+try:
+    session.continuous_move(pan_tilt=PtzVector(0.5, 0.0), timeout_ms=2000.0)
+    status = session.get_status()
+    print(status.pan_tilt, status.zoom)
+finally:
+    session.close()
+```
+
+**실험적 기능입니다.** 검증됨: 세션 열기, 기능 지원 확인(guard), 요청 구성,
+timeout 포함, close 시 stop 호출. 미검증: 카메라가 의도한 대로 실제로
+움직이는지 여부 — 실제 PTZ 하드웨어가 없어 확인하지 못했습니다.
+
 ### `play_file`
 
 ```python

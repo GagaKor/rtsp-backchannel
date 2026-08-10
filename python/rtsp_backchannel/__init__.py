@@ -22,6 +22,13 @@ from .onvif import (
     get_stream_uris,
 )
 from .playback import PlaybackResult, play_file
+from .ptz import (
+    PtzSession,
+    PtzSessionOptions,
+    PtzStatus,
+    PtzVector,
+    open_ptz_session,
+)
 
 __all__ = [
     "CameraCapabilityProfile",
@@ -36,10 +43,15 @@ __all__ = [
     "PtzCapabilityReport",
     "PtzNode",
     "PtzServiceCapabilities",
+    "PtzSession",
+    "PtzSessionOptions",
     "PtzSpaces",
+    "PtzStatus",
+    "PtzVector",
     "StreamUri",
     "discover_devices",
     "get_camera_capabilities",
     "get_stream_uris",
+    "open_ptz_session",
     "play_file",
 ]
