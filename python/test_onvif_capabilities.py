@@ -209,7 +209,7 @@ class FakeCapabilityDevice:
         self.connect_count += 1
         return DeviceInfo(manufacturer="Fixture Camera", model="C1")
 
-    def read_only_call(self, body, endpoint=None):
+    def service_call(self, body, endpoint=None):
         self.calls.append((body, endpoint))
         return self.responder(body, endpoint)
 
@@ -1231,8 +1231,8 @@ class OnvifCapabilityTransportTests(unittest.TestCase):
         )
 
         info = device.connect()
-        selected = device.read_only_call(GET_SCOPES)
-        auth_fault = device.read_only_call(
+        selected = device.service_call(GET_SCOPES)
+        auth_fault = device.service_call(
             GET_SCOPES, f"http://127.0.0.1:{port}/auth-fault"
         )
 
@@ -1439,7 +1439,7 @@ class OnvifCapabilityTransportTests(unittest.TestCase):
             messages = []
             for endpoint in endpoints:
                 with self.assertRaises(RuntimeError) as caught:
-                    device.read_only_call(GET_SCOPES, endpoint)
+                    device.service_call(GET_SCOPES, endpoint)
                 messages.append(str(caught.exception))
 
         self.assertEqual(messages, ["invalid ONVIF service URL"] * len(endpoints))
@@ -1460,7 +1460,7 @@ class OnvifCapabilityTransportTests(unittest.TestCase):
             with self.assertRaisesRegex(
                 RuntimeError, "^invalid ONVIF service URL$"
             ):
-                device.read_only_call(GET_SCOPES, endpoint)
+                device.service_call(GET_SCOPES, endpoint)
 
         self.assertEqual(wsse.call_count, 0)
         self.assertEqual(_OnvifFixtureHandler.requests, [])
@@ -1523,7 +1523,7 @@ class OnvifCapabilityTransportTests(unittest.TestCase):
                 with self.subTest(kind="allowed", endpoint=endpoint):
                     device = OnvifDevice("camera", "admin", "password")
                     device.device_url = device_url
-                    device.read_only_call(GET_SCOPES, endpoint)
+                    device.service_call(GET_SCOPES, endpoint)
             allowed_calls = request.call_count
             allowed_wsse = wsse.call_count
             for device_url, endpoint in rejected:
@@ -1533,7 +1533,7 @@ class OnvifCapabilityTransportTests(unittest.TestCase):
                     with self.assertRaisesRegex(
                         RuntimeError, "^invalid ONVIF service URL$"
                     ):
-                        device.read_only_call(GET_SCOPES, endpoint)
+                        device.service_call(GET_SCOPES, endpoint)
 
         self.assertEqual(allowed_calls, len(allowed))
         self.assertEqual(allowed_wsse, len(allowed))

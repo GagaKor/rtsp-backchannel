@@ -15,6 +15,7 @@ from .onvif import (
     _SoapResponse,
     _safe_xml_fromstring,
 )
+from .ptz_types import PtzNode, PtzServiceCapabilities, PtzSpaces
 
 
 _SOAP11_NS = "http://schemas.xmlsoap.org/soap/envelope/"
@@ -109,35 +110,6 @@ class CameraCapabilityProfile:
     name: str | None = None
     ptz_configuration_token: str | None = None
     ptz_node_token: str | None = None
-
-
-@dataclass(frozen=True)
-class PtzSpaces:
-    absolute_pan_tilt: bool = False
-    absolute_zoom: bool = False
-    relative_pan_tilt: bool = False
-    relative_zoom: bool = False
-    continuous_pan_tilt: bool = False
-    continuous_zoom: bool = False
-
-
-@dataclass(frozen=True)
-class PtzNode:
-    token: str
-    spaces: PtzSpaces
-    name: str | None = None
-    maximum_presets: int | None = None
-    home_supported: bool | None = None
-    auxiliary_commands: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
-class PtzServiceCapabilities:
-    e_flip: bool | None = None
-    reverse: bool | None = None
-    get_compatible_configurations: bool | None = None
-    move_status: bool | None = None
-    status_position: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -821,7 +793,7 @@ def get_camera_capabilities(
 
     def call(body: str, parser, endpoint: str | None = None):
         return _parse_read_only_response(
-            device_client.read_only_call(body, endpoint), parser
+            device_client.service_call(body, endpoint), parser
         )
 
     scopes: tuple[str, ...] = ()
