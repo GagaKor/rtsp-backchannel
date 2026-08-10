@@ -37,7 +37,8 @@ async function withAuthChallenge(
   const challengeServer = net.createServer((socket) => {
     let input = Buffer.alloc(0);
     socket.on('data', (chunk) => {
-      input = Buffer.concat([input, chunk]);
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      input = Buffer.concat([input, buffer]);
       while (true) {
         const end = input.indexOf('\r\n\r\n');
         if (end < 0) return;
@@ -89,7 +90,8 @@ async function withRtspResponder(
   const responseServer = net.createServer((socket) => {
     let input = Buffer.alloc(0);
     socket.on('data', (chunk) => {
-      input = Buffer.concat([input, chunk]);
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      input = Buffer.concat([input, buffer]);
       while (true) {
         const end = input.indexOf('\r\n\r\n');
         if (end < 0) return;
@@ -132,7 +134,8 @@ before(async () => {
   server = net.createServer((socket) => {
     let input = Buffer.alloc(0);
     socket.on('data', (chunk) => {
-      input = Buffer.concat([input, chunk]);
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      input = Buffer.concat([input, buffer]);
       while (true) {
         const end = input.indexOf('\r\n\r\n');
         if (end < 0) return;
@@ -217,7 +220,8 @@ test('adds RTSP Digest authorization only after a 401 challenge', async () => {
   const challengeServer = net.createServer((socket) => {
     let input = Buffer.alloc(0);
     socket.on('data', (chunk) => {
-      input = Buffer.concat([input, chunk]);
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      input = Buffer.concat([input, buffer]);
       while (true) {
         const end = input.indexOf('\r\n\r\n');
         if (end < 0) return;
@@ -324,7 +328,8 @@ test('increments Digest nonce count and resets it for a new nonce', async () => 
   const nonceServer = net.createServer((socket) => {
     let input = Buffer.alloc(0);
     socket.on('data', (chunk) => {
-      input = Buffer.concat([input, chunk]);
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      input = Buffer.concat([input, buffer]);
       while (true) {
         const end = input.indexOf('\r\n\r\n');
         if (end < 0) return;
@@ -507,7 +512,8 @@ test('serializes concurrent RTSP requests so each caller owns its response', asy
   const delayedServer = net.createServer((socket) => {
     let input = Buffer.alloc(0);
     socket.on('data', (chunk) => {
-      input = Buffer.concat([input, chunk]);
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      input = Buffer.concat([input, buffer]);
       while (true) {
         const end = input.indexOf('\r\n\r\n');
         if (end < 0) return;

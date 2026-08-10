@@ -108,7 +108,8 @@ export class RtspClient {
         sock.setTimeout(0);
         this.socket = sock;
         sock.on('data', (chunk) => {
-          if (chunk.length > MAX_RTSP_BUFFER_BYTES - this.rxBuf.length) {
+          const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          if (buffer.length > MAX_RTSP_BUFFER_BYTES - this.rxBuf.length) {
             const error = new Error(
               `RTSP receive buffer exceeds ${MAX_RTSP_BUFFER_BYTES} bytes`,
             );
@@ -119,7 +120,7 @@ export class RtspClient {
             }
             return;
           }
-          this.rxBuf = Buffer.concat([this.rxBuf, chunk]);
+          this.rxBuf = Buffer.concat([this.rxBuf, buffer]);
           if (this.rxWaiter) this.rxWaiter.wake();
           else this.discardInterleavedFrames();
         });
