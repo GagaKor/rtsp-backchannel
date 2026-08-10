@@ -19,7 +19,6 @@ import math
 import re
 from dataclasses import dataclass
 from xml.etree import ElementTree
-from xml.sax.saxutils import escape
 
 from .onvif import OnvifDevice, _safe_xml_fromstring
 from .ptz_types import PtzNode, PtzSpaces
@@ -63,6 +62,25 @@ _MEDIA1_GET_PROFILES = f'<GetProfiles xmlns="{_MEDIA1_NS}"/>'
 _MEDIA2_GET_PROFILES = (
     f'<GetProfiles xmlns="{_MEDIA2_NS}"><Type>All</Type></GetProfiles>'
 )
+
+
+def _encode_xml(value: str) -> str:
+    """Escape text for use inside an XML element.
+
+    Matches the TypeScript reference's ``encodeXml`` (src/onvif/deviceClient.ts)
+    byte for byte: unlike ``xml.sax.saxutils.escape`` (which only encodes
+    ``&``, ``<``, ``>``), this also encodes ``"`` and ``'`` so a profile
+    token carrying either character produces identical request bytes across
+    languages. Defined locally rather than in onvif.py: onvif.py's own
+    ``escape()`` calls are out of scope for this task.
+    """
+    return (
+        value.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&apos;")
+    )
 
 
 @dataclass(frozen=True)
@@ -514,7 +532,7 @@ class PtzSession:
             raise RuntimeError("PTZ session is closed")
 
     def _profile_token_xml(self) -> str:
-        return escape(self._profile_token)
+        return _encode_xml(self._profile_token)
 
     def _call(
         self, body: str, response_name: str, operation: str

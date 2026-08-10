@@ -514,6 +514,29 @@ class PtzRequestBodyTests(unittest.TestCase):
             "</Velocity><Timeout>PT1.000S</Timeout></ContinuousMove>",
         )
 
+    def test_continuous_move_sends_an_explicit_per_call_timeout_in_the_body(self):
+        # The Timeout element is the runaway guard: it must reach the wire as
+        # the value the caller actually asked for, not a hardcoded default.
+        # Every other test in this suite uses the 1000ms default, so without
+        # this test PT1.000S could be hardcoded and nothing would notice.
+        calls: list = []
+        session = open_session(FakePtzDevice(calls, {"continuous_zoom": True}))
+        session.continuous_move(zoom=0.5, timeout_ms=1500)
+
+        body = calls[-1][0]
+        self.assertIn("<Timeout>PT1.500S</Timeout>", body)
+
+    def test_continuous_move_uses_the_session_level_default_timeout_in_the_body(self):
+        calls: list = []
+        session = open_session(
+            FakePtzDevice(calls, {"continuous_zoom": True}),
+            default_move_timeout_ms=250,
+        )
+        session.continuous_move(zoom=0.5)
+
+        body = calls[-1][0]
+        self.assertIn("<Timeout>PT0.250S</Timeout>", body)
+
     def test_builds_an_absolute_move_body_with_position_speed_and_no_timeout(self):
         calls: list = []
         session = open_session(
@@ -570,6 +593,21 @@ class PtzRequestBodyTests(unittest.TestCase):
         self.assertEqual(
             calls[-1][0],
             f'<GetStatus xmlns="{PTZ_NS}"><ProfileToken>main</ProfileToken></GetStatus>',
+        )
+
+    def test_escapes_a_profile_token_containing_quotes_and_apostrophes(self):
+        # xml.sax.saxutils.escape() only encodes &, <, > — it would leave the
+        # quote and apostrophe below untouched, diverging from the
+        # TypeScript reference's encodeXml() and breaking byte-for-byte
+        # parity across languages for any token containing either character.
+        calls: list = []
+        session = open_session(FakePtzDevice(calls), profile_token="a\"b'c")
+        session.get_status()
+
+        self.assertEqual(
+            calls[-1][0],
+            f'<GetStatus xmlns="{PTZ_NS}">'
+            "<ProfileToken>a&quot;b&apos;c</ProfileToken></GetStatus>",
         )
 
 
