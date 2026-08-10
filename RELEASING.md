@@ -8,10 +8,21 @@ must never be bundled in these artifacts.
 
 1. Update the version in `package.json`, `package-lock.json`,
    `python/pyproject.toml`, `rust/Cargo.toml`, and `rust/Cargo.lock`.
-2. Move the pending entries in `CHANGELOG.md` to a dated release section.
-3. Merge the version change to `master` and work from a clean checkout of that
+   `npm version <new> --no-git-tag-version` covers the first two, and
+   `cargo update --manifest-path rust/Cargo.toml --package rtsp-backchannel
+   --precise <new>` refreshes the Cargo lock after the manifest edit.
+2. Update the version references that live outside the manifests, or the test
+   suite will fail: the install pins in all six READMEs
+   (`rtsp-backchannel@^X.Y` for npm, `'rtsp-backchannel>=X.Y,<X.Z'` for pip,
+   `rtsp-backchannel = "X.Y"` for Cargo), the release-series sentence in
+   `README.ko.md`, and the asserted version in
+   `python/test_library_api.py::test_declares_installable_wheel_metadata`.
+   `git grep` for the outgoing version to catch any others.
+3. Move the pending entries in `CHANGELOG.md` to a dated release section and
+   update the link references at the bottom of the file.
+4. Merge the version change to `master` and work from a clean checkout of that
    commit.
-4. Confirm that `npm whoami`, PyPI authentication, and a crates.io API token
+5. Confirm that `npm whoami`, PyPI authentication, and a crates.io API token
    are available before creating the tag.
 
 ## 2. Verify source and artifacts

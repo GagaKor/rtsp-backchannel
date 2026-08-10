@@ -636,7 +636,7 @@ class LibraryApiTests(unittest.TestCase):
         )
 
         self.assertEqual(metadata["project"]["name"], "rtsp-backchannel")
-        self.assertEqual(metadata["project"]["version"], "0.2.0")
+        self.assertEqual(metadata["project"]["version"], "0.3.0")
         self.assertEqual(metadata["project"]["requires-python"], ">=3.11")
         self.assertEqual(metadata["project"]["license"], "MIT OR Apache-2.0")
         self.assertEqual(metadata["project"]["readme"], "README.md")
