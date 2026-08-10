@@ -16,6 +16,15 @@ pub use capabilities::{
     get_camera_capabilities,
 };
 
+// PtzNode, PtzServiceCapabilities, and PtzSpaces live here so neither
+// capabilities.rs nor ptz.rs has to import the other.
+mod ptz_types;
+
+// `pub` only so the module is reachable and its API isn't flagged as dead
+// code; wiring it into a `pub use` alongside capabilities' exports (README,
+// CLI) is Task 7's job.
+pub mod ptz;
+
 const DEVICE_NS: &str = "http://www.onvif.org/ver10/device/wsdl";
 const MEDIA_NS: &str = "http://www.onvif.org/ver10/media/wsdl";
 const SCHEMA_NS: &str = "http://www.onvif.org/ver10/schema";
