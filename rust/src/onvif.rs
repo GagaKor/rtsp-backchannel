@@ -20,10 +20,8 @@ pub use capabilities::{
 // capabilities.rs nor ptz.rs has to import the other.
 mod ptz_types;
 
-// `pub` only so the module is reachable and its API isn't flagged as dead
-// code; wiring it into a `pub use` alongside capabilities' exports (README,
-// CLI) is Task 7's job.
 pub mod ptz;
+pub use ptz::{PtzSession, PtzSessionOptions, PtzStatus, PtzVector, open_ptz_session};
 
 const DEVICE_NS: &str = "http://www.onvif.org/ver10/device/wsdl";
 const MEDIA_NS: &str = "http://www.onvif.org/ver10/media/wsdl";

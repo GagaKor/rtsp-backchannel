@@ -884,12 +884,12 @@ impl PtzSession {
     }
 }
 
-/// Open a PTZ control session: connect -> GetServices -> GetNodes -> resolve
-/// the profile token.
+/// Open a PTZ control session.
 ///
-/// # Experimental
-///
-/// See [`PtzSession`].
+/// **Experimental.** Physical movement is unverified against real PTZ
+/// hardware. Request construction, capability guarding, the device-side move
+/// timeout, and stop-on-close are covered by tests; that a camera actually
+/// moves as intended is not.
 pub fn open_ptz_session(options: &PtzSessionOptions) -> Result<PtzSession, String> {
     let device_urls = if options.device_urls.is_empty() {
         vec![

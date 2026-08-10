@@ -1,6 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use rtsp_backchannel::audio::{CodecPreference, G711Variant};
+use rtsp_backchannel::onvif::{
+    PtzSession, PtzSessionOptions, PtzStatus, PtzVector, open_ptz_session,
+};
 use rtsp_backchannel::playback::{PlaybackConfig, PlaybackResult, play_file, play_file_with_codec};
 
 #[test]
@@ -19,6 +22,23 @@ fn exposes_one_shot_file_playback_as_a_library_api() {
 
     assert_eq!(config.host, "camera.local");
     assert_eq!(config.volume, 0.05);
+}
+
+#[test]
+fn exposes_the_complete_ptz_session_contract_as_a_library_api() {
+    let _open: fn(&PtzSessionOptions) -> Result<PtzSession, String> = open_ptz_session;
+    let options = PtzSessionOptions::new("camera.local", "operator", "example-only");
+    let vector = PtzVector { x: 0.5, y: -0.5 };
+    let status = PtzStatus {
+        pan_tilt: Some(vector),
+        zoom: Some(0.25),
+        pan_tilt_move_status: Some("MOVING".to_owned()),
+        zoom_move_status: Some("IDLE".to_owned()),
+        utc_time: Some("2026-08-10T00:00:00Z".to_owned()),
+    };
+
+    assert_eq!(options.host, "camera.local");
+    assert_eq!(status.pan_tilt, Some(vector));
 }
 
 #[test]
