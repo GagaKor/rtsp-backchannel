@@ -625,10 +625,10 @@ test('keeps the three-call connect sequence and exposes selected and explicit re
       `<GetCapabilities xmlns="http://www.onvif.org/ver10/device/wsdl"><Category>Media</Category></GetCapabilities>`,
     ]);
 
-    const selected = await device.readOnlyCall(
+    const selected = await device.serviceCall(
       `<GetScopes xmlns="http://www.onvif.org/ver10/device/wsdl"/>`,
     );
-    const authFault = await device.readOnlyCall(
+    const authFault = await device.serviceCall(
       `<GetScopes xmlns="http://www.onvif.org/ver10/device/wsdl"/>`,
       `http://127.0.0.1:${address.port}/auth-fault`,
     );
@@ -770,7 +770,7 @@ test('binds explicit authenticated calls by scheme and canonical host while allo
     await client.connect();
 
     await assert.rejects(
-      client.readOnlyCall(
+      client.serviceCall(
         '<GetScopes xmlns="http://www.onvif.org/ver10/device/wsdl"/>',
         `http://localhost:${peerAddress.port}/attacker`,
       ),
@@ -780,7 +780,7 @@ test('binds explicit authenticated calls by scheme and canonical host while allo
     assert.equal(peerConnections, 0);
 
     await assert.rejects(
-      client.readOnlyCall(
+      client.serviceCall(
         '<GetScopes xmlns="http://www.onvif.org/ver10/device/wsdl"/>',
         `https://127.0.0.1:${peerAddress.port}/wrong-scheme`,
       ),
@@ -788,7 +788,7 @@ test('binds explicit authenticated calls by scheme and canonical host while allo
     );
     assert.equal(peerConnections, 0);
 
-    const allowed = await client.readOnlyCall(
+    const allowed = await client.serviceCall(
       '<GetScopes xmlns="http://www.onvif.org/ver10/device/wsdl"/>',
       `http://127.0.0.1:${peerAddress.port}/different/path`,
     );

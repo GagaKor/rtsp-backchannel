@@ -4,6 +4,8 @@ import {
   type OnvifOptions,
   type OnvifRawResponse,
 } from './deviceClient.ts';
+export type { PtzNode, PtzServiceCapabilities, PtzSpaces } from './ptzTypes.ts';
+import type { PtzNode, PtzServiceCapabilities, PtzSpaces } from './ptzTypes.ts';
 import {
   attribute,
   childElements,
@@ -46,32 +48,6 @@ export interface CameraCapabilityProfile {
   hasAudioSource: boolean;
   ptzConfigurationToken?: string;
   ptzNodeToken?: string;
-}
-
-export interface PtzServiceCapabilities {
-  eFlip?: boolean;
-  reverse?: boolean;
-  getCompatibleConfigurations?: boolean;
-  moveStatus?: boolean;
-  statusPosition?: boolean;
-}
-
-export interface PtzSpaces {
-  absolutePanTilt: boolean;
-  absoluteZoom: boolean;
-  relativePanTilt: boolean;
-  relativeZoom: boolean;
-  continuousPanTilt: boolean;
-  continuousZoom: boolean;
-}
-
-export interface PtzNode {
-  token: string;
-  name?: string;
-  spaces: PtzSpaces;
-  maximumPresets?: number;
-  homeSupported?: boolean;
-  auxiliaryCommands: string[];
 }
 
 export interface CameraCapabilityWarning {
@@ -599,7 +575,7 @@ export function parseMedia2OptionsResponse(xml: string): string[] {
 export interface CameraCapabilityDevice {
   connect(): Promise<DeviceInfo>;
   connectedMediaUrl(): string;
-  readOnlyCall(body: string, endpoint?: string): Promise<OnvifRawResponse>;
+  serviceCall(body: string, endpoint?: string): Promise<OnvifRawResponse>;
 }
 
 /** @internal */
@@ -632,7 +608,7 @@ const MEDIA2_GET_OPTIONS = `<GetVideoEncoderConfigurationOptions xmlns="${MEDIA2
 const PTZ_GET_CAPABILITIES = `<GetServiceCapabilities xmlns="${PTZ_NS}"/>`;
 const PTZ_GET_NODES = `<GetNodes xmlns="${PTZ_NS}"/>`;
 
-function parseReadOnlyResponse<T>(
+function parseServiceResponse<T>(
   response: OnvifRawResponse,
   parser: (xml: string) => T,
 ): T {
@@ -715,8 +691,8 @@ export async function getCameraCapabilitiesWithDependencies(
     body: string,
     parser: (xml: string) => T,
     endpoint?: string,
-  ): Promise<T> => parseReadOnlyResponse(
-    await deviceClient.readOnlyCall(body, endpoint),
+  ): Promise<T> => parseServiceResponse(
+    await deviceClient.serviceCall(body, endpoint),
     parser,
   );
 

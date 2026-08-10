@@ -624,7 +624,7 @@ function fakeCapabilityDependencies(
     createDevice: () => ({
       connect: options.connect ?? (async () => ({ manufacturer: 'Fixture Camera', model: 'C1' })),
       connectedMediaUrl: () => options.mediaUrl ?? 'http://camera/connected-media',
-      readOnlyCall: async (body, endpoint) => {
+      serviceCall: async (body, endpoint) => {
         calls.push({ body, ...(endpoint ? { endpoint } : {}) });
         return respond(body, endpoint);
       },

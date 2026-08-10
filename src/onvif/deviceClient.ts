@@ -442,7 +442,7 @@ export class OnvifDevice {
   }
 
   /** @internal */
-  readOnlyCall(body: string, endpoint?: string): Promise<OnvifRawResponse> {
+  serviceCall(body: string, endpoint?: string): Promise<OnvifRawResponse> {
     const deviceUrl = this.requireDeviceUrl();
     return this.soapResponse(endpoint ?? deviceUrl, body, true);
   }
