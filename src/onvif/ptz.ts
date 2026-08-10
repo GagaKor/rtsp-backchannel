@@ -32,6 +32,7 @@ const SOAP_11_NS = 'http://schemas.xmlsoap.org/soap/envelope/';
 const DEV_NS = 'http://www.onvif.org/ver10/device/wsdl';
 const SCHEMA_NS = 'http://www.onvif.org/ver10/schema';
 const MEDIA1_NS = 'http://www.onvif.org/ver10/media/wsdl';
+const MEDIA2_NS = 'http://www.onvif.org/ver20/media/wsdl';
 const PTZ_NS = 'http://www.onvif.org/ver20/ptz/wsdl';
 
 const DEFAULT_MOVE_TIMEOUT_MS = 1000;
@@ -344,11 +345,23 @@ function findServiceXAddr(response: XmlElement, namespace: string): string | und
   return undefined;
 }
 
-function findDefaultProfileToken(response: XmlElement): string | undefined {
+function findMedia1ProfileToken(response: XmlElement): string | undefined {
   for (const profile of childElements(response, MEDIA1_NS, 'Profiles')) {
     const token = attribute(profile, '', 'token');
     const hasPtzConfiguration = Boolean(firstChild(profile, SCHEMA_NS, 'PTZConfiguration'));
     if (token && hasPtzConfiguration) return token;
+  }
+  return undefined;
+}
+
+// Mirrors capabilities.ts's parseProfile('media2'): PTZ binding lives at
+// Profiles/Configurations/PTZ, not directly on Profiles like Media1.
+function findMedia2ProfileToken(response: XmlElement): string | undefined {
+  for (const profile of childElements(response, MEDIA2_NS, 'Profiles')) {
+    const token = attribute(profile, '', 'token');
+    const configurations = firstChild(profile, MEDIA2_NS, 'Configurations');
+    const hasPtz = Boolean(configurations && firstChild(configurations, MEDIA2_NS, 'PTZ'));
+    if (token && hasPtz) return token;
   }
   return undefined;
 }
@@ -413,6 +426,8 @@ const defaultDependencies: PtzSessionDependencies = {
 const GET_SERVICES = `<GetServices xmlns="${DEV_NS}"/>`;
 const GET_NODES = `<GetNodes xmlns="${PTZ_NS}"/>`;
 const MEDIA1_GET_PROFILES = `<GetProfiles xmlns="${MEDIA1_NS}"/>`;
+// Same body capabilities.ts sends for Media2 GetProfiles — not a second dialect.
+const MEDIA2_GET_PROFILES = `<GetProfiles xmlns="${MEDIA2_NS}"><Type>All</Type></GetProfiles>`;
 
 class PtzSessionImpl implements PtzSession {
   private closed = false;
@@ -569,14 +584,33 @@ export async function openPtzSession(
 
   let profileToken = options.profileToken;
   if (profileToken === undefined) {
-    const profilesRaw = await device.serviceCall(MEDIA1_GET_PROFILES, device.connectedMediaUrl());
-    const profilesResponse = operationResponse(
-      profilesRaw.xml,
+    const media1Raw = await device.serviceCall(MEDIA1_GET_PROFILES, device.connectedMediaUrl());
+    const media1Response = operationResponse(
+      media1Raw.xml,
       MEDIA1_NS,
       'GetProfilesResponse',
       'Media1 GetProfiles',
     );
-    profileToken = findDefaultProfileToken(profilesResponse);
+    profileToken = findMedia1ProfileToken(media1Response);
+
+    // Media1 came up empty: fall back to Media2, the same second source
+    // capabilities.ts already draws PTZ-capable profiles from. Only costs a
+    // round trip when Media1 had no PTZ profile, and only when Media2 is
+    // advertised at all.
+    if (profileToken === undefined) {
+      const media2XAddr = findServiceXAddr(servicesResponse, MEDIA2_NS);
+      if (media2XAddr) {
+        const media2Raw = await device.serviceCall(MEDIA2_GET_PROFILES, media2XAddr);
+        const media2Response = operationResponse(
+          media2Raw.xml,
+          MEDIA2_NS,
+          'GetProfilesResponse',
+          'Media2 GetProfiles',
+        );
+        profileToken = findMedia2ProfileToken(media2Response);
+      }
+    }
+
     if (profileToken === undefined) throw new Error('no ONVIF PTZ profile');
   }
 

@@ -5,6 +5,7 @@ import {
   formatPtzDuration,
   formatPtzNumber,
   openPtzSession,
+  type PtzSession,
   type PtzSessionDependencies,
 } from './ptz.ts';
 import type { PtzSpaces } from './ptzTypes.ts';
@@ -13,11 +14,13 @@ const SOAP_NS = 'http://www.w3.org/2003/05/soap-envelope';
 const DEV_NS = 'http://www.onvif.org/ver10/device/wsdl';
 const SCHEMA_NS = 'http://www.onvif.org/ver10/schema';
 const MEDIA1_NS = 'http://www.onvif.org/ver10/media/wsdl';
+const MEDIA2_NS = 'http://www.onvif.org/ver20/media/wsdl';
 const PTZ_NS = 'http://www.onvif.org/ver20/ptz/wsdl';
 
 const GET_SERVICES = `<GetServices xmlns="${DEV_NS}"/>`;
 const GET_NODES = `<GetNodes xmlns="${PTZ_NS}"/>`;
 const MEDIA1_GET_PROFILES = `<GetProfiles xmlns="${MEDIA1_NS}"/>`;
+const MEDIA2_GET_PROFILES = `<GetProfiles xmlns="${MEDIA2_NS}"><Type>All</Type></GetProfiles>`;
 
 test('formats PTZ numbers as fixed six-decimal strings', () => {
   assert.equal(formatPtzNumber(0.5), '0.500000');
@@ -62,6 +65,9 @@ interface FakePtzOptions {
   omitPtzService?: boolean;
   nodesXml?: string;
   profilesXml?: string;
+  /** When set, GetServices also advertises a Media2 service at this XAddr. */
+  media2XAddr?: string;
+  media2ProfilesXml?: string;
   respond?: (
     body: string,
     endpoint?: string,
@@ -71,7 +77,8 @@ interface FakePtzOptions {
 function soap(body: string): string {
   return (
     `<s:Envelope xmlns:s="${SOAP_NS}" xmlns:tds="${DEV_NS}"`
-    + ` xmlns:tt="${SCHEMA_NS}" xmlns:trt="${MEDIA1_NS}" xmlns:tptz="${PTZ_NS}">`
+    + ` xmlns:tt="${SCHEMA_NS}" xmlns:trt="${MEDIA1_NS}" xmlns:tr2="${MEDIA2_NS}"`
+    + ` xmlns:tptz="${PTZ_NS}">`
     + `<s:Body>${body}</s:Body></s:Envelope>`
   );
 }
@@ -130,10 +137,15 @@ function fakePtzDependencies(
         const custom = options.respond?.(body, endpoint);
         if (custom) return custom;
         if (body === GET_SERVICES) {
-          return response(options.omitPtzService
-            ? '<tds:GetServicesResponse/>'
-            : `<tds:GetServicesResponse><tds:Service><tds:Namespace>${PTZ_NS}</tds:Namespace>`
-              + `<tds:XAddr>${ptzXAddr}</tds:XAddr></tds:Service></tds:GetServicesResponse>`);
+          const ptzService = options.omitPtzService
+            ? ''
+            : `<tds:Service><tds:Namespace>${PTZ_NS}</tds:Namespace>`
+              + `<tds:XAddr>${ptzXAddr}</tds:XAddr></tds:Service>`;
+          const media2Service = options.media2XAddr
+            ? `<tds:Service><tds:Namespace>${MEDIA2_NS}</tds:Namespace>`
+              + `<tds:XAddr>${options.media2XAddr}</tds:XAddr></tds:Service>`
+            : '';
+          return response(`<tds:GetServicesResponse>${ptzService}${media2Service}</tds:GetServicesResponse>`);
         }
         if (body === GET_NODES && endpoint === ptzXAddr) {
           return response(options.nodesXml ?? (
@@ -147,6 +159,10 @@ function fakePtzDependencies(
             `<trt:GetProfilesResponse><trt:Profiles token="${profileToken}">`
             + '<tt:PTZConfiguration token="ptz-config"/></trt:Profiles></trt:GetProfilesResponse>'
           ));
+        }
+        if (body === MEDIA2_GET_PROFILES && endpoint === options.media2XAddr) {
+          return response(options.media2ProfilesXml
+            ?? '<tr2:GetProfilesResponse/>');
         }
         return response(defaultOperationResponse(body));
       },
@@ -284,6 +300,59 @@ test('rejects unsupported continuous and relative zoom the same way as pan/tilt'
   assert.equal(calls.length, sentBefore);
 });
 
+test('rejects every unsupported guard in the table, each with zero additional requests', async () => {
+  const cases: Array<{
+    space: keyof PtzSpaces;
+    message: string;
+    invoke: (session: PtzSession) => Promise<void>;
+  }> = [
+    {
+      space: 'continuousPanTilt',
+      message: 'PTZ continuous pan/tilt is not supported',
+      invoke: (session) => session.continuousMove({ panTilt: { x: 0, y: 0 } }),
+    },
+    {
+      space: 'continuousZoom',
+      message: 'PTZ continuous zoom is not supported',
+      invoke: (session) => session.continuousMove({ zoom: 0.5 }),
+    },
+    {
+      space: 'absolutePanTilt',
+      message: 'PTZ absolute pan/tilt is not supported',
+      invoke: (session) => session.absoluteMove({ panTilt: { x: 0, y: 0 } }),
+    },
+    {
+      space: 'absoluteZoom',
+      message: 'PTZ absolute zoom is not supported',
+      invoke: (session) => session.absoluteMove({ zoom: 0.5 }),
+    },
+    {
+      space: 'relativePanTilt',
+      message: 'PTZ relative pan/tilt is not supported',
+      invoke: (session) => session.relativeMove({ panTilt: { x: 0, y: 0 } }),
+    },
+    {
+      space: 'relativeZoom',
+      message: 'PTZ relative zoom is not supported',
+      invoke: (session) => session.relativeMove({ zoom: 0.5 }),
+    },
+  ];
+
+  for (const { space, message, invoke } of cases) {
+    const calls: RecordedPtzCall[] = [];
+    const session = await openPtzSession(
+      { host: 'camera', user: 'operator', pass: 'secret' },
+      // Every space defaults to false; only the one under test is named, and
+      // it stays false, so this always exercises an unsupported guard.
+      fakePtzDependencies(calls, { [space]: false }),
+    );
+    const sentBefore = calls.length;
+
+    await assert.rejects(invoke(session), { message });
+    assert.equal(calls.length, sentBefore);
+  }
+});
+
 test('fails to open when no PTZ service is advertised', async () => {
   const calls: RecordedPtzCall[] = [];
   await assert.rejects(
@@ -333,6 +402,54 @@ test('fails to open when no media profile carries a PTZConfiguration', async () 
     ),
     { message: 'no ONVIF PTZ profile' },
   );
+});
+
+test('falls back to Media2 and resolves a PTZ-capable profile Media1 does not have', async () => {
+  const calls: RecordedPtzCall[] = [];
+  const session = await openPtzSession(
+    { host: 'camera' },
+    fakePtzDependencies(calls, {}, {
+      // Media1 has profiles, but none carries a PTZConfiguration.
+      profilesXml: '<trt:GetProfilesResponse><trt:Profiles token="media1-no-ptz"/></trt:GetProfilesResponse>',
+      media2XAddr: 'http://camera/media2',
+      media2ProfilesXml: '<tr2:GetProfilesResponse>'
+        + '<tr2:Profiles token="media2-no-ptz"><tr2:Configurations/></tr2:Profiles>'
+        + '<tr2:Profiles token="media2-has-ptz"><tr2:Configurations>'
+        + '<tr2:PTZ token="ptz-two"/></tr2:Configurations></tr2:Profiles>'
+        + '</tr2:GetProfilesResponse>',
+    }),
+  );
+
+  assert.equal(session.profileToken, 'media2-has-ptz');
+  assert.deepEqual(calls.map((call) => call.body), [
+    GET_SERVICES,
+    GET_NODES,
+    MEDIA1_GET_PROFILES,
+    MEDIA2_GET_PROFILES,
+  ]);
+});
+
+test('fails to open when both Media1 and Media2 have no PTZ-capable profile', async () => {
+  const calls: RecordedPtzCall[] = [];
+  await assert.rejects(
+    openPtzSession(
+      { host: 'camera' },
+      fakePtzDependencies(calls, {}, {
+        profilesXml: '<trt:GetProfilesResponse><trt:Profiles token="media1-no-ptz"/></trt:GetProfilesResponse>',
+        media2XAddr: 'http://camera/media2',
+        media2ProfilesXml: '<tr2:GetProfilesResponse>'
+          + '<tr2:Profiles token="media2-no-ptz"><tr2:Configurations/></tr2:Profiles>'
+          + '</tr2:GetProfilesResponse>',
+      }),
+    ),
+    { message: 'no ONVIF PTZ profile' },
+  );
+  assert.deepEqual(calls.map((call) => call.body), [
+    GET_SERVICES,
+    GET_NODES,
+    MEDIA1_GET_PROFILES,
+    MEDIA2_GET_PROFILES,
+  ]);
 });
 
 test('skips Media1 GetProfiles entirely when an explicit profileToken is given', async () => {
