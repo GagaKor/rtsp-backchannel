@@ -56,7 +56,7 @@ pub struct PtzVector {
     pub y: f64,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct PtzSessionOptions {
     pub host: String,
     pub user: String,
@@ -68,6 +68,27 @@ pub struct PtzSessionOptions {
     pub timeout: Duration,
     /// ContinuousMove `Timeout`, default 1000ms.
     pub default_move_timeout_ms: f64,
+}
+
+const REDACTED_PASSWORD_PLACEHOLDER: &str = "<redacted>";
+
+impl std::fmt::Debug for PtzSessionOptions {
+    // Hand-written so a caller's `dbg!`, log line, or error context can
+    // never print the plaintext camera password: this struct is what every
+    // caller constructs directly, so it is far more exposed than
+    // `PtzSession` (see that type's own hand-written `Debug`).
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PtzSessionOptions")
+            .field("host", &self.host)
+            .field("user", &self.user)
+            .field("password", &REDACTED_PASSWORD_PLACEHOLDER)
+            .field("profile_token", &self.profile_token)
+            .field("device_urls", &self.device_urls)
+            .field("timeout", &self.timeout)
+            .field("default_move_timeout_ms", &self.default_move_timeout_ms)
+            .finish()
+    }
 }
 
 impl PtzSessionOptions {
@@ -993,6 +1014,17 @@ mod tests {
                 "PTZ timeout must be finite and greater than 0"
             );
         }
+    }
+
+    #[test]
+    fn debug_formatting_of_ptz_session_options_redacts_the_password() {
+        let secret_password = "super-secret-camera-password";
+        let options = PtzSessionOptions::new("camera", "operator", secret_password);
+
+        let formatted = format!("{options:?}");
+
+        assert!(formatted.contains(REDACTED_PASSWORD_PLACEHOLDER));
+        assert!(!formatted.contains(secret_password));
     }
 
     // -----------------------------------------------------------------
