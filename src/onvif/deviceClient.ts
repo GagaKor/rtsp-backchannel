@@ -36,7 +36,8 @@ function decodeXml(value: string): string {
     .replace(/&apos;/g, "'");
 }
 
-function encodeXml(value: string): string {
+/** @internal */
+export function encodeXml(value: string): string {
   return value
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
