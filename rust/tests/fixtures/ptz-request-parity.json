@@ -1,0 +1,13 @@
+{
+  "profileToken": "MediaProfile00000",
+  "panTilt": { "x": 0.5, "y": -0.25 },
+  "zoom": 0.75,
+  "timeoutMs": 1000,
+  "requests": {
+    "continuousMove": "<ContinuousMove xmlns=\"http://www.onvif.org/ver20/ptz/wsdl\"><ProfileToken>MediaProfile00000</ProfileToken><Velocity><PanTilt xmlns=\"http://www.onvif.org/ver10/schema\" x=\"0.500000\" y=\"-0.250000\"/><Zoom xmlns=\"http://www.onvif.org/ver10/schema\" x=\"0.750000\"/></Velocity><Timeout>PT1.000S</Timeout></ContinuousMove>",
+    "absoluteMove": "<AbsoluteMove xmlns=\"http://www.onvif.org/ver20/ptz/wsdl\"><ProfileToken>MediaProfile00000</ProfileToken><Position><PanTilt xmlns=\"http://www.onvif.org/ver10/schema\" x=\"0.500000\" y=\"-0.250000\"/><Zoom xmlns=\"http://www.onvif.org/ver10/schema\" x=\"0.750000\"/></Position></AbsoluteMove>",
+    "relativeMove": "<RelativeMove xmlns=\"http://www.onvif.org/ver20/ptz/wsdl\"><ProfileToken>MediaProfile00000</ProfileToken><Translation><PanTilt xmlns=\"http://www.onvif.org/ver10/schema\" x=\"0.500000\" y=\"-0.250000\"/><Zoom xmlns=\"http://www.onvif.org/ver10/schema\" x=\"0.750000\"/></Translation></RelativeMove>",
+    "stop": "<Stop xmlns=\"http://www.onvif.org/ver20/ptz/wsdl\"><ProfileToken>MediaProfile00000</ProfileToken><PanTilt>true</PanTilt><Zoom>true</Zoom></Stop>",
+    "getStatus": "<GetStatus xmlns=\"http://www.onvif.org/ver20/ptz/wsdl\"><ProfileToken>MediaProfile00000</ProfileToken></GetStatus>"
+  }
+}

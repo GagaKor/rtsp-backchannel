@@ -4,6 +4,7 @@ import dataclasses
 import json
 import math
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -681,6 +682,57 @@ class PtzStatusParsingTests(unittest.TestCase):
         session = open_session(FakePtzDevice(calls, respond=respond))
         with self.assertRaisesRegex(ValueError, "^SOAP Fault: ActionNotSupported$"):
             session.get_status()
+
+
+class PtzRequestParityFixtureTests(unittest.TestCase):
+    def test_ptz_request_bodies_match_shared_cross_language_fixture(self):
+        fixture_path = (
+            Path(__file__).resolve().parents[1]
+            / "rust"
+            / "tests"
+            / "fixtures"
+            / "ptz-request-parity.json"
+        )
+        self.assertTrue(
+            fixture_path.is_file(),
+            "shared PTZ request parity fixture is missing",
+        )
+        fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+
+        calls: list = []
+        session = open_session(
+            FakePtzDevice(
+                calls,
+                {
+                    "absolute_pan_tilt": True,
+                    "absolute_zoom": True,
+                    "relative_pan_tilt": True,
+                    "relative_zoom": True,
+                    "continuous_pan_tilt": True,
+                    "continuous_zoom": True,
+                },
+                profile_token=fixture["profileToken"],
+            ),
+            profile_token=fixture["profileToken"],
+        )
+
+        pan_tilt = PtzVector(fixture["panTilt"]["x"], fixture["panTilt"]["y"])
+        zoom = fixture["zoom"]
+
+        session.continuous_move(pan_tilt=pan_tilt, zoom=zoom)
+        self.assertEqual(calls[-1][0], fixture["requests"]["continuousMove"])
+
+        session.absolute_move(pan_tilt=pan_tilt, zoom=zoom)
+        self.assertEqual(calls[-1][0], fixture["requests"]["absoluteMove"])
+
+        session.relative_move(pan_tilt=pan_tilt, zoom=zoom)
+        self.assertEqual(calls[-1][0], fixture["requests"]["relativeMove"])
+
+        session.stop()
+        self.assertEqual(calls[-1][0], fixture["requests"]["stop"])
+
+        session.get_status()
+        self.assertEqual(calls[-1][0], fixture["requests"]["getStatus"])
 
 
 if __name__ == "__main__":

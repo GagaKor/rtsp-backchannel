@@ -1788,6 +1788,75 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ptz_request_bodies_match_shared_cross_language_fixture() {
+        let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/ptz-request-parity.json");
+        assert!(
+            fixture_path.is_file(),
+            "shared PTZ request parity fixture is missing: {}",
+            fixture_path.display()
+        );
+        let raw_fixture = std::fs::read_to_string(&fixture_path).unwrap();
+        let fixture: serde_json::Value = serde_json::from_str(&raw_fixture).unwrap();
+
+        let profile_token = fixture["profileToken"].as_str().unwrap().to_owned();
+        let pan_tilt = PtzVector {
+            x: fixture["panTilt"]["x"].as_f64().unwrap(),
+            y: fixture["panTilt"]["y"].as_f64().unwrap(),
+        };
+        let zoom = fixture["zoom"].as_f64().unwrap();
+
+        let (server, session) = open(
+            FakeCameraConfig::default()
+                .with_profile_token(profile_token)
+                .with_spaces(PtzSpaces {
+                    absolute_pan_tilt: true,
+                    absolute_zoom: true,
+                    relative_pan_tilt: true,
+                    relative_zoom: true,
+                    continuous_pan_tilt: true,
+                    continuous_zoom: true,
+                }),
+        );
+
+        session
+            .continuous_move(Some(pan_tilt), Some(zoom), None)
+            .unwrap();
+        assert_eq!(
+            server.request_bodies().last().unwrap().as_str(),
+            fixture["requests"]["continuousMove"].as_str().unwrap()
+        );
+
+        session
+            .absolute_move(Some(pan_tilt), Some(zoom), None, None)
+            .unwrap();
+        assert_eq!(
+            server.request_bodies().last().unwrap().as_str(),
+            fixture["requests"]["absoluteMove"].as_str().unwrap()
+        );
+
+        session
+            .relative_move(Some(pan_tilt), Some(zoom), None, None)
+            .unwrap();
+        assert_eq!(
+            server.request_bodies().last().unwrap().as_str(),
+            fixture["requests"]["relativeMove"].as_str().unwrap()
+        );
+
+        session.stop(None, None).unwrap();
+        assert_eq!(
+            server.request_bodies().last().unwrap().as_str(),
+            fixture["requests"]["stop"].as_str().unwrap()
+        );
+
+        session.get_status().unwrap();
+        assert_eq!(
+            server.request_bodies().last().unwrap().as_str(),
+            fixture["requests"]["getStatus"].as_str().unwrap()
+        );
+    }
+
     // -----------------------------------------------------------------
     // GetStatus parsing
     // -----------------------------------------------------------------

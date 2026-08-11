@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { existsSync, readFileSync } from 'node:fs';
 import { test } from 'node:test';
 
 import {
@@ -617,4 +618,78 @@ test('exposes the cached PTZ node and resolved profile token on the session', as
   assert.equal(session.node.token, 'node-1');
   assert.equal(session.node.spaces.continuousPanTilt, true);
   assert.equal(session.node.spaces.absolutePanTilt, false);
+});
+
+test('continuousMove sends an explicit per-call timeout in the body', async () => {
+  // The Timeout element is the runaway guard: it must reach the wire as the
+  // value the caller actually asked for, not a hardcoded default. Every
+  // other test in this suite uses the 1000ms default, so without this test
+  // a hardcoded PT1.000S could pass the whole suite undetected.
+  const calls: RecordedPtzCall[] = [];
+  const session = await openPtzSession(
+    { host: 'camera', user: 'operator', pass: 'secret' },
+    fakePtzDependencies(calls, { continuousZoom: true }),
+  );
+  await session.continuousMove({ zoom: 0.5, timeoutMs: 1500 });
+
+  assert.match(calls.at(-1)!.body, /<Timeout>PT1\.500S<\/Timeout>/);
+});
+
+test('continuousMove uses the session-level default timeout in the body', async () => {
+  const calls: RecordedPtzCall[] = [];
+  const session = await openPtzSession(
+    { host: 'camera', user: 'operator', pass: 'secret', defaultMoveTimeoutMs: 250 },
+    fakePtzDependencies(calls, { continuousZoom: true }),
+  );
+  await session.continuousMove({ zoom: 0.5 });
+
+  assert.match(calls.at(-1)!.body, /<Timeout>PT0\.250S<\/Timeout>/);
+});
+
+test('PTZ request bodies match shared cross-language fixture', async () => {
+  const fixtureUrl = new URL('../../rust/tests/fixtures/ptz-request-parity.json', import.meta.url);
+  assert.equal(existsSync(fixtureUrl), true, 'shared PTZ request parity fixture is missing');
+
+  interface Fixture {
+    profileToken: string;
+    panTilt: { x: number; y: number };
+    zoom: number;
+    timeoutMs: number;
+    requests: {
+      continuousMove: string;
+      absoluteMove: string;
+      relativeMove: string;
+      stop: string;
+      getStatus: string;
+    };
+  }
+  const fixture = JSON.parse(readFileSync(fixtureUrl, 'utf8')) as Fixture;
+
+  const calls: RecordedPtzCall[] = [];
+  const session = await openPtzSession(
+    { host: 'camera', profileToken: fixture.profileToken },
+    fakePtzDependencies(calls, {
+      absolutePanTilt: true,
+      absoluteZoom: true,
+      relativePanTilt: true,
+      relativeZoom: true,
+      continuousPanTilt: true,
+      continuousZoom: true,
+    }, { profileToken: fixture.profileToken }),
+  );
+
+  await session.continuousMove({ panTilt: fixture.panTilt, zoom: fixture.zoom });
+  assert.equal(calls.at(-1)!.body, fixture.requests.continuousMove);
+
+  await session.absoluteMove({ panTilt: fixture.panTilt, zoom: fixture.zoom });
+  assert.equal(calls.at(-1)!.body, fixture.requests.absoluteMove);
+
+  await session.relativeMove({ panTilt: fixture.panTilt, zoom: fixture.zoom });
+  assert.equal(calls.at(-1)!.body, fixture.requests.relativeMove);
+
+  await session.stop();
+  assert.equal(calls.at(-1)!.body, fixture.requests.stop);
+
+  await session.getStatus();
+  assert.equal(calls.at(-1)!.body, fixture.requests.getStatus);
 });
