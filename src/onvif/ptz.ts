@@ -103,6 +103,18 @@ export interface PtzSession {
   relativeMove(move: PtzRelativeMoveOptions): Promise<void>;
   stop(options?: PtzStopOptions): Promise<void>;
   getStatus(): Promise<PtzStatus>;
+  /**
+   * Stop both axes, then mark the session closed either way.
+   *
+   * A failing Stop is swallowed — it must never replace an error the
+   * caller is already handling — but `close()` still becomes terminal:
+   * every later call, including `stop()`, throws `PTZ session is closed`.
+   * If that swallowed Stop failed mid-move (a network blip, say), this
+   * session offers no further way to halt the camera. The backstop is the
+   * camera itself: its move timeout (`defaultMoveTimeoutMs` / a move's own
+   * `timeoutMs`, both capped at 60000 ms) always elapses on its own, so the
+   * camera stops moving even though this session can no longer ask it to.
+   */
   close(): Promise<void>;
 }
 
@@ -567,18 +579,8 @@ class PtzSessionImpl implements PtzSession {
     return parseStatusResponse(response);
   }
 
-  /**
-   * Stop both axes, then mark the session closed either way.
-   *
-   * A failing Stop is swallowed — it must never replace an error the
-   * caller is already handling — but `close()` still becomes terminal:
-   * every later call, including `stop()`, throws `PTZ session is closed`.
-   * If that swallowed Stop failed mid-move (a network blip, say), this
-   * session offers no further way to halt the camera. The backstop is the
-   * camera itself: its move timeout (`defaultMoveTimeoutMs` / a move's own
-   * `timeoutMs`, both capped at 60000 ms) always elapses on its own, so the
-   * camera stops moving even though this session can no longer ask it to.
-   */
+  // See PtzSession.close's doc comment (the public interface this class
+  // implements) for what happens when the Stop below fails.
   async close(): Promise<void> {
     if (this.closed) return;
     try {
