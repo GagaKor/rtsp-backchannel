@@ -32,6 +32,12 @@ _MEDIA2_NS = "http://www.onvif.org/ver20/media/wsdl"
 _PTZ_NS = "http://www.onvif.org/ver20/ptz/wsdl"
 
 _DEFAULT_MOVE_TIMEOUT_MS = 1000.0
+# A caller-supplied move timeout above this is rejected outright: combined
+# with close()'s best-effort stop() (see PtzSession.close's docstring), an
+# unbounded timeout would let a single continuous_move keep a camera moving
+# for as long as the caller likes, with no ceiling on how long the
+# device-side stop-on-close backstop takes to kick in.
+_MAX_MOVE_TIMEOUT_MS = 60_000.0
 _PAN_TILT_RANGE = (-1.0, 1.0)
 # Every zoom quantity is -1..1 except an absolute zoom *position*, which is 0..1.
 _ZOOM_GENERIC_RANGE = (-1.0, 1.0)
@@ -56,6 +62,9 @@ _AUTH_FAULT_PATTERNS = (
     ),
 )
 
+# Plain form, unlike capabilities.py's IncludeCapability=true: this session
+# only needs the XAddr list, and capabilities would inflate the response
+# against the shared 1MB body cap for data this module discards.
 _GET_SERVICES = f'<GetServices xmlns="{_DEVICE_NS}"/>'
 _GET_NODES = f'<GetNodes xmlns="{_PTZ_NS}"/>'
 _MEDIA1_GET_PROFILES = f'<GetProfiles xmlns="{_MEDIA1_NS}"/>'
@@ -292,6 +301,8 @@ def format_ptz_number(value: float) -> str:
 def format_ptz_duration(milliseconds: float) -> str:
     if not math.isfinite(milliseconds) or milliseconds <= 0:
         raise ValueError("PTZ timeout must be finite and greater than 0")
+    if milliseconds > _MAX_MOVE_TIMEOUT_MS:
+        raise ValueError("PTZ timeout must not exceed 60000 ms")
     return f"PT{milliseconds / 1000:.3f}S"
 
 
@@ -652,6 +663,18 @@ class PtzSession:
         return _parse_status_response(response)
 
     def close(self) -> None:
+        """Stop both axes, then mark the session closed either way.
+
+        A failing stop() is swallowed - it must never replace an error the
+        caller is already handling - but close() still becomes terminal:
+        every later call, including stop(), raises "PTZ session is closed".
+        If that swallowed stop() failed mid-move (a network blip, say), this
+        session offers no further way to halt the camera. The backstop is
+        the camera itself: its move timeout (default_move_timeout_ms / a
+        move's own timeout_ms, both capped at 60000 ms) always elapses on
+        its own, so the camera stops moving even though this session can no
+        longer ask it to.
+        """
         if self._closed:
             return
         try:
@@ -732,6 +755,9 @@ def open_ptz_session(options: PtzSessionOptions) -> PtzSession:
         if profile_token is None:
             raise RuntimeError("no ONVIF PTZ profile")
 
+    # Bounded at open, not deferred to the first move: an unbounded default
+    # would otherwise pass silently until a caller's first continuous_move.
+    format_ptz_duration(options.default_move_timeout_ms)
     return PtzSession(
         device,
         ptz_xaddr,

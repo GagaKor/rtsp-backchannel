@@ -212,6 +212,15 @@ class FormatterTests(unittest.TestCase):
                 ):
                     format_ptz_duration(bad)
 
+    def test_rejects_a_ptz_duration_above_the_60000ms_ceiling_but_accepts_the_boundary(self):
+        self.assertEqual(format_ptz_duration(60_000), "PT60.000S")
+        for bad in (60_001, 600_000):
+            with self.subTest(value=bad):
+                with self.assertRaisesRegex(
+                    ValueError, "^PTZ timeout must not exceed 60000 ms$"
+                ):
+                    format_ptz_duration(bad)
+
 
 class PtzSessionLifecycleTests(unittest.TestCase):
     def test_fails_to_open_when_no_ptz_service_is_advertised(self):
@@ -537,6 +546,30 @@ class PtzRequestBodyTests(unittest.TestCase):
 
         body = calls[-1][0]
         self.assertIn("<Timeout>PT0.250S</Timeout>", body)
+
+    def test_rejects_a_default_move_timeout_ms_above_60000ms_at_session_open(self):
+        calls: list = []
+        with self.assertRaisesRegex(ValueError, "^PTZ timeout must not exceed 60000 ms$"):
+            open_session(
+                FakePtzDevice(calls, {"continuous_zoom": True}),
+                default_move_timeout_ms=600_000,
+            )
+        # Rejected at open, before any move: no ContinuousMove should have
+        # been sent, since the whole point is to fail even if the caller
+        # never calls continuous_move at all.
+        self.assertTrue(
+            all(not body.startswith("<ContinuousMove ") for body, _ in calls)
+        )
+
+    def test_rejects_a_per_call_continuous_move_timeout_ms_above_60000ms(self):
+        calls: list = []
+        session = open_session(FakePtzDevice(calls, {"continuous_zoom": True}))
+        sent_before = len(calls)
+
+        with self.assertRaisesRegex(ValueError, "^PTZ timeout must not exceed 60000 ms$"):
+            session.continuous_move(zoom=0.5, timeout_ms=600_000)
+
+        self.assertEqual(len(calls), sent_before)
 
     def test_builds_an_absolute_move_body_with_position_speed_and_no_timeout(self):
         calls: list = []
