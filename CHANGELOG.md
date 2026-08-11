@@ -7,12 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-
-- Automated version tags and GitHub Releases with native Rust CLI binaries for
-  Linux (x64 and ARM64), macOS (Apple Silicon and Intel), and Windows (x64),
-  plus live release and package-version badges in every README.
-
 ## [0.3.0] - 2026-08-11
 
 ### Added

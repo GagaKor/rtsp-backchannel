@@ -17,26 +17,37 @@ registry with OIDC trusted publishing — no tokens are stored in the
 repository or its secrets.
 
 Before publishing, the workflow verifies that all five versioned manifest and
-lock files agree. It then tags the commit and creates a GitHub Release when the
-version has no release yet, attaching single-file Rust CLI binaries for Linux
+lock files agree and that `CHANGELOG.md` has exactly one dated section for that
+version. It then tags the commit and creates a GitHub Release when the version
+has no complete release yet, attaching single-file Rust CLI binaries for Linux
 (x64 and ARM64), macOS (Apple Silicon and Intel), and Windows (x64). This runs
 independently of whether any package actually published, so it also backfills
 a release for a version that is already live on every registry but was never
-tagged. Tag and release state are checked separately: if a run pushes the tag
-but fails while creating the release, a retry rebuilds the assets and finishes
-the missing release. Once both exist, routine master pushes skip the binary
-builds. Tagging and releasing use the automatic `GITHUB_TOKEN`; no additional
-secret is involved.
+tagged. The tag is pushed before any registry job starts, so even a partial
+registry failure leaves a durable source SHA for every retry. Before those
+jobs begin, a private draft Release stores the same SHA in a hidden note
+marker. Tag, draft, and asset state are checked separately: a retry checks out
+that pinned commit and continues from the same source. Every registry and
+platform build uses the SHA, and the tag is checked again before publication.
+A draft, missing asset, or missing marker makes the workflow rebuild and
+replace the entire five-binary set while the Release is private; a marker that
+names a different SHA is a hard error requiring manual repair, never a reason
+to reinterpret already-published artifacts. The workflow also repairs the
+repository's `Latest` designation so the README release badge and
+`/releases/latest` links resolve to the current version. Once all five assets
+exist on the published release, routine master pushes skip the binary builds.
+Tagging and releasing use the automatic `GITHUB_TOKEN`; no additional secret
+is involved.
 
 To ship a release:
 
 1. Do step 1 below ("Prepare the release") to bump the versions and update
    the version references that live outside the manifests.
 2. Merge that change to `master`.
-3. The workflow runs automatically and publishes whichever packages changed
-   version, then tags the commit and creates the GitHub Release. Watch the
-   run in the Actions tab; each registry's publish job is skipped (not
-   failed) for a package whose version didn't change.
+3. The workflow runs automatically, pins the tag and provenance draft, then
+   publishes whichever packages changed version and completes the GitHub
+   Release. Watch the run in the Actions tab; each registry's publish job is
+   skipped (not failed) for a package whose version didn't change.
 
 You can also trigger a run manually from the Actions tab
 (`workflow_dispatch`) if you need to retry a publish without pushing a new
@@ -141,12 +152,57 @@ credentials and does not store a registry token as an Actions secret.
 
 ## 5. Create the GitHub release
 
+The automated workflow is strongly preferred because a compliant GitHub
+Release requires all five native binaries. If automation is unavailable,
+build on native hosts using the same target matrix from `release.yml`, collect
+the binaries under their exact release names, and extract the matching
+changelog section before creating the Release:
+
 ```bash
-gh release create v0.1.0 \
+VERSION=0.3.0
+TARGET=x86_64-unknown-linux-gnu # Select the native target for this host.
+SUFFIX=
+[ "$TARGET" = x86_64-pc-windows-msvc ] && SUFFIX=.exe
+RELEASE_COMMIT=$(git rev-parse HEAD)
+[ "$(git rev-list -n 1 "v${VERSION}")" = "$RELEASE_COMMIT" ]
+
+cargo +1.86.0 build --release --locked \
+  --manifest-path rust/Cargo.toml \
+  --target "$TARGET"
+
+mkdir -p release-dist
+cp "rust/target/${TARGET}/release/rtsp-backchannel${SUFFIX}" \
+  "release-dist/rtsp-backchannel-${VERSION}-${TARGET}${SUFFIX}"
+
+# Required asset names (the Windows binary keeps its .exe suffix):
+# rtsp-backchannel-${VERSION}-x86_64-unknown-linux-gnu
+# rtsp-backchannel-${VERSION}-aarch64-unknown-linux-gnu
+# rtsp-backchannel-${VERSION}-aarch64-apple-darwin
+# rtsp-backchannel-${VERSION}-x86_64-apple-darwin
+# rtsp-backchannel-${VERSION}-x86_64-pc-windows-msvc.exe
+
+awk -v ver="$VERSION" '
+  /^## \[/ {
+    if (in_section) exit
+    if (index($0, "## [" ver "] - ") == 1) in_section = 1
+  }
+  in_section { print }
+' CHANGELOG.md > release-notes.md
+test -s release-notes.md
+printf '\n<!-- rtsp-backchannel-release-commit: %s -->\n' \
+  "$RELEASE_COMMIT" >> release-notes.md
+
+gh release create "v${VERSION}" \
   --verify-tag \
-  --title 'rtsp-backchannel 0.1.0' \
-  --notes-from-tag
+  --title "rtsp-backchannel ${VERSION}" \
+  --notes-file release-notes.md \
+  release-dist/*
 ```
+
+Do not publish an assetless fallback Release. If all five native binaries are
+not available, leave only the pushed tag and run `workflow_dispatch` later;
+the automated workflow detects the tag without a complete Release and
+backfills the matching assets from that tag commit.
 
 Verify that all three registry pages show the expected version and metadata,
 then install each package in a clean consumer project and run its CLI help.
