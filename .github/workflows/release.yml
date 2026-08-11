@@ -133,16 +133,26 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v7
+
+      # Deliberately no `registry-url` here. Passing it makes setup-node write
+      # an .npmrc containing `//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}`
+      # and point NPM_CONFIG_USERCONFIG at it. With no NODE_AUTH_TOKEN set that
+      # resolves to an empty credential, and npm — seeing a token already
+      # configured — never attempts the OIDC exchange, so the publish is
+      # rejected with a bare `E404 PUT`. That is exactly how the 0.3.0 npm
+      # publish failed while PyPI and crates.io succeeded from this same job's
+      # `release` environment. npm defaults to the public registry anyway.
       - uses: actions/setup-node@v7
         with:
           node-version: 22
-          registry-url: https://registry.npmjs.org
           cache: npm
 
-      # npm's OIDC trusted publishing needs npm CLI >= 11.5.1; the npm
-      # bundled with the setup-node Node 22 build is older than that, so
-      # pin a CLI release new enough to negotiate it.
-      - run: npm install -g npm@11.5.1
+      # npm's OIDC trusted publishing needs npm CLI >= 11.5.1, newer than the
+      # npm bundled with Node 22. Track the latest release rather than pinning:
+      # the feature is young and pinning the first version that shipped it
+      # keeps us on the least-fixed one.
+      - run: npm install -g npm@latest
+      - run: npm --version
 
       - run: npm ci
       - run: npm test
