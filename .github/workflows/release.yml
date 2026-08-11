@@ -1,0 +1,211 @@
+name: Release
+
+# Publishes to npm, PyPI, and crates.io using OIDC trusted publishing.
+# There are no stored registry tokens: each publish job requests a
+# short-lived OIDC token from GitHub (permissions.id-token: write) and
+# exchanges it with the registry for a one-time credential.
+#
+# This must stay at .github/workflows/release.yml and the publish jobs
+# must run in the "release" GitHub Actions environment — both are the
+# exact values registered with each registry's Trusted Publisher config
+# for GagaKor/rtsp-backchannel. Renaming the file or the environment
+# breaks OIDC verification and publishing is rejected.
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Queue rather than cancel: a half-finished publish cannot be undone,
+  # so a newer run must never interrupt one already talking to a registry.
+  group: release-${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  # Reads the three manifest versions and compares each against what is
+  # currently live on its registry. A package only publishes when its
+  # manifest version differs from the published one, so routine merges
+  # (e.g. Dependabot bumps) that don't touch a version number publish
+  # nothing. A registry 404 (package never published) counts as "needs
+  # publishing", not as an error.
+  check-versions:
+    name: Check manifest vs. published versions
+    if: github.repository == 'GagaKor/rtsp-backchannel' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      npm-version: ${{ steps.gate.outputs.npm-version }}
+      npm-publish: ${{ steps.gate.outputs.npm-publish }}
+      pypi-version: ${{ steps.gate.outputs.pypi-version }}
+      pypi-publish: ${{ steps.gate.outputs.pypi-publish }}
+      crates-version: ${{ steps.gate.outputs.crates-version }}
+      crates-publish: ${{ steps.gate.outputs.crates-publish }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Compare manifest versions against published versions
+        id: gate
+        run: |
+          set -euo pipefail
+
+          npm_manifest=$(jq -r '.version' package.json)
+          pypi_manifest=$(grep -m1 '^version' python/pyproject.toml | sed -E 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')
+          crates_manifest=$(grep -m1 '^version' rust/Cargo.toml | sed -E 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')
+
+          echo "npm manifest version: $npm_manifest"
+          echo "pypi manifest version: $pypi_manifest"
+          echo "crates manifest version: $crates_manifest"
+
+          # Prints "<body>\n<http_status>" so the status can be split off
+          # without a second request.
+          fetch() {
+            local url="$1"; shift
+            curl -sS -w '\n%{http_code}' "$@" "$url"
+          }
+
+          npm_response=$(fetch "https://registry.npmjs.org/rtsp-backchannel")
+          npm_status="${npm_response##*$'\n'}"
+          npm_body="${npm_response%$'\n'*}"
+          if [ "$npm_status" = "404" ]; then
+            npm_published=""
+          elif [ "$npm_status" = "200" ]; then
+            npm_published=$(printf '%s' "$npm_body" | jq -r '.["dist-tags"].latest')
+          else
+            echo "npm registry query failed with HTTP $npm_status" >&2
+            exit 1
+          fi
+
+          pypi_response=$(fetch "https://pypi.org/pypi/rtsp-backchannel/json")
+          pypi_status="${pypi_response##*$'\n'}"
+          pypi_body="${pypi_response%$'\n'*}"
+          if [ "$pypi_status" = "404" ]; then
+            pypi_published=""
+          elif [ "$pypi_status" = "200" ]; then
+            pypi_published=$(printf '%s' "$pypi_body" | jq -r '.info.version')
+          else
+            echo "PyPI registry query failed with HTTP $pypi_status" >&2
+            exit 1
+          fi
+
+          # crates.io rejects requests with no User-Agent.
+          crates_response=$(fetch "https://crates.io/api/v1/crates/rtsp-backchannel" -A "rtsp-backchannel-release-workflow (https://github.com/GagaKor/rtsp-backchannel)")
+          crates_status="${crates_response##*$'\n'}"
+          crates_body="${crates_response%$'\n'*}"
+          if [ "$crates_status" = "404" ]; then
+            crates_published=""
+          elif [ "$crates_status" = "200" ]; then
+            crates_published=$(printf '%s' "$crates_body" | jq -r '.crate.max_version')
+          else
+            echo "crates.io registry query failed with HTTP $crates_status" >&2
+            exit 1
+          fi
+
+          echo "npm published version: ${npm_published:-<none>}"
+          echo "pypi published version: ${pypi_published:-<none>}"
+          echo "crates published version: ${crates_published:-<none>}"
+
+          if [ "$npm_manifest" != "$npm_published" ]; then npm_publish=true; else npm_publish=false; fi
+          if [ "$pypi_manifest" != "$pypi_published" ]; then pypi_publish=true; else pypi_publish=false; fi
+          if [ "$crates_manifest" != "$crates_published" ]; then crates_publish=true; else crates_publish=false; fi
+
+          {
+            echo "npm-version=$npm_manifest"
+            echo "npm-publish=$npm_publish"
+            echo "pypi-version=$pypi_manifest"
+            echo "pypi-publish=$pypi_publish"
+            echo "crates-version=$crates_manifest"
+            echo "crates-publish=$crates_publish"
+          } >> "$GITHUB_OUTPUT"
+
+  publish-npm:
+    name: Publish npm package
+    needs: check-versions
+    if: github.repository == 'GagaKor/rtsp-backchannel' && github.ref == 'refs/heads/master' && needs.check-versions.outputs.npm-publish == 'true'
+    runs-on: ubuntu-latest
+    environment: release
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          cache: npm
+
+      # npm's OIDC trusted publishing needs npm CLI >= 11.5.1; the npm
+      # bundled with the setup-node Node 22 build is older than that, so
+      # pin a CLI release new enough to negotiate it.
+      - run: npm install -g npm@11.5.1
+
+      - run: npm ci
+      - run: npm test
+      - run: npm run typecheck
+      - run: npm publish --access public
+
+  publish-pypi:
+    name: Publish PyPI package
+    needs: check-versions
+    if: github.repository == 'GagaKor/rtsp-backchannel' && github.ref == 'refs/heads/master' && needs.check-versions.outputs.pypi-publish == 'true'
+    runs-on: ubuntu-latest
+    environment: release
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: python/pyproject.toml
+      - run: PYTHONPATH=python:. python -m unittest discover -s python -p 'test_*.py'
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+          cache: pip
+          cache-dependency-path: python/pyproject.toml
+      - run: PYTHONPATH=python:. python -m unittest discover -s python -p 'test_*.py'
+
+      - run: python -m pip install --upgrade build twine
+      - run: python -m build --outdir "$RUNNER_TEMP/python-dist" python
+      - run: python -m twine check "$RUNNER_TEMP"/python-dist/*
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@v1.14.2
+        with:
+          packages-dir: ${{ runner.temp }}/python-dist
+
+  publish-crates:
+    name: Publish crates.io package
+    needs: check-versions
+    if: github.repository == 'GagaKor/rtsp-backchannel' && github.ref == 'refs/heads/master' && needs.check-versions.outputs.crates-publish == 'true'
+    runs-on: ubuntu-latest
+    environment: release
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.86.0 --profile minimal
+      - run: cargo +1.86.0 test --manifest-path rust/Cargo.toml --locked
+
+      - name: Authenticate with crates.io
+        id: crates-auth
+        uses: rust-lang/crates-io-auth-action@v1.0.5
+
+      - name: Publish to crates.io
+        run: cargo +1.86.0 publish --manifest-path rust/Cargo.toml --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-auth.outputs.token }}
