@@ -1,5 +1,7 @@
 # RTSP Backchannel for TypeScript
 
+[![rtsp-backchannel on npm](https://img.shields.io/npm/v/rtsp-backchannel?label=npm)](https://www.npmjs.com/package/rtsp-backchannel) [![rtsp-backchannel on PyPI](https://img.shields.io/pypi/v/rtsp-backchannel?label=PyPI)](https://pypi.org/project/rtsp-backchannel/) [![rtsp-backchannel on crates.io](https://img.shields.io/crates/v/rtsp-backchannel?label=crates.io)](https://crates.io/crates/rtsp-backchannel)
+
 [English](https://github.com/GagaKor/rtsp-backchannel/blob/master/README.md) |
 [한국어](https://github.com/GagaKor/rtsp-backchannel/blob/master/README.ko.md)
 
@@ -9,8 +11,8 @@ FFmpeg is required only for file playback; GStreamer is not used.
 
 Other implementations:
 
-- [Python](https://github.com/GagaKor/rtsp-backchannel/blob/master/python/README.md)
-- [Rust](https://github.com/GagaKor/rtsp-backchannel/blob/master/rust/README.md)
+- [Python](https://github.com/GagaKor/rtsp-backchannel/blob/master/python/README.md) — [PyPI](https://pypi.org/project/rtsp-backchannel/)
+- [Rust](https://github.com/GagaKor/rtsp-backchannel/blob/master/rust/README.md) — [crates.io](https://crates.io/crates/rtsp-backchannel)
 
 The package starts a backchannel session, sends the complete file at real-time
 speed, and closes the session. It calls a separately installed `ffmpeg`

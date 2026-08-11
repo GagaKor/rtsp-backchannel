@@ -1,5 +1,7 @@
 # RTSP Backchannel for Rust
 
+[![rtsp-backchannel on npm](https://img.shields.io/npm/v/rtsp-backchannel?label=npm)](https://www.npmjs.com/package/rtsp-backchannel) [![rtsp-backchannel on PyPI](https://img.shields.io/pypi/v/rtsp-backchannel?label=PyPI)](https://pypi.org/project/rtsp-backchannel/) [![rtsp-backchannel on crates.io](https://img.shields.io/crates/v/rtsp-backchannel?label=crates.io)](https://crates.io/crates/rtsp-backchannel)
+
 [English](https://github.com/GagaKor/rtsp-backchannel/blob/master/rust/README.md) |
 [한국어](https://github.com/GagaKor/rtsp-backchannel/blob/master/rust/README.ko.md)
 
@@ -10,8 +12,8 @@ GStreamer is not used.
 
 Other implementations:
 
-- [TypeScript](https://github.com/GagaKor/rtsp-backchannel/blob/master/README.md)
-- [Python](https://github.com/GagaKor/rtsp-backchannel/blob/master/python/README.md)
+- [TypeScript](https://github.com/GagaKor/rtsp-backchannel/blob/master/README.md) — [npm](https://www.npmjs.com/package/rtsp-backchannel)
+- [Python](https://github.com/GagaKor/rtsp-backchannel/blob/master/python/README.md) — [PyPI](https://pypi.org/project/rtsp-backchannel/)
 
 The crate starts a backchannel session, sends the complete file at real-time
 speed, and closes the session. It calls a separately installed `ffmpeg`
