@@ -125,6 +125,7 @@ console.log({ packetsSent });
 | `discoverDevices(options?)` | `timeoutMs?`, `interfaces?`, `cidrs?`, `ports?`, `concurrency?` | `Promise<DiscoveredDevice[]>` |
 | `getStreamUris(options)` | `host`, `user`, `pass`, `deviceUrls?`, `timeoutMs?` | `Promise<StreamUri[]>` |
 | `getCameraCapabilities(options)` | `host`, `user?`, `pass?`, `deviceUrls?`, `timeoutMs?` | `Promise<CameraCapabilityReport>` |
+| `openPtzSession(options)` | `host`, `user?`, `pass?`, `profileToken?`, `deviceUrls?`, `timeoutMs?`, `defaultMoveTimeoutMs?` | `Promise<PtzSession>` (실험적 기능) |
 | `playFile(options)` | `host`, `user`, `pass`, `file`, `volume`, `codec` | RTP 패킷 수 `Promise<number>` |
 
 `DiscoveredDevice`에는 `ip`, `xaddrs`, `scopes`와 선택적인 `name`, `hardware`,
@@ -364,6 +365,68 @@ option 보강은 유용한 근거이지만 Profile T 인증의 증명은 아닙�
 수행하므로 전체 소요 시간은 timeout 한 구간보다 길 수 있습니다. 선택적인 보강
 요청은 실패 시 warning을 추가하고 계속할 수 있지만 단일 요청의 timeout을 늘리지는
 않습니다.
+
+### PTZ 제어
+
+`openPtzSession`은 카메라 한 대에 대한 제어 세션을 엽니다. 먼저 연결한 뒤
+`GetServices`와 `GetNodes`를 실행해 PTZ 서비스와 그 node를 찾고, Media Profile
+token을 정합니다. `profileToken`을 직접 지정하지 않으면 PTZ를 지원하는 첫
+번째 profile을 사용합니다. 이어서 해당 node가 지원하는 PTZ space를 캐시해
+두어, 이후의 모든 호출을 카메라가 실제로 광고한 기능과 대조해 검사합니다.
+반환되는 `PtzSession`은 `getCameraCapabilities`와 `getStreamUris`가 사용하는
+것과 같은 인증된 transport를 재사용합니다. PTZ 요청은 새 연결이 아니라 기존
+연결 위의 또 다른 SOAP body일 뿐입니다.
+
+`PtzSession`은 `continuousMove`, `absoluteMove`, `relativeMove`, `stop`,
+`getStatus`와 `close`를 제공합니다. 각 move 메서드는 카메라의 PTZ node가 해당
+space를 광고하지 않았다면 요청을 보내기 전에 reject합니다. 예를 들어
+`continuousZoom: false`를 보고한 node에서 `continuousMove({ zoom: ... })`을
+호출하면 거부됩니다. Pan/tilt 값과 대부분의 zoom 값은 `-1.0`~`1.0`이며, 절대
+zoom *위치*만 `0.0`~`1.0`입니다. `close()`는 세션을 닫힌 상태로 표시하기 전에
+pan/tilt와 zoom 모두에 대해 best-effort로 `stop()`을 호출하므로, 호출자가
+종료 시점에 movement 정지를 따로 챙기지 않아도 됩니다.
+
+모든 `continuousMove` 호출에는 카메라로 전달되는 device-side timeout이
+포함되며, 기본값은 1000ms입니다. 카메라는 이 timeout이 지나면 스스로
+움직임을 멈추므로, 한 번의 호출로는 카메라가 약 1초 동안만 움직입니다.
+계속 움직이게 하려면 호출자가 이전 timeout이 끝나기 전에 `continuousMove`를
+다시 호출해야 합니다. 이 기본값은 `defaultMoveTimeoutMs`로 제어하며,
+호출마다 다른 값을 쓰려면 `timeoutMs`로 재정의할 수 있습니다. 이는 의도된
+안전장치입니다. 클라이언트가 멈추라고 지시하지 않아도 카메라가 스스로
+정지하므로, 클라이언트가 비정상 종료되거나 연결이 끊겨도 카메라가 계속
+움직이는 상태로 남지 않습니다.
+
+비밀번호는 소스 코드에 넣지 말고 `ONVIF_PASSWORD`로 전달하십시오.
+
+```typescript
+import {
+  openPtzSession,
+  type PtzSession,
+} from 'rtsp-backchannel';
+
+const password = process.env.ONVIF_PASSWORD;
+if (!password) throw new Error('ONVIF_PASSWORD is required');
+
+const session: PtzSession = await openPtzSession({
+  host: 'camera.local',
+  user: 'operator',
+  pass: password,
+  deviceUrls: ['http://camera.local/onvif/device_service'],
+  timeoutMs: 8000,
+});
+
+try {
+  await session.continuousMove({ panTilt: { x: 0.5, y: 0 }, timeoutMs: 2000 });
+  const status = await session.getStatus();
+  console.log(status.panTilt, status.zoom);
+} finally {
+  await session.close();
+}
+```
+
+**실험적 기능입니다.** 검증됨: 세션 열기, 기능 지원 확인(guard), 요청 구성,
+timeout 포함, close 시 stop 호출. 미검증: 카메라가 의도한 대로 실제로
+움직이는지 여부 — 실제 PTZ 하드웨어가 없어 확인하지 못했습니다.
 
 ### 저수준 백채널 API
 

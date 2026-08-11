@@ -36,7 +36,8 @@ function decodeXml(value: string): string {
     .replace(/&apos;/g, "'");
 }
 
-function encodeXml(value: string): string {
+/** @internal */
+export function encodeXml(value: string): string {
   return value
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
@@ -442,7 +443,7 @@ export class OnvifDevice {
   }
 
   /** @internal */
-  readOnlyCall(body: string, endpoint?: string): Promise<OnvifRawResponse> {
+  serviceCall(body: string, endpoint?: string): Promise<OnvifRawResponse> {
     const deviceUrl = this.requireDeviceUrl();
     return this.soapResponse(endpoint ?? deviceUrl, body, true);
   }

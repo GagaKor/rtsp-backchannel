@@ -63,7 +63,7 @@ silent-auth-failure bug it was masking is concrete.
 - `src/onvif/deviceClient.ts` — `discoverMediaUrl()` no longer catches; `soap()` now throws `ONVIF SOAP Fault` for Fault envelopes and `ONVIF HTTP response error` for other non-2xx.
 - `python/rtsp_backchannel/onvif.py` — `_media_service_url()`, the already-strict reference behaviour.
 - `rust/src/onvif.rs` — `connect()`, the already-strict reference behaviour.
-- `src/onvif/capabilities.ts` — unaffected: it uses `readOnlyCall()` → `soapResponse()` and classifies auth failures itself via `parseReadOnlyResponse` and `isAuthenticationFailure`.
+- `src/onvif/capabilities.ts` — unaffected: it uses `readOnlyCall()` → `soapResponse()` and classifies auth failures itself via `parseReadOnlyResponse` and `isAuthenticationFailure`. (Note: `readOnlyCall`/`parseReadOnlyResponse` were renamed to `serviceCall`/`parseServiceResponse` on 2026-08-10; this line names them as they were when this decision was recorded.)
 
 ## Consequences
 

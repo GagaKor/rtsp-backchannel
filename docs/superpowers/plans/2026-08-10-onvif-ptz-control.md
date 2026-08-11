@@ -117,8 +117,47 @@ Other fixed messages:
 | Any call after `close()` | `PTZ session is closed` |
 | No PTZ service advertised at open | `no ONVIF PTZ service` |
 | `GetNodes` returned no node | `no ONVIF PTZ node` |
+| No media profile carries a `PTZConfiguration` | `no ONVIF PTZ profile` |
 | Non-finite value | `PTZ value must be finite` |
+| Finite but outside its range | `PTZ value must be within its valid range` |
 | Timeout not finite or <= 0 | `PTZ timeout must be finite and greater than 0` |
+
+### Ranges, resolved
+
+The blanket statement "zoom position is 0.0..1.0" needs one refinement, settled
+during the TypeScript implementation and binding on all three languages:
+
+| Quantity | Range |
+|---|---|
+| `absoluteMove` `Position/Zoom` | `0.0..1.0` |
+| `continuousMove` `Velocity/Zoom` | `-1.0..1.0` |
+| `relativeMove` `Translation/Zoom` | `-1.0..1.0` |
+| `Speed/Zoom` on either move | `-1.0..1.0` |
+| All pan/tilt values, every call | `-1.0..1.0` |
+
+Only an absolute zoom is a *position*; a velocity and a translation are signed
+quantities. Implement this as two named range constants, not inline literals.
+
+### Details settled during the TypeScript implementation
+
+These came up because the contract did not cover them. They are now binding on
+Python and Rust too — do not re-decide them, or Task 8's byte-parity fixture
+will fail.
+
+- **Default profile-token resolution:** query Media1 `GetProfiles` first and
+  take the first profile carrying a `PTZConfiguration`. If Media1 yields none
+  and the `GetServices` response already fetched at open advertises Media2,
+  query Media2 the same way. Fail with `no ONVIF PTZ profile` only when both
+  are empty. Do not issue a second `GetServices`.
+- **Multiple `PTZNode` elements in one `GetNodesResponse`:** sort by token —
+  matching how the capability module's node parser already orders them — and
+  cache the first.
+- **PTZ SOAP fault classification** mirrors the capability module's fault
+  canonicalization. Since the two modules must not import each other, each
+  carries its own copy.
+- **`GetServices` at session open** sends the plain
+  `<GetServices xmlns="DEV_NS"/>` form, without `<IncludeCapability>`. The
+  session needs only the XAddr list. All three languages send the same bytes.
 
 ### Session lifecycle
 

@@ -94,6 +94,25 @@ class LibraryApiTests(unittest.TestCase):
         self.assertIs(getattr(library, "DeviceInfo", None), onvif.DeviceInfo)
         self.assertIn("DeviceInfo", library.__all__)
 
+    def test_exports_complete_ptz_session_contract(self):
+        library = importlib.import_module("rtsp_backchannel")
+        ptz = importlib.import_module("rtsp_backchannel.ptz")
+        ptz_exports = (
+            "open_ptz_session",
+            "PtzSession",
+            "PtzSessionOptions",
+            "PtzStatus",
+            "PtzVector",
+        )
+
+        for name in ptz_exports:
+            with self.subTest(name=name):
+                self.assertIs(
+                    getattr(library, name, None),
+                    getattr(ptz, name),
+                )
+                self.assertIn(name, library.__all__)
+
     def test_capabilities_parser_preserves_defaults_and_repeatable_values(self):
         cli = importlib.import_module("rtsp_backchannel.cli")
         parser_factory = getattr(cli, "_capabilities_parser", None)

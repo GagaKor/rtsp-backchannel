@@ -16,6 +16,13 @@ pub use capabilities::{
     get_camera_capabilities,
 };
 
+// PtzNode, PtzServiceCapabilities, and PtzSpaces live here so neither
+// capabilities.rs nor ptz.rs has to import the other.
+mod ptz_types;
+
+pub mod ptz;
+pub use ptz::{PtzSession, PtzSessionOptions, PtzStatus, PtzVector, open_ptz_session};
+
 const DEVICE_NS: &str = "http://www.onvif.org/ver10/device/wsdl";
 const MEDIA_NS: &str = "http://www.onvif.org/ver10/media/wsdl";
 const SCHEMA_NS: &str = "http://www.onvif.org/ver10/schema";

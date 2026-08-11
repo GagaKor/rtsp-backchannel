@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Experimental ONVIF PTZ movement control in all three packages:
+  `openPtzSession` / `open_ptz_session` for continuous, absolute, and relative
+  moves plus stop and status. Every continuous move carries a device-side
+  timeout so a stopped client cannot leave a camera moving, and operations the
+  camera does not advertise are rejected before a request is sent. Physical
+  movement is unverified against real PTZ hardware.
+
 ## [0.3.0] - 2026-08-10
 
 ### Added

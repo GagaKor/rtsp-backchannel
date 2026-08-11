@@ -4,6 +4,43 @@ This repository publishes the same version under the `rtsp-backchannel` name
 to npm, PyPI, and crates.io. FFmpeg is an external runtime prerequisite and
 must never be bundled in these artifacts.
 
+## Automated releases (the normal path)
+
+`.github/workflows/release.yml` publishes on every push to `master`. It reads
+the version out of `package.json`, `python/pyproject.toml`, and
+`rust/Cargo.toml`, compares each one against what is currently live on npm,
+PyPI, and crates.io, and publishes only the packages whose manifest version
+differs from the published version. A merge that doesn't change a version
+number (a Dependabot bump, a docs fix, etc.) publishes nothing. Each publish
+job runs its language's full test suite first and authenticates to its
+registry with OIDC trusted publishing — no tokens are stored in the
+repository or its secrets.
+
+To ship a release:
+
+1. Do step 1 below ("Prepare the release") to bump the versions and update
+   the version references that live outside the manifests.
+2. Merge that change to `master`.
+3. The workflow runs automatically and publishes whichever packages changed
+   version. Watch the run in the Actions tab; each registry's publish job
+   is skipped (not failed) for a package whose version didn't change.
+
+You can also trigger a run manually from the Actions tab
+(`workflow_dispatch`) if you need to retry a publish without pushing a new
+commit — it applies the same per-package version check.
+
+**One-time setup:** the workflow runs its publish jobs in a GitHub Actions
+environment named `release`. That environment does not exist yet and must be
+created in the repository's Settings → Environments before the workflow can
+publish anything (the registries' Trusted Publisher configuration is already
+set up to expect a run from that environment). No secrets need to be added
+to it — OIDC trusted publishing requires none.
+
+The manual process below remains the fallback if the workflow can't run, and
+is also the process for the very first publish to each registry (creating a
+new project on npm/PyPI/crates.io, and configuring Trusted Publisher settings
+for this repository) and for authenticating locally.
+
 ## 1. Prepare the release
 
 1. Update the version in `package.json`, `package-lock.json`,

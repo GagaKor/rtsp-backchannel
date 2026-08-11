@@ -142,6 +142,7 @@ fn main() -> Result<()> {
 | `discover_devices_in_cidrs(&options)` | `CidrDiscoveryOptions` | `Result<Vec<DiscoveredDevice>, String>` |
 | `get_camera_capabilities(&options)` | `CameraCapabilityOptions` | `Result<CameraCapabilityReport, String>` |
 | `get_stream_uris(&options)` | `StreamUriOptions` | `Result<Vec<StreamUri>, String>` |
+| `open_ptz_session(&options)` | `PtzSessionOptions` | `Result<PtzSession, String>` (실험적 기능) |
 | `play_file(&config)` | `PlaybackConfig` | `anyhow::Result<PlaybackResult>` |
 
 ### 카메라 기능 근거
@@ -329,6 +330,67 @@ ONVIF 인증 결과가 아닙니다.
   보고서는 계속할 수 있습니다.
 - `timeout`은 per-request 한도입니다. 한 보고서는 여러 요청을 사용하므로 총 소요
   시간은 per-request timeout 한 번보다 길 수 있습니다.
+
+### PTZ 제어
+
+`open_ptz_session`, `PtzSession`, `PtzSessionOptions`, `PtzStatus`,
+`PtzVector`는 `rtsp_backchannel::onvif`에서 export됩니다. `open_ptz_session`은
+카메라 한 대에 대한 제어 세션을 엽니다. 먼저 연결한 뒤 `GetServices`와
+`GetNodes`를 실행해 PTZ 서비스와 그 node를 찾고, Media Profile token을
+정합니다. `profile_token`을 직접 지정하지 않으면 PTZ를 지원하는 첫 번째
+profile을 사용합니다. 이어서 해당 node가 지원하는 PTZ space를 캐시해 두어,
+이후의 모든 호출을 카메라가 실제로 광고한 기능과 대조해 검사합니다. 반환되는
+`PtzSession`은 `get_camera_capabilities`와 `get_stream_uris`가 사용하는 것과
+같은 인증된 transport를 재사용합니다. PTZ 요청은 새 연결이 아니라 기존 연결
+위의 또 다른 SOAP body일 뿐입니다.
+
+`PtzSession`은 `continuous_move`, `absolute_move`, `relative_move`, `stop`,
+`get_status`와 `close`를 제공합니다. 각 move 메서드는 카메라의 PTZ node가
+해당 space를 광고하지 않았다면 요청을 보내기 전에 오류를 반환합니다. 예를
+들어 `continuous_zoom: false`를 보고한 node에서
+`continuous_move(None, Some(zoom), None)`을 호출하면 오류가 발생합니다.
+Pan/tilt 값과 대부분의 zoom 값은 `-1.0`~`1.0`이며, 절대 zoom *위치*만
+`0.0`~`1.0`입니다. `close()`는 세션을 닫힌 상태로 표시하기 전에 pan/tilt와
+zoom 모두에 대해 best-effort로 `stop()`을 호출하므로, 호출자가 종료 시점에
+movement 정지를 따로 챙기지 않아도 됩니다.
+
+모든 `continuous_move` 호출에는 카메라로 전달되는 device-side timeout이
+포함되며, 기본값은 1000ms입니다. 카메라는 이 timeout이 지나면 스스로
+움직임을 멈추므로, 한 번의 호출로는 카메라가 약 1초 동안만 움직입니다.
+계속 움직이게 하려면 호출자가 이전 timeout이 끝나기 전에
+`continuous_move`를 다시 호출해야 합니다. 이 기본값은
+`PtzSessionOptions::default_move_timeout_ms`로 제어하며,
+`continuous_move`의 `timeout_ms` 인자로 호출마다 재정의할 수 있습니다. 이는
+의도된 안전장치입니다. 클라이언트가 멈추라고 지시하지 않아도 카메라가
+스스로 정지하므로, 클라이언트가 비정상 종료되거나 연결이 끊겨도 카메라가
+계속 움직이는 상태로 남지 않습니다.
+
+```rust
+use rtsp_backchannel::onvif::{PtzSessionOptions, PtzVector, open_ptz_session};
+
+let password = std::env::var("ONVIF_PASSWORD").unwrap_or_default();
+let mut options = PtzSessionOptions::new("camera.local", "operator", password);
+options.device_urls = vec![
+    "http://camera.local/onvif/device_service".to_owned(),
+];
+let mut session = open_ptz_session(&options)?;
+
+// close()는 오류가 발생한 경로에서도 실행됩니다. close()로 카메라 정지를
+// 보장하려는 호출자가 중간 호출 실패 때문에 이를 건너뛰면 안 되기 때문입니다.
+let result = (|| -> Result<(), String> {
+    session.continuous_move(Some(PtzVector { x: 0.5, y: 0.0 }), None, Some(2000.0))?;
+    let status = session.get_status()?;
+    println!("{:?} {:?}", status.pan_tilt, status.zoom);
+    Ok(())
+})();
+session.close();
+result?;
+# Ok::<(), String>(())
+```
+
+**실험적 기능입니다.** 검증됨: 세션 열기, 기능 지원 확인(guard), 요청 구성,
+timeout 포함, close 시 stop 호출. 미검증: 카메라가 의도한 대로 실제로
+움직이는지 여부 — 실제 PTZ 하드웨어가 없어 확인하지 못했습니다.
 
 ### 장치 검색
 

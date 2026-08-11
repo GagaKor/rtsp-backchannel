@@ -1092,7 +1092,7 @@ class OnvifDevice:
             raise RuntimeError("call connect() first")
         return self.device_url
 
-    def read_only_call(
+    def service_call(
         self, body: str, endpoint: str | None = None
     ) -> _SoapResponse:
         device_url = self._required_device_url()

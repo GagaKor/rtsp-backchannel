@@ -392,6 +392,82 @@ only as `SOAP Fault: Fault`.
 `timeout` applies per request; because one report performs multiple requests,
 its total elapsed time can exceed one timeout interval.
 
+### `open_ptz_session`
+
+```python
+open_ptz_session(options: PtzSessionOptions) -> PtzSession
+
+PtzSessionOptions(
+    host: str,
+    user: str = "",
+    password: str = "",
+    profile_token: str | None = None,
+    device_urls: list[str] | None = None,
+    timeout: float = 8.0,
+    default_move_timeout_ms: float = 1000.0,
+)
+```
+
+`open_ptz_session` opens a control session for one camera: it connects, then
+runs `GetServices` and `GetNodes` to find the PTZ service and its node,
+resolves a Media Profile token (the first PTZ-capable profile unless
+`profile_token` is given explicitly), and caches the node's supported PTZ
+spaces so every later call can be checked against what the camera actually
+advertised. The returned `PtzSession` reuses the same authenticated
+transport `get_camera_capabilities` and `get_stream_uris` use; PTZ requests
+are a different SOAP body on the existing connection, not a new one.
+
+`PtzSession` exposes `continuous_move`, `absolute_move`, `relative_move`,
+`stop`, and `get_status`, plus `close`. Each move method raises before
+sending any request if the camera's PTZ node did not advertise the
+corresponding space — for example, `continuous_move(zoom=...)` against a
+node reporting `continuous_zoom=False`. Pan/tilt values and most zoom
+quantities are `-1.0`..`1.0`; an absolute zoom *position* is `0.0`..`1.0`.
+`close()` makes a best-effort `stop()` call for both pan/tilt and zoom before
+marking the session closed, so a caller does not have to remember to stop
+movement on the way out.
+
+Every `continuous_move` call carries a device-side timeout, defaulting to
+1000 ms, that is sent to the camera as part of the request. The camera is
+responsible for halting the movement itself once that timeout elapses, so a
+single call moves the camera for only about a second; a caller that wants
+continuous motion must keep re-issuing `continuous_move` before the previous
+timeout runs out. `default_move_timeout_ms` controls this default (a
+per-call `timeout_ms` overrides it for one call). This is a deliberate
+safety property: the camera stops on its own, so a crashed or disconnected
+client can never leave it moving indefinitely.
+
+Supply passwords through `ONVIF_PASSWORD` rather than source code:
+
+```python
+import os
+
+from rtsp_backchannel import PtzSessionOptions, PtzVector, open_ptz_session
+
+password = os.environ["ONVIF_PASSWORD"]
+
+session = open_ptz_session(
+    PtzSessionOptions(
+        host="camera.local",
+        user="operator",
+        password=password,
+        device_urls=["http://camera.local/onvif/device_service"],
+        timeout=8.0,
+    )
+)
+
+try:
+    session.continuous_move(pan_tilt=PtzVector(0.5, 0.0), timeout_ms=2000.0)
+    status = session.get_status()
+    print(status.pan_tilt, status.zoom)
+finally:
+    session.close()
+```
+
+**Experimental.** Verified: session open, capability guarding, request
+construction, timeout inclusion, and stop-on-close. Unverified: that a
+camera physically moves as intended — no PTZ hardware was available.
+
 ### `play_file`
 
 ```python

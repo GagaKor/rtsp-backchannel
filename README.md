@@ -127,6 +127,7 @@ console.log({ packetsSent });
 | `discoverDevices(options?)` | `timeoutMs?`, `interfaces?`, `cidrs?`, `ports?`, `concurrency?` | `Promise<DiscoveredDevice[]>` |
 | `getStreamUris(options)` | `host`, `user`, `pass`, `deviceUrls?`, `timeoutMs?` | `Promise<StreamUri[]>` |
 | `getCameraCapabilities(options)` | `host`, `user?`, `pass?`, `deviceUrls?`, `timeoutMs?` | `Promise<CameraCapabilityReport>` |
+| `openPtzSession(options)` | `host`, `user?`, `pass?`, `profileToken?`, `deviceUrls?`, `timeoutMs?`, `defaultMoveTimeoutMs?` | `Promise<PtzSession>` (experimental) |
 | `playFile(options)` | `host`, `user`, `pass`, `file`, `volume`, `codec` | RTP packet count as `Promise<number>` |
 
 `DiscoveredDevice` contains `ip`, `xaddrs`, `scopes`, and optional `name`,
@@ -384,6 +385,69 @@ certification.
 requests, so total elapsed time can exceed one timeout interval. Optional
 enrichment failures can add warnings and continue; they do not extend a single
 request's timeout.
+
+### PTZ Control
+
+`openPtzSession` opens a control session for one camera: it connects, then
+runs `GetServices` and `GetNodes` to find the PTZ service and its node,
+resolves a Media Profile token (the first PTZ-capable profile unless
+`profileToken` is given explicitly), and caches the node's supported PTZ
+spaces so every later call can be checked against what the camera actually
+advertised. The returned `PtzSession` reuses the same authenticated
+transport `getCameraCapabilities` and `getStreamUris` use; PTZ requests are a
+different SOAP body on the existing connection, not a new one.
+
+`PtzSession` exposes `continuousMove`, `absoluteMove`, `relativeMove`,
+`stop`, and `getStatus`, plus `close`. Each move method rejects before
+sending any request if the camera's PTZ node did not advertise the
+corresponding space — for example, `continuousMove({ zoom: ... })` against a
+node reporting `continuousZoom: false`. Pan/tilt values and most zoom
+quantities are `-1.0`..`1.0`; an absolute zoom *position* is `0.0`..`1.0`.
+`close()` makes a best-effort `stop()` call for both pan/tilt and zoom before
+marking the session closed, so a caller does not have to remember to stop
+movement on the way out.
+
+Every `continuousMove` call carries a device-side timeout, defaulting to
+1000 ms, that is sent to the camera as part of the request. The camera is
+responsible for halting the movement itself once that timeout elapses, so a
+single call moves the camera for only about a second; a caller that wants
+continuous motion must keep re-issuing `continuousMove` before the previous
+timeout runs out. `defaultMoveTimeoutMs` controls this default (a per-call
+`timeoutMs` overrides it for one call). This is a deliberate safety
+property: the camera stops on its own, so a crashed or disconnected client
+can never leave it moving indefinitely.
+
+Supply passwords through `ONVIF_PASSWORD` rather than source code:
+
+```typescript
+import {
+  openPtzSession,
+  type PtzSession,
+} from 'rtsp-backchannel';
+
+const password = process.env.ONVIF_PASSWORD;
+if (!password) throw new Error('ONVIF_PASSWORD is required');
+
+const session: PtzSession = await openPtzSession({
+  host: 'camera.local',
+  user: 'operator',
+  pass: password,
+  deviceUrls: ['http://camera.local/onvif/device_service'],
+  timeoutMs: 8000,
+});
+
+try {
+  await session.continuousMove({ panTilt: { x: 0.5, y: 0 }, timeoutMs: 2000 });
+  const status = await session.getStatus();
+  console.log(status.panTilt, status.zoom);
+} finally {
+  await session.close();
+}
+```
+
+**Experimental.** Verified: session open, capability guarding, request
+construction, timeout inclusion, and stop-on-close. Unverified: that a
+camera physically moves as intended — no PTZ hardware was available.
 
 ### Low-Level Backchannel API
 

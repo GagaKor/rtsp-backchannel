@@ -18,7 +18,11 @@ import type {
   EncodedAudioFrame,
   PtzNode,
   PtzServiceCapabilities,
+  PtzSession,
+  PtzSessionOptions,
   PtzSpaces,
+  PtzStatus,
+  PtzVector,
   SendCodec,
 } from './index.ts';
 
@@ -35,6 +39,7 @@ test('exports the supported npm library surface from one entry point', () => {
   assert.equal(typeof library.discoverDevices, 'function');
   assert.equal(typeof library.getStreamUris, 'function');
   assert.equal(typeof library.getCameraCapabilities, 'function');
+  assert.equal(typeof library.openPtzSession, 'function');
   assert.equal(library.SAMPLE_RATE, 8000);
   assert.equal(library.PACKET_MS, 40);
 });
@@ -136,6 +141,58 @@ test('exports the complete camera capability report contract', () => {
     'camera.local',
     spaces,
     warning,
+  ]);
+});
+
+test('exports the complete PTZ session contract', () => {
+  const options: PtzSessionOptions = {
+    host: 'camera.local',
+    user: 'operator',
+    pass: 'example-only',
+    profileToken: 'main',
+    deviceUrls: ['http://camera.local/onvif/device_service'],
+    timeoutMs: 8_000,
+    defaultMoveTimeoutMs: 1_000,
+  };
+  const vector: PtzVector = { x: 0.5, y: -0.5 };
+  const status: PtzStatus = {
+    panTilt: vector,
+    zoom: 0.25,
+    panTiltMoveStatus: 'MOVING',
+    zoomMoveStatus: 'IDLE',
+    utcTime: '2026-08-10T00:00:00Z',
+  };
+  const node: PtzNode = {
+    token: 'node-main',
+    spaces: {
+      absolutePanTilt: true,
+      absoluteZoom: false,
+      relativePanTilt: false,
+      relativeZoom: false,
+      continuousPanTilt: true,
+      continuousZoom: true,
+    },
+    auxiliaryCommands: [],
+  };
+  const session: PtzSession = {
+    profileToken: options.profileToken as string,
+    node,
+    continuousMove: async () => {},
+    absoluteMove: async () => {},
+    relativeMove: async () => {},
+    stop: async () => {},
+    getStatus: async () => status,
+    close: async () => {},
+  };
+  const openSession: (
+    value: PtzSessionOptions,
+  ) => Promise<PtzSession> = library.openPtzSession;
+
+  assert.equal(typeof openSession, 'function');
+  assert.deepEqual([options.host, session.node.spaces, session.profileToken], [
+    'camera.local',
+    node.spaces,
+    'main',
   ]);
 });
 
@@ -272,6 +329,20 @@ test('ships clean public declarations without capability parser or injection sea
     /discoverDevices\(options\?: DiscoveryOptions\): Promise<DiscoveredDevice\[\]>/,
   );
 
+  // ptz.ts hides its injection seam the same way discovery.ts and
+  // capabilities.ts hide theirs: openPtzSession takes options only, and
+  // PtzSessionDependencies/PtzSessionDevice live behind the internal-only
+  // openPtzSessionWithDependencies. This is the ptz.d.ts counterpart of the
+  // discovery.d.ts and index.d.ts/cli.d.ts assertions above and below — the
+  // gap this closes is exactly what let PtzSessionDependencies and
+  // PtzSessionDevice leak into shipped declarations undetected.
+  const ptzDeclaration = readFileSync('dist/onvif/ptz.d.ts', 'utf8');
+  assert.doesNotMatch(ptzDeclaration, /PtzSessionDependencies|PtzSessionDevice|WithDependencies/);
+  assert.match(
+    ptzDeclaration,
+    /export declare function openPtzSession\(options: PtzSessionOptions\): Promise<PtzSession>;/,
+  );
+
   const indexDeclaration = readFileSync('dist/index.d.ts', 'utf8');
   const cliDeclaration = readFileSync('dist/cli.d.ts', 'utf8');
   assert.match(indexDeclaration, /export \{ getCameraCapabilities \}/);
@@ -289,6 +360,16 @@ test('ships clean public declarations without capability parser or injection sea
   }
   assert.match(cliDeclaration, /getCameraCapabilities: typeof getCameraCapabilities/);
 
+  assert.match(indexDeclaration, /export \{ openPtzSession \}/);
+  for (const typeName of [
+    'PtzSession',
+    'PtzSessionOptions',
+    'PtzStatus',
+    'PtzVector',
+  ]) {
+    assert.match(indexDeclaration, new RegExp(`\\b${typeName}\\b`));
+  }
+
   const publicDeclarations = `${indexDeclaration}\n${cliDeclaration}`;
   assert.doesNotMatch(
     publicDeclarations,
@@ -297,5 +378,9 @@ test('ships clean public declarations without capability parser or injection sea
   assert.doesNotMatch(
     publicDeclarations,
     /OnvifResponseError|ParsedServiceDiscovery|ParsedPtzNodes|parseScopesResponse|parseServicesResponse|parseCapabilitiesResponse|selectService|parseMedia1ProfilesResponse|parseMedia2ProfilesResponse|parsePtz|parseMedia2OptionsResponse/,
+  );
+  assert.doesNotMatch(
+    publicDeclarations,
+    /PtzResponseError|formatPtzNumber|formatPtzDuration/,
   );
 });

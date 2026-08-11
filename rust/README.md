@@ -145,6 +145,7 @@ fn main() -> Result<()> {
 | `discover_devices_in_cidrs(&options)` | `CidrDiscoveryOptions` | `Result<Vec<DiscoveredDevice>, String>` |
 | `get_camera_capabilities(&options)` | `CameraCapabilityOptions` | `Result<CameraCapabilityReport, String>` |
 | `get_stream_uris(&options)` | `StreamUriOptions` | `Result<Vec<StreamUri>, String>` |
+| `open_ptz_session(&options)` | `PtzSessionOptions` | `Result<PtzSession, String>` (experimental) |
 | `play_file(&config)` | `PlaybackConfig` | `anyhow::Result<PlaybackResult>` |
 
 ### Camera Capability Evidence
@@ -337,6 +338,67 @@ Interpret the report as evidence, not certification:
   unknown or empty; the rest of the report can continue.
 - `timeout` is a per-request limit. One report performs several requests, so
   its total elapsed time can exceed one per-request timeout interval.
+
+### PTZ Control
+
+`open_ptz_session`, `PtzSession`, `PtzSessionOptions`, `PtzStatus`, and
+`PtzVector` are exported from `rtsp_backchannel::onvif`. `open_ptz_session`
+opens a control session for one camera: it connects, then runs
+`GetServices` and `GetNodes` to find the PTZ service and its node, resolves
+a Media Profile token (the first PTZ-capable profile unless `profile_token`
+is given explicitly), and caches the node's supported PTZ spaces so every
+later call can be checked against what the camera actually advertised. The
+returned `PtzSession` reuses the same authenticated transport
+`get_camera_capabilities` and `get_stream_uris` use; PTZ requests are a
+different SOAP body on the existing connection, not a new one.
+
+`PtzSession` exposes `continuous_move`, `absolute_move`, `relative_move`,
+`stop`, and `get_status`, plus `close`. Each move method returns an error
+before sending any request if the camera's PTZ node did not advertise the
+corresponding space — for example, `continuous_move(None, Some(zoom), None)`
+against a node reporting `continuous_zoom: false`. Pan/tilt values and most
+zoom quantities are `-1.0`..`1.0`; an absolute zoom *position* is
+`0.0`..`1.0`. `close()` makes a best-effort `stop()` call for both pan/tilt
+and zoom before marking the session closed, so a caller does not have to
+remember to stop movement on the way out.
+
+Every `continuous_move` call carries a device-side timeout, defaulting to
+1000 ms, that is sent to the camera as part of the request. The camera is
+responsible for halting the movement itself once that timeout elapses, so a
+single call moves the camera for only about a second; a caller that wants
+continuous motion must keep re-issuing `continuous_move` before the previous
+timeout runs out. `PtzSessionOptions::default_move_timeout_ms` controls this
+default (the `timeout_ms` argument to `continuous_move` overrides it for one
+call). This is a deliberate safety property: the camera stops on its own,
+so a crashed or disconnected client can never leave it moving indefinitely.
+
+```rust
+use rtsp_backchannel::onvif::{PtzSessionOptions, PtzVector, open_ptz_session};
+
+let password = std::env::var("ONVIF_PASSWORD").unwrap_or_default();
+let mut options = PtzSessionOptions::new("camera.local", "operator", password);
+options.device_urls = vec![
+    "http://camera.local/onvif/device_service".to_owned(),
+];
+let mut session = open_ptz_session(&options)?;
+
+// `close()` runs on the error path too (not just after a successful move),
+// since a caller relying on `close()` to stop the camera must not skip it
+// just because a call in between failed.
+let result = (|| -> Result<(), String> {
+    session.continuous_move(Some(PtzVector { x: 0.5, y: 0.0 }), None, Some(2000.0))?;
+    let status = session.get_status()?;
+    println!("{:?} {:?}", status.pan_tilt, status.zoom);
+    Ok(())
+})();
+session.close();
+result?;
+# Ok::<(), String>(())
+```
+
+**Experimental.** Verified: session open, capability guarding, request
+construction, timeout inclusion, and stop-on-close. Unverified: that a
+camera physically moves as intended — no PTZ hardware was available.
 
 ### Device Discovery
 

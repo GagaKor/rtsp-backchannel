@@ -49,6 +49,13 @@ export type {
   PtzServiceCapabilities,
   PtzSpaces,
 } from './onvif/capabilities.ts';
+export { openPtzSession } from './onvif/ptz.ts';
+export type {
+  PtzSession,
+  PtzSessionOptions,
+  PtzStatus,
+  PtzVector,
+} from './onvif/ptz.ts';
 export { discoverDevices } from './onvif/discovery.ts';
 export type {
   DiscoveredDevice,
