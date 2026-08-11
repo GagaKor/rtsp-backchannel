@@ -1,16 +1,19 @@
 # RTSP Backchannel for TypeScript
 
+[![latest GitHub Release](https://img.shields.io/github/v/release/GagaKor/rtsp-backchannel?label=release)](https://github.com/GagaKor/rtsp-backchannel/releases/latest) [![rtsp-backchannel on npm](https://img.shields.io/npm/v/rtsp-backchannel?label=npm)](https://www.npmjs.com/package/rtsp-backchannel) [![rtsp-backchannel on PyPI](https://img.shields.io/pypi/v/rtsp-backchannel?label=PyPI)](https://pypi.org/project/rtsp-backchannel/) [![rtsp-backchannel on crates.io](https://img.shields.io/crates/v/rtsp-backchannel?label=crates.io)](https://crates.io/crates/rtsp-backchannel)
+
 [English](https://github.com/GagaKor/rtsp-backchannel/blob/master/README.md) |
 [한국어](https://github.com/GagaKor/rtsp-backchannel/blob/master/README.ko.md)
 
-TypeScript library and CLI for discovering ONVIF cameras, resolving profile
-RTSP URIs, and playing one audio file through an ONVIF RTSP backchannel.
-FFmpeg is required only for file playback; GStreamer is not used.
+ONVIF RTSP backchannel libraries and CLI tools for TypeScript, Python, and Rust.
+
+Supports ONVIF camera discovery, RTSP URI resolution, camera capability inspection,
+PTZ control, and two-way audio backchannel streaming with G.711, G.726, and AAC.
 
 Other implementations:
 
-- [Python](https://github.com/GagaKor/rtsp-backchannel/blob/master/python/README.md)
-- [Rust](https://github.com/GagaKor/rtsp-backchannel/blob/master/rust/README.md)
+- [Python](https://github.com/GagaKor/rtsp-backchannel/blob/master/python/README.md) — [PyPI](https://pypi.org/project/rtsp-backchannel/)
+- [Rust](https://github.com/GagaKor/rtsp-backchannel/blob/master/rust/README.md) — [crates.io](https://crates.io/crates/rtsp-backchannel)
 
 The package starts a backchannel session, sends the complete file at real-time
 speed, and closes the session. It calls a separately installed `ffmpeg`

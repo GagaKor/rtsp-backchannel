@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-11
+
 ### Added
 
 - Experimental ONVIF PTZ movement control in all three packages:
@@ -15,11 +17,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   timeout so a stopped client cannot leave a camera moving, and operations the
   camera does not advertise are rejected before a request is sent. Physical
   movement is unverified against real PTZ hardware.
-
-## [0.3.0] - 2026-08-10
-
-### Added
-
 - Equivalent TypeScript, Python, and Rust APIs plus a `capabilities` command for
   read-only ONVIF camera capability reports covering device identity, scopes,
   declared profiles, services, media profiles, PTZ, and Media2/H.265 evidence.

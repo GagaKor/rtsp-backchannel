@@ -1,5 +1,7 @@
 # Python용 RTSP Backchannel
 
+[![latest GitHub Release](https://img.shields.io/github/v/release/GagaKor/rtsp-backchannel?label=release)](https://github.com/GagaKor/rtsp-backchannel/releases/latest) [![rtsp-backchannel on npm](https://img.shields.io/npm/v/rtsp-backchannel?label=npm)](https://www.npmjs.com/package/rtsp-backchannel) [![rtsp-backchannel on PyPI](https://img.shields.io/pypi/v/rtsp-backchannel?label=PyPI)](https://pypi.org/project/rtsp-backchannel/) [![rtsp-backchannel on crates.io](https://img.shields.io/crates/v/rtsp-backchannel?label=crates.io)](https://crates.io/crates/rtsp-backchannel)
+
 [English](https://github.com/GagaKor/rtsp-backchannel/blob/master/python/README.md) |
 [한국어](https://github.com/GagaKor/rtsp-backchannel/blob/master/python/README.ko.md)
 
@@ -9,8 +11,8 @@ FFmpeg가 필요하며 GStreamer는 사용하지 않습니다.
 
 다른 구현체:
 
-- [TypeScript](https://github.com/GagaKor/rtsp-backchannel/blob/master/README.ko.md)
-- [Rust](https://github.com/GagaKor/rtsp-backchannel/blob/master/rust/README.ko.md)
+- [TypeScript](https://github.com/GagaKor/rtsp-backchannel/blob/master/README.ko.md) — [npm 패키지](https://www.npmjs.com/package/rtsp-backchannel)
+- [Rust](https://github.com/GagaKor/rtsp-backchannel/blob/master/rust/README.ko.md) — [crates.io 패키지](https://crates.io/crates/rtsp-backchannel)
 
 패키지는 백채널 세션을 열고 음원 파일 전체를 실시간 속도로 전송한 뒤 세션을
 종료합니다. 입력 음원 디코딩에는 별도로 설치된 `ffmpeg` 실행 파일을 사용하며,

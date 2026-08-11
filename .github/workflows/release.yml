@@ -20,9 +20,10 @@ permissions:
   contents: read
 
 concurrency:
-  # Queue rather than cancel: a half-finished publish cannot be undone,
-  # so a newer run must never interrupt one already talking to a registry.
+  # Queue every release rather than cancel: a half-finished publish cannot be
+  # undone, and two rapid version bumps must not replace an older pending run.
   group: release-${{ github.workflow }}
+  queue: max
   cancel-in-progress: false
 
 jobs:
@@ -37,6 +38,11 @@ jobs:
     if: github.repository == 'GagaKor/rtsp-backchannel' && github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # Listing draft releases requires push access. This job only reads state;
+    # write permission lets an interrupted draft be detected and repaired by
+    # the later tag-and-release job instead of being mistaken for no release.
+    permissions:
+      contents: write
     outputs:
       npm-version: ${{ steps.gate.outputs.npm-version }}
       npm-publish: ${{ steps.gate.outputs.npm-publish }}
@@ -44,6 +50,12 @@ jobs:
       pypi-publish: ${{ steps.gate.outputs.pypi-publish }}
       crates-version: ${{ steps.gate.outputs.crates-version }}
       crates-publish: ${{ steps.gate.outputs.crates-publish }}
+      release-tag: ${{ steps.release-state.outputs.tag }}
+      release-tag-exists: ${{ steps.release-state.outputs.tag-exists }}
+      release-commit: ${{ steps.release-state.outputs.release-commit }}
+      github-release-exists: ${{ steps.release-state.outputs.release-exists }}
+      github-release-needed: ${{ steps.release-state.outputs.release-needed }}
+      github-release-assets-needed: ${{ steps.release-state.outputs.assets-needed }}
     steps:
       - uses: actions/checkout@v7
 
@@ -53,12 +65,41 @@ jobs:
           set -euo pipefail
 
           npm_manifest=$(jq -r '.version' package.json)
+          npm_lock=$(jq -r '.version' package-lock.json)
+          npm_package_lock=$(jq -r '.packages[""].version' package-lock.json)
           pypi_manifest=$(grep -m1 '^version' python/pyproject.toml | sed -E 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')
           crates_manifest=$(grep -m1 '^version' rust/Cargo.toml | sed -E 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')
+          crates_lock=$(awk '
+            $0 == "name = \"rtsp-backchannel\"" { found = 1; next }
+            found && /^version = / {
+              gsub(/^version = \"|\"$/, "")
+              print
+              exit
+            }
+          ' rust/Cargo.lock)
 
           echo "npm manifest version: $npm_manifest"
+          echo "npm lock versions: $npm_lock, $npm_package_lock"
           echo "pypi manifest version: $pypi_manifest"
           echo "crates manifest version: $crates_manifest"
+          echo "crates lock version: $crates_lock"
+
+          if [ "$npm_manifest" != "$npm_lock" ] || \
+             [ "$npm_manifest" != "$npm_package_lock" ] || \
+             [ "$npm_manifest" != "$pypi_manifest" ] || \
+             [ "$npm_manifest" != "$crates_manifest" ] || \
+             [ "$npm_manifest" != "$crates_lock" ]; then
+            echo "Release versions must match in all five manifests and lock files." >&2
+            exit 1
+          fi
+
+          if ! awk -v prefix="## [${npm_manifest}] - " '
+            index($0, prefix) == 1 { matches++ }
+            END { exit(matches == 1 ? 0 : 1) }
+          ' CHANGELOG.md; then
+            echo "CHANGELOG.md must contain exactly one dated section for ${npm_manifest}." >&2
+            exit 1
+          fi
 
           # Prints "<body>\n<http_status>" so the status can be split off
           # without a second request.
@@ -121,9 +162,371 @@ jobs:
             echo "crates-publish=$crates_publish"
           } >> "$GITHUB_OUTPUT"
 
+      # This gate prevents routine master pushes from rebuilding five native
+      # binaries after the current version already has a GitHub Release. Tag
+      # and release state are separate, and a Release is only complete when all
+      # five expected assets are uploaded. A retry after any partial failure
+      # rebuilds from the tag commit and repairs the draft or incomplete release.
+      - name: Check GitHub tag and release state
+        id: release-state
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          version="${{ steps.gate.outputs.npm-version }}"
+          tag="v${version}"
+
+          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null; then
+            tag_exists=true
+            git fetch --force --depth=1 origin "refs/tags/${tag}:refs/tags/${tag}"
+            release_commit=$(git rev-list -n 1 "$tag")
+          else
+            tag_exists=false
+            release_commit=$(git rev-parse HEAD)
+          fi
+
+          # A pre-existing tag is a release source, not merely a name. Reject
+          # a moved or mistagged commit whose package versions do not match the
+          # version selected from the current, synchronized manifests.
+          release_npm_manifest=$(git show "${release_commit}:package.json" | jq -r '.version')
+          release_npm_lock=$(git show "${release_commit}:package-lock.json" | jq -r '.version')
+          release_npm_package_lock=$(git show "${release_commit}:package-lock.json" | jq -r '.packages[""].version')
+          release_pypi_manifest=$(git show "${release_commit}:python/pyproject.toml" | awk '
+            !found && /^version[[:space:]]*=/ {
+              value = $0
+              sub(/^[^"]*"/, "", value)
+              sub(/".*$/, "", value)
+              print value
+              found = 1
+            }
+          ')
+          release_crates_manifest=$(git show "${release_commit}:rust/Cargo.toml" | awk '
+            !found && /^version[[:space:]]*=/ {
+              value = $0
+              sub(/^[^"]*"/, "", value)
+              sub(/".*$/, "", value)
+              print value
+              found = 1
+            }
+          ')
+          release_crates_lock=$(git show "${release_commit}:rust/Cargo.lock" | awk '
+            $0 == "name = \"rtsp-backchannel\"" { found = 1; next }
+            found && !printed && /^version = / {
+              gsub(/^version = \"|\"$/, "")
+              print
+              printed = 1
+            }
+          ')
+
+          if [ "$release_npm_manifest" != "$version" ] || \
+             [ "$release_npm_lock" != "$version" ] || \
+             [ "$release_npm_package_lock" != "$version" ] || \
+             [ "$release_pypi_manifest" != "$version" ] || \
+             [ "$release_crates_manifest" != "$version" ] || \
+             [ "$release_crates_lock" != "$version" ]; then
+            echo "Release commit ${release_commit} does not contain synchronized ${version} manifests." >&2
+            exit 1
+          fi
+
+          changelog_source="$RUNNER_TEMP/release-changelog.md"
+          if [ "$tag_exists" = true ]; then
+            git show "${release_commit}:CHANGELOG.md" > "$changelog_source"
+          else
+            cp CHANGELOG.md "$changelog_source"
+          fi
+
+          expected_notes="$RUNNER_TEMP/expected-release-notes.md"
+          awk -v ver="$version" '
+            /^## \[/ {
+              if (in_section) exit
+              if (index($0, "## [" ver "] - ") == 1) { in_section = 1 }
+            }
+            in_section { print }
+          ' "$changelog_source" > "$expected_notes"
+
+          if [ ! -s "$expected_notes" ]; then
+            echo "The release source has no dated CHANGELOG.md section for ${version}." >&2
+            exit 1
+          fi
+
+          provenance_marker="<!-- rtsp-backchannel-release-commit: ${release_commit} -->"
+          printf '\n%s\n' "$provenance_marker" >> "$expected_notes"
+
+          expected_title="rtsp-backchannel ${version}"
+          expected_body=$(cat "$expected_notes")
+          expected_assets=(
+            "rtsp-backchannel-${version}-x86_64-unknown-linux-gnu"
+            "rtsp-backchannel-${version}-aarch64-unknown-linux-gnu"
+            "rtsp-backchannel-${version}-aarch64-apple-darwin"
+            "rtsp-backchannel-${version}-x86_64-apple-darwin"
+            "rtsp-backchannel-${version}-x86_64-pc-windows-msvc.exe"
+          )
+
+          releases_json="$RUNNER_TEMP/github-releases.json"
+          release_json="$RUNNER_TEMP/github-release.json"
+          latest_release_json="$RUNNER_TEMP/github-latest-release.json"
+          release_status=$(curl -sS -o "$releases_json" -w '%{http_code}' \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases?per_page=100")
+
+          if [ "$release_status" != 200 ]; then
+            echo "GitHub release query failed with HTTP ${release_status}" >&2
+            cat "$releases_json" >&2
+            exit 1
+          fi
+
+          latest_release_status=$(curl -sS -o "$latest_release_json" -w '%{http_code}' \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/latest")
+
+          case "$latest_release_status" in
+            200) latest_release_tag=$(jq -r '.tag_name' "$latest_release_json") ;;
+            404) latest_release_tag="" ;;
+            *)
+              echo "Latest GitHub Release query failed with HTTP ${latest_release_status}" >&2
+              cat "$latest_release_json" >&2
+              exit 1
+              ;;
+          esac
+
+          release_matches=$(jq --arg tag "$tag" \
+            '[.[] | select(.tag_name == $tag)] | length' "$releases_json")
+
+          if [ "$release_matches" -gt 1 ]; then
+            echo "Multiple GitHub Releases found for ${tag}." >&2
+            exit 1
+          elif [ "$release_matches" -eq 0 ]; then
+            release_exists=false
+            release_needed=true
+            assets_needed=true
+          else
+            jq --arg tag "$tag" '.[] | select(.tag_name == $tag)' \
+              "$releases_json" > "$release_json"
+
+            release_exists=true
+            release_needed=false
+            assets_needed=false
+            publication_state_needed=false
+            release_is_draft=$(jq -r '.draft' "$release_json")
+            release_is_prerelease=$(jq -r '.prerelease' "$release_json")
+            release_is_immutable=$(jq -r '.immutable // false' "$release_json")
+            actual_body=$(jq -r '.body // ""' "$release_json")
+            marker_line_count=$(printf '%s\n' "$actual_body" | awk '
+              /^<!-- rtsp-backchannel-release-commit:/ { count++ }
+              END { print count + 0 }
+            ')
+            existing_release_commit=$(printf '%s\n' "$actual_body" | sed -nE \
+              's/^<!-- rtsp-backchannel-release-commit: ([0-9a-f]{40}) -->$/\1/p')
+
+            if [ "$marker_line_count" -gt 1 ] || \
+               { [ "$marker_line_count" -eq 1 ] && \
+                 [ "$existing_release_commit" != "$release_commit" ]; }; then
+              echo "GitHub Release provenance conflicts with tag ${tag}; manual repair required." >&2
+              exit 1
+            fi
+
+            if [ "$(jq -r '.name // ""' "$release_json")" != "$expected_title" ] || \
+               [ "$actual_body" != "$expected_body" ]; then
+              echo "GitHub Release title or notes need repair."
+              release_needed=true
+            fi
+
+            if [ "$release_is_draft" = true ] || \
+               [ "$release_is_prerelease" = true ]; then
+              echo "GitHub Release publication state needs repair."
+              release_needed=true
+              publication_state_needed=true
+            fi
+
+            if [ "$latest_release_tag" != "$tag" ]; then
+              echo "GitHub Release ${tag} is not marked Latest."
+              release_needed=true
+              publication_state_needed=true
+            fi
+
+            # A hidden marker binds every asset set to the exact build commit.
+            # Draft assets are also untrusted after an interrupted tag-move
+            # race. Either condition forces all five assets to be replaced.
+            if [ "$release_is_draft" = true ] || [ "$marker_line_count" -eq 0 ]; then
+              echo "GitHub Release assets need provenance-safe replacement."
+              release_needed=true
+              assets_needed=true
+            fi
+
+            for asset in "${expected_assets[@]}"; do
+              if ! jq -e --arg asset "$asset" \
+                'any(.assets[]?; .name == $asset and .state == "uploaded" and .size > 0)' \
+                "$release_json" >/dev/null; then
+                echo "GitHub Release is missing asset: ${asset}"
+                release_needed=true
+                assets_needed=true
+              fi
+            done
+
+            # Published immutable releases allow title/notes edits only. Their
+            # protected assets, prerelease state, and Latest designation cannot
+            # be repaired by this workflow.
+            if [ "$release_is_immutable" = true ] && \
+               { [ "$assets_needed" = true ] || [ "$publication_state_needed" = true ]; }; then
+              echo "GitHub Release ${tag} is immutable and needs a locked-state repair." >&2
+              exit 1
+            fi
+          fi
+
+          echo "release tag: ${tag} (exists: ${tag_exists}; commit: ${release_commit})"
+          echo "GitHub Release exists: ${release_exists}; create or repair: ${release_needed}"
+          echo "latest published release tag: ${latest_release_tag:-<none>}"
+
+          {
+            echo "tag=${tag}"
+            echo "tag-exists=${tag_exists}"
+            echo "release-commit=${release_commit}"
+            echo "release-exists=${release_exists}"
+            echo "release-needed=${release_needed}"
+            echo "assets-needed=${assets_needed}"
+          } >> "$GITHUB_OUTPUT"
+
+  # Persist the selected source commit before any immutable registry artifact
+  # can be published. If a later registry job fails, every retry and every
+  # subsequent master push resolves this tag and continues from the same SHA.
+  pin-release-tag:
+    name: Pin release source tag
+    needs: check-versions
+    if: github.repository == 'GagaKor/rtsp-backchannel' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.check-versions.outputs.release-commit }}
+
+      - name: Create or verify the release tag
+        run: |
+          set -euo pipefail
+
+          tag="${{ needs.check-versions.outputs.release-tag }}"
+          release_commit="${{ needs.check-versions.outputs.release-commit }}"
+          checkout_commit=$(git rev-parse HEAD)
+          if [ "$checkout_commit" != "$release_commit" ]; then
+            echo "Release checkout is ${checkout_commit}, expected ${release_commit}." >&2
+            exit 1
+          fi
+
+          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null; then
+            git fetch --force --depth=1 origin "refs/tags/${tag}:refs/tags/${tag}"
+            tag_commit=$(git rev-list -n 1 "$tag")
+            if [ "$tag_commit" != "$release_commit" ]; then
+              echo "Release tag ${tag} points to ${tag_commit}, but this run pinned ${release_commit}." >&2
+              exit 1
+            fi
+            echo "Release tag already pins ${release_commit}: ${tag}"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "$tag" -m "rtsp-backchannel ${{ needs.check-versions.outputs.npm-version }}"
+            git push origin "$tag"
+          fi
+
+      - name: Persist release provenance before registry publishing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          tag="${{ needs.check-versions.outputs.release-tag }}"
+          version="${{ needs.check-versions.outputs.npm-version }}"
+          release_commit="${{ needs.check-versions.outputs.release-commit }}"
+          provenance_marker="<!-- rtsp-backchannel-release-commit: ${release_commit} -->"
+          notes_file="${RUNNER_TEMP}/pinned-release-notes.md"
+
+          awk -v ver="$version" '
+            /^## \[/ {
+              if (in_section) exit
+              if (index($0, "## [" ver "] - ") == 1) { in_section = 1 }
+            }
+            in_section { print }
+          ' CHANGELOG.md > "$notes_file"
+
+          if [ ! -s "$notes_file" ]; then
+            echo "No dated CHANGELOG.md section found for ${version}." >&2
+            exit 1
+          fi
+          printf '\n%s\n' "$provenance_marker" >> "$notes_file"
+
+          verify_remote_tag_commit() {
+            git fetch --force --depth=1 origin "refs/tags/${tag}:refs/tags/${tag}"
+            tag_commit=$(git rev-list -n 1 "$tag")
+            if [ "$tag_commit" != "$release_commit" ]; then
+              echo "Release tag ${tag} moved from ${release_commit} to ${tag_commit}." >&2
+              exit 1
+            fi
+          }
+
+          fetch_release() {
+            gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" |
+              jq --arg tag "$tag" \
+                '[.[] | select(.tag_name == $tag)] |
+                 if length == 1 then .[0]
+                 elif length == 0 then empty
+                 else error("multiple releases found for tag")
+                 end'
+          }
+
+          verify_remote_tag_commit
+          release_json=$(mktemp)
+          fetch_release > "$release_json"
+
+          if [ ! -s "$release_json" ]; then
+            # The draft is a durable SHA record even if the first registry
+            # publish succeeds and a later one fails. It remains private until
+            # all native assets are built and verified.
+            gh release create "$tag" \
+              --draft \
+              --verify-tag \
+              --title "rtsp-backchannel ${version}" \
+              --notes-file "$notes_file"
+            fetch_release > "$release_json"
+          fi
+
+          actual_body=$(jq -r '.body // ""' "$release_json")
+          marker_line_count=$(printf '%s\n' "$actual_body" | awk '
+            /^<!-- rtsp-backchannel-release-commit:/ { count++ }
+            END { print count + 0 }
+          ')
+          existing_release_commit=$(printf '%s\n' "$actual_body" | sed -nE \
+            's/^<!-- rtsp-backchannel-release-commit: ([0-9a-f]{40}) -->$/\1/p')
+
+          if [ "$marker_line_count" -gt 1 ] || \
+             { [ "$marker_line_count" -eq 1 ] && \
+               [ "$existing_release_commit" != "$release_commit" ]; }; then
+            echo "GitHub Release provenance conflicts with tag ${tag}; registry publishing is blocked." >&2
+            exit 1
+          fi
+
+          any_registry_publish=false
+          if [ "${{ needs.check-versions.outputs.npm-publish }}" = true ] || \
+             [ "${{ needs.check-versions.outputs.pypi-publish }}" = true ] || \
+             [ "${{ needs.check-versions.outputs.crates-publish }}" = true ]; then
+            any_registry_publish=true
+          fi
+
+          if [ "$marker_line_count" -eq 0 ] && [ "$any_registry_publish" = true ]; then
+            echo "Registry publishing requires an existing Release provenance marker." >&2
+            exit 1
+          fi
+
+          verify_remote_tag_commit
+
   publish-npm:
     name: Publish npm package
-    needs: check-versions
+    needs: [check-versions, pin-release-tag]
     if: github.repository == 'GagaKor/rtsp-backchannel' && github.ref == 'refs/heads/master' && needs.check-versions.outputs.npm-publish == 'true'
     runs-on: ubuntu-latest
     environment: release
@@ -133,6 +536,8 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.check-versions.outputs.release-commit }}
 
       # Deliberately no `registry-url` here. Passing it makes setup-node write
       # an .npmrc containing `//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}`
@@ -161,7 +566,7 @@ jobs:
 
   publish-pypi:
     name: Publish PyPI package
-    needs: check-versions
+    needs: [check-versions, pin-release-tag]
     if: github.repository == 'GagaKor/rtsp-backchannel' && github.ref == 'refs/heads/master' && needs.check-versions.outputs.pypi-publish == 'true'
     runs-on: ubuntu-latest
     environment: release
@@ -171,6 +576,8 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.check-versions.outputs.release-commit }}
 
       - uses: actions/setup-python@v7
         with:
@@ -197,7 +604,7 @@ jobs:
 
   publish-crates:
     name: Publish crates.io package
-    needs: check-versions
+    needs: [check-versions, pin-release-tag]
     if: github.repository == 'GagaKor/rtsp-backchannel' && github.ref == 'refs/heads/master' && needs.check-versions.outputs.crates-publish == 'true'
     runs-on: ubuntu-latest
     environment: release
@@ -207,6 +614,8 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.check-versions.outputs.release-commit }}
       - name: Install Rust toolchain
         run: rustup toolchain install 1.86.0 --profile minimal
       - run: cargo +1.86.0 test --manifest-path rust/Cargo.toml --locked
@@ -219,3 +628,323 @@ jobs:
         run: cargo +1.86.0 publish --manifest-path rust/Cargo.toml --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-auth.outputs.token }}
+
+  # Builds the Rust CLI as a single native binary for every supported
+  # platform. This is the project's answer for "run the CLI
+  # without installing Node, Python, or Rust" and feeds the GitHub Release
+  # created by tag-and-release below. This is gated on the GitHub Release,
+  # not on registry publication: it can backfill a release for a version
+  # already live on every registry without rebuilding all five binaries on
+  # every later docs or dependency-only push to master.
+  build-binaries:
+    name: Build binary (${{ matrix.target }})
+    if: |
+      github.repository == 'GagaKor/rtsp-backchannel' && github.ref == 'refs/heads/master' &&
+      needs.check-versions.outputs.github-release-assets-needed == 'true'
+    needs: [check-versions, pin-release-tag]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Pin every matrix leg to the one commit resolved before the builds
+          # start. A mutable tag name must never yield mixed-version assets.
+          ref: ${{ needs.check-versions.outputs.release-commit }}
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.86.0 --profile minimal
+
+      # Every target runs on a matching native architecture, so this only
+      # registers its standard library — no cross compiler or emulator is
+      # involved.
+      - name: Add build target
+        run: rustup target add ${{ matrix.target }} --toolchain 1.86.0
+
+      - name: Build release binary
+        run: cargo +1.86.0 build --release --locked --manifest-path rust/Cargo.toml --target ${{ matrix.target }}
+
+      - name: Stage binary for upload
+        id: stage
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="${{ needs.check-versions.outputs.npm-version }}"
+          target="${{ matrix.target }}"
+          src="rust/target/${target}/release/rtsp-backchannel"
+          name="rtsp-backchannel-${version}-${target}"
+
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            src="${src}.exe"
+            name="${name}.exe"
+          fi
+
+          mkdir -p dist
+          cp "$src" "dist/${name}"
+          echo "artifact-name=${name}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.stage.outputs.artifact-name }}
+          path: dist/${{ steps.stage.outputs.artifact-name }}
+          if-no-files-found: error
+
+  # Backfills and maintains GitHub Releases after pin-release-tag has durably
+  # selected the source used by every registry and binary job. Release and
+  # asset state are tracked separately so a retry can finish a prior partial
+  # run. All three packages are already at 0.3.0 with neither tag nor release,
+  # so the first run after this merges publishes nothing to registries but
+  # still creates v0.3.0 and its GitHub Release.
+  # Blocked only by an actual failure upstream: skipped publish jobs mean
+  # "nothing to publish" and are safe, while a failure prevents a release.
+  tag-and-release:
+    name: Publish GitHub Release
+    needs: [check-versions, pin-release-tag, publish-npm, publish-pypi, publish-crates, build-binaries]
+    if: |
+      github.repository == 'GagaKor/rtsp-backchannel' && github.ref == 'refs/heads/master' &&
+      !cancelled() && !contains(needs.*.result, 'failure') &&
+      needs.check-versions.outputs.github-release-needed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Use the same immutable commit SHA as every binary build.
+          ref: ${{ needs.check-versions.outputs.release-commit }}
+
+      # Keep a Changelog sections start with "## [<version>] - <date>" and
+      # run until the next "## " heading. Match on the version rather than
+      # the date since the date isn't known here, and stop at the first
+      # following "## [" line so this can never bleed into [Unreleased]
+      # above it or the next dated section below it. The early version gate
+      # requires exactly one matching dated section; an empty extraction is
+      # therefore a release-blocking integrity failure, never generic notes.
+      - name: Extract changelog section for this version
+        if: needs.check-versions.outputs.github-release-needed == 'true'
+        id: notes
+        run: |
+          set -euo pipefail
+
+          version="${{ needs.check-versions.outputs.npm-version }}"
+          release_commit="${{ needs.check-versions.outputs.release-commit }}"
+          notes_file="${RUNNER_TEMP}/release-notes.md"
+
+          awk -v ver="$version" '
+            /^## \[/ {
+              if (in_section) exit
+              if (index($0, "## [" ver "] - ") == 1) { in_section = 1 }
+            }
+            in_section { print }
+          ' CHANGELOG.md > "$notes_file"
+
+          if [ ! -s "$notes_file" ]; then
+            echo "No dated CHANGELOG.md section found for ${version}." >&2
+            exit 1
+          fi
+
+          # Hidden provenance binds the release assets to the exact commit
+          # shared by every registry and native binary build.
+          printf '\n<!-- rtsp-backchannel-release-commit: %s -->\n' \
+            "$release_commit" >> "$notes_file"
+
+          echo "notes-file=${notes_file}" >> "$GITHUB_OUTPUT"
+
+      - name: Download built binaries
+        if: needs.check-versions.outputs.github-release-assets-needed == 'true'
+        uses: actions/download-artifact@v8
+        with:
+          path: dist-binaries
+
+      - name: Create or repair GitHub Release
+        if: needs.check-versions.outputs.github-release-needed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          tag="${{ needs.check-versions.outputs.release-tag }}"
+          version="${{ needs.check-versions.outputs.npm-version }}"
+          release_commit="${{ needs.check-versions.outputs.release-commit }}"
+          asset_repair_requested="${{ needs.check-versions.outputs.github-release-assets-needed }}"
+          provenance_marker="<!-- rtsp-backchannel-release-commit: ${release_commit} -->"
+          expected_assets=(
+            "rtsp-backchannel-${version}-x86_64-unknown-linux-gnu"
+            "rtsp-backchannel-${version}-aarch64-unknown-linux-gnu"
+            "rtsp-backchannel-${version}-aarch64-apple-darwin"
+            "rtsp-backchannel-${version}-x86_64-apple-darwin"
+            "rtsp-backchannel-${version}-x86_64-pc-windows-msvc.exe"
+          )
+
+          verify_remote_tag_commit() {
+            git fetch --force --depth=1 origin "refs/tags/${tag}:refs/tags/${tag}"
+            tag_commit=$(git rev-list -n 1 "$tag")
+            if [ "$tag_commit" != "$release_commit" ]; then
+              echo "Release tag ${tag} moved from ${release_commit} to ${tag_commit}." >&2
+              exit 1
+            fi
+          }
+
+          fetch_release() {
+            gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" |
+              jq --arg tag "$tag" \
+                '[.[] | select(.tag_name == $tag)] |
+                 if length == 1 then .[0]
+                 elif length == 0 then empty
+                 else error("multiple releases found for tag")
+                 end'
+          }
+
+          release_json=$(mktemp)
+          verify_remote_tag_commit
+          fetch_release > "$release_json"
+
+          if [ ! -s "$release_json" ]; then
+            if [ "$asset_repair_requested" != true ]; then
+              echo "The Release disappeared after the state check; rerun to rebuild its assets." >&2
+              exit 1
+            fi
+
+            # Keep the release as a draft until every asset has been verified.
+            # A failed upload therefore never exposes a partial public release.
+            gh release create "$tag" \
+              --draft \
+              --verify-tag \
+              --title "rtsp-backchannel ${version}" \
+              --notes-file "${{ steps.notes.outputs.notes-file }}"
+          else
+            live_asset_repair=false
+            actual_body=$(jq -r '.body // ""' "$release_json")
+
+            if [ "$(jq -r '.draft' "$release_json")" = true ] || \
+               ! printf '%s\n' "$actual_body" | grep -Fxq "$provenance_marker"; then
+              live_asset_repair=true
+            fi
+
+            for asset in "${expected_assets[@]}"; do
+              if ! jq -e --arg asset "$asset" \
+                'any(.assets[]?; .name == $asset and .state == "uploaded" and .size > 0)' \
+                "$release_json" >/dev/null; then
+                live_asset_repair=true
+              fi
+            done
+
+            if [ "$live_asset_repair" = true ] && \
+               [ "$asset_repair_requested" != true ]; then
+              echo "Release assets changed after the state check; rerun to rebuild them." >&2
+              exit 1
+            fi
+
+            if [ "$asset_repair_requested" = true ]; then
+              if [ "$(jq -r '.immutable // false' "$release_json")" = true ]; then
+                echo "GitHub Release ${tag} became immutable before asset repair." >&2
+                exit 1
+              fi
+
+              # Hide a published mutable Release before replacing assets so a
+              # failed clobber never leaves a partially repaired public page.
+              gh release edit "$tag" \
+                --draft \
+                --title "rtsp-backchannel ${version}" \
+                --notes-file "${{ steps.notes.outputs.notes-file }}"
+            else
+              gh release edit "$tag" \
+                --title "rtsp-backchannel ${version}" \
+                --notes-file "${{ steps.notes.outputs.notes-file }}"
+            fi
+          fi
+
+          fetch_release > "$release_json"
+
+          # When any asset is suspect, rebuild and replace the complete set.
+          # Name/state/size alone cannot prove that an older valid-looking file
+          # came from the currently pinned release commit.
+          if [ "$asset_repair_requested" = true ]; then
+            for asset in "${expected_assets[@]}"; do
+              path="dist-binaries/${asset}/${asset}"
+              if [ ! -s "$path" ]; then
+                echo "Missing or empty workflow artifact: ${path}" >&2
+                exit 1
+              fi
+              gh release upload "$tag" "$path" --clobber
+            done
+          fi
+
+          fetch_release > "$release_json"
+
+          for asset in "${expected_assets[@]}"; do
+            jq -e --arg asset "$asset" \
+              'any(.assets[]?; .name == $asset and .state == "uploaded" and .size > 0)' \
+              "$release_json" >/dev/null || {
+                echo "GitHub Release asset verification failed: ${asset}" >&2
+                exit 1
+              }
+          done
+
+          expected_body=$(cat "${{ steps.notes.outputs.notes-file }}")
+          if [ "$(jq -r '.name // ""' "$release_json")" != "rtsp-backchannel ${version}" ] || \
+             [ "$(jq -r '.body // ""' "$release_json")" != "$expected_body" ]; then
+            echo "GitHub Release metadata verification failed." >&2
+            exit 1
+          fi
+
+          # Refuse to publish if the tag moved while assets were uploading.
+          verify_remote_tag_commit
+
+          if [ "$(jq -r '.immutable // false' "$release_json")" = true ]; then
+            # Published immutable Releases permit title/notes edits only. The
+            # state gate already rejected locked asset/publication changes.
+            if [ "$(jq -r '.draft' "$release_json")" = true ] || \
+               [ "$(jq -r '.prerelease' "$release_json")" = true ]; then
+              echo "Immutable GitHub Release has invalid publication state." >&2
+              exit 1
+            fi
+          else
+            gh release edit "$tag" \
+              --draft=false \
+              --latest \
+              --prerelease=false \
+              --title "rtsp-backchannel ${version}" \
+              --notes-file "${{ steps.notes.outputs.notes-file }}"
+          fi
+
+          # Verify the public result rather than assuming the edit succeeded.
+          fetch_release > "$release_json"
+          if [ "$(jq -r '.draft' "$release_json")" = true ] || \
+             [ "$(jq -r '.prerelease' "$release_json")" = true ] || \
+             [ "$(jq -r '.name // ""' "$release_json")" != "rtsp-backchannel ${version}" ] || \
+             [ "$(jq -r '.body // ""' "$release_json")" != "$expected_body" ]; then
+            echo "Published GitHub Release verification failed." >&2
+            exit 1
+          fi
+
+          for asset in "${expected_assets[@]}"; do
+            jq -e --arg asset "$asset" \
+              'any(.assets[]?; .name == $asset and .state == "uploaded" and .size > 0)' \
+              "$release_json" >/dev/null || {
+                echo "Published GitHub Release asset verification failed: ${asset}" >&2
+                exit 1
+              }
+          done
+
+          latest_release_tag=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/releases/latest" --jq '.tag_name')
+          if [ "$latest_release_tag" != "$tag" ]; then
+            echo "Published GitHub Release ${tag} is not Latest." >&2
+            exit 1
+          fi
