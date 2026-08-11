@@ -9,17 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Automated version tags and GitHub Releases with native Rust CLI binaries for
+  Linux (x64 and ARM64), macOS (Apple Silicon and Intel), and Windows (x64),
+  plus live release and package-version badges in every README.
+
+## [0.3.0] - 2026-08-11
+
+### Added
+
 - Experimental ONVIF PTZ movement control in all three packages:
   `openPtzSession` / `open_ptz_session` for continuous, absolute, and relative
   moves plus stop and status. Every continuous move carries a device-side
   timeout so a stopped client cannot leave a camera moving, and operations the
   camera does not advertise are rejected before a request is sent. Physical
   movement is unverified against real PTZ hardware.
-
-## [0.3.0] - 2026-08-10
-
-### Added
-
 - Equivalent TypeScript, Python, and Rust APIs plus a `capabilities` command for
   read-only ONVIF camera capability reports covering device identity, scopes,
   declared profiles, services, media profiles, PTZ, and Media2/H.265 evidence.

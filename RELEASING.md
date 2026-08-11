@@ -16,25 +16,37 @@ job runs its language's full test suite first and authenticates to its
 registry with OIDC trusted publishing — no tokens are stored in the
 repository or its secrets.
 
+Before publishing, the workflow verifies that all five versioned manifest and
+lock files agree. It then tags the commit and creates a GitHub Release when the
+version has no release yet, attaching single-file Rust CLI binaries for Linux
+(x64 and ARM64), macOS (Apple Silicon and Intel), and Windows (x64). This runs
+independently of whether any package actually published, so it also backfills
+a release for a version that is already live on every registry but was never
+tagged. Tag and release state are checked separately: if a run pushes the tag
+but fails while creating the release, a retry rebuilds the assets and finishes
+the missing release. Once both exist, routine master pushes skip the binary
+builds. Tagging and releasing use the automatic `GITHUB_TOKEN`; no additional
+secret is involved.
+
 To ship a release:
 
 1. Do step 1 below ("Prepare the release") to bump the versions and update
    the version references that live outside the manifests.
 2. Merge that change to `master`.
 3. The workflow runs automatically and publishes whichever packages changed
-   version. Watch the run in the Actions tab; each registry's publish job
-   is skipped (not failed) for a package whose version didn't change.
+   version, then tags the commit and creates the GitHub Release. Watch the
+   run in the Actions tab; each registry's publish job is skipped (not
+   failed) for a package whose version didn't change.
 
 You can also trigger a run manually from the Actions tab
 (`workflow_dispatch`) if you need to retry a publish without pushing a new
 commit — it applies the same per-package version check.
 
-**One-time setup:** the workflow runs its publish jobs in a GitHub Actions
-environment named `release`. That environment does not exist yet and must be
-created in the repository's Settings → Environments before the workflow can
-publish anything (the registries' Trusted Publisher configuration is already
-set up to expect a run from that environment). No secrets need to be added
-to it — OIDC trusted publishing requires none.
+**Repository setup:** the workflow runs its publish jobs in the existing
+GitHub Actions environment named `release`. Keep that environment and the
+registries' Trusted Publisher configuration pointed at `release.yml` and the
+`release` environment. No secrets need to be added to it — OIDC trusted
+publishing requires none.
 
 The manual process below remains the fallback if the workflow can't run, and
 is also the process for the very first publish to each registry (creating a
@@ -63,8 +75,9 @@ for this repository) and for authenticating locally.
    update the link references at the bottom of the file.
 4. Merge the version change to `master` and work from a clean checkout of that
    commit.
-5. Confirm that `npm whoami`, PyPI authentication, and a crates.io API token
-   are available before creating the tag.
+5. For the manual fallback only, confirm that `npm whoami`, PyPI
+   authentication, and a crates.io API token are available before creating
+   the tag.
 
 ## 2. Verify source and artifacts
 
@@ -93,6 +106,11 @@ binary, credentials, media files, packet captures, or build caches.
 
 ## 3. Tag the verified commit
 
+This step and step 5 are now the fallback: the automated workflow above
+already tags the commit and creates the GitHub Release for you once it
+publishes to master. Only do this by hand if the workflow can't run, or to
+tag a commit outside that path.
+
 Replace `0.1.0` with the version being released:
 
 ```bash
@@ -116,10 +134,10 @@ python3 -m twine upload python/dist/*
 cargo publish --manifest-path rust/Cargo.toml --locked
 ```
 
-After the initial npm and PyPI projects exist, configure their trusted
-publisher settings for this GitHub repository before automating subsequent
-releases. Store a crates.io token as a GitHub Actions secret if crates.io
-publishing is later automated.
+After the initial projects exist, configure npm, PyPI, and crates.io trusted
+publishing for this GitHub repository before automating subsequent releases.
+The automated workflow exchanges GitHub OIDC identity for short-lived
+credentials and does not store a registry token as an Actions secret.
 
 ## 5. Create the GitHub release
 

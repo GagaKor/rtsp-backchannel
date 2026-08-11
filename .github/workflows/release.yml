@@ -44,6 +44,9 @@ jobs:
       pypi-publish: ${{ steps.gate.outputs.pypi-publish }}
       crates-version: ${{ steps.gate.outputs.crates-version }}
       crates-publish: ${{ steps.gate.outputs.crates-publish }}
+      release-tag: ${{ steps.release-state.outputs.tag }}
+      release-tag-exists: ${{ steps.release-state.outputs.tag-exists }}
+      github-release-needed: ${{ steps.release-state.outputs.release-needed }}
     steps:
       - uses: actions/checkout@v7
 
@@ -53,12 +56,33 @@ jobs:
           set -euo pipefail
 
           npm_manifest=$(jq -r '.version' package.json)
+          npm_lock=$(jq -r '.version' package-lock.json)
+          npm_package_lock=$(jq -r '.packages[""].version' package-lock.json)
           pypi_manifest=$(grep -m1 '^version' python/pyproject.toml | sed -E 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')
           crates_manifest=$(grep -m1 '^version' rust/Cargo.toml | sed -E 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')
+          crates_lock=$(awk '
+            $0 == "name = \"rtsp-backchannel\"" { found = 1; next }
+            found && /^version = / {
+              gsub(/^version = \"|\"$/, "")
+              print
+              exit
+            }
+          ' rust/Cargo.lock)
 
           echo "npm manifest version: $npm_manifest"
+          echo "npm lock versions: $npm_lock, $npm_package_lock"
           echo "pypi manifest version: $pypi_manifest"
           echo "crates manifest version: $crates_manifest"
+          echo "crates lock version: $crates_lock"
+
+          if [ "$npm_manifest" != "$npm_lock" ] || \
+             [ "$npm_manifest" != "$npm_package_lock" ] || \
+             [ "$npm_manifest" != "$pypi_manifest" ] || \
+             [ "$npm_manifest" != "$crates_manifest" ] || \
+             [ "$npm_manifest" != "$crates_lock" ]; then
+            echo "Release versions must match in all five manifests and lock files." >&2
+            exit 1
+          fi
 
           # Prints "<body>\n<http_status>" so the status can be split off
           # without a second request.
@@ -119,6 +143,52 @@ jobs:
             echo "pypi-publish=$pypi_publish"
             echo "crates-version=$crates_manifest"
             echo "crates-publish=$crates_publish"
+          } >> "$GITHUB_OUTPUT"
+
+      # This gate prevents routine master pushes from rebuilding five native
+      # binaries after the current version already has a GitHub Release. Tag
+      # and release state are separate: a previous run may have pushed the tag
+      # and then failed while creating the release, in which case a retry must
+      # rebuild the assets and finish the missing release.
+      - name: Check GitHub tag and release state
+        id: release-state
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          version="${{ steps.gate.outputs.npm-version }}"
+          tag="v${version}"
+
+          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null; then
+            tag_exists=true
+          else
+            tag_exists=false
+          fi
+
+          release_status=$(curl -sS -o "$RUNNER_TEMP/github-release.json" -w '%{http_code}' \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${tag}")
+
+          case "$release_status" in
+            200) release_needed=false ;;
+            404) release_needed=true ;;
+            *)
+              echo "GitHub release query failed with HTTP ${release_status}" >&2
+              cat "$RUNNER_TEMP/github-release.json" >&2
+              exit 1
+              ;;
+          esac
+
+          echo "release tag: ${tag} (exists: ${tag_exists})"
+          echo "GitHub Release needed: ${release_needed}"
+
+          {
+            echo "tag=${tag}"
+            echo "tag-exists=${tag_exists}"
+            echo "release-needed=${release_needed}"
           } >> "$GITHUB_OUTPUT"
 
   publish-npm:
@@ -219,3 +289,161 @@ jobs:
         run: cargo +1.86.0 publish --manifest-path rust/Cargo.toml --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-auth.outputs.token }}
+
+  # Builds the Rust CLI as a single native binary for every supported
+  # platform. This is the project's answer for "run the CLI
+  # without installing Node, Python, or Rust" and feeds the GitHub Release
+  # created by tag-and-release below. This is gated on the GitHub Release,
+  # not on registry publication: it can backfill a release for a version
+  # already live on every registry without rebuilding all five binaries on
+  # every later docs or dependency-only push to master.
+  build-binaries:
+    name: Build binary (${{ matrix.target }})
+    if: |
+      github.repository == 'GagaKor/rtsp-backchannel' && github.ref == 'refs/heads/master' &&
+      needs.check-versions.outputs.github-release-needed == 'true'
+    needs: check-versions
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.86.0 --profile minimal
+
+      # Every target runs on a matching native architecture, so this only
+      # registers its standard library — no cross compiler or emulator is
+      # involved.
+      - name: Add build target
+        run: rustup target add ${{ matrix.target }} --toolchain 1.86.0
+
+      - name: Build release binary
+        run: cargo +1.86.0 build --release --locked --manifest-path rust/Cargo.toml --target ${{ matrix.target }}
+
+      - name: Stage binary for upload
+        id: stage
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="${{ needs.check-versions.outputs.npm-version }}"
+          target="${{ matrix.target }}"
+          src="rust/target/${target}/release/rtsp-backchannel"
+          name="rtsp-backchannel-${version}-${target}"
+
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            src="${src}.exe"
+            name="${name}.exe"
+          fi
+
+          mkdir -p dist
+          cp "$src" "dist/${name}"
+          echo "artifact-name=${name}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.stage.outputs.artifact-name }}
+          path: dist/${{ steps.stage.outputs.artifact-name }}
+          if-no-files-found: error
+
+  # Backfills and maintains git tags / GitHub Releases, which the registry
+  # publishes above never created on their own. Tag and release existence
+  # are tracked separately so a retry can finish a release after a prior run
+  # pushed the tag but failed before uploading assets. All three packages are
+  # already at 0.3.0 with neither tag nor release, so the first run after this
+  # merges publishes nothing but still creates v0.3.0 and its release.
+  # Blocked only by an actual failure upstream: skipped publish jobs mean
+  # "nothing to publish" and are safe, while a failure prevents a release.
+  tag-and-release:
+    name: Tag release and publish GitHub Release
+    needs: [check-versions, publish-npm, publish-pypi, publish-crates, build-binaries]
+    if: |
+      github.repository == 'GagaKor/rtsp-backchannel' && github.ref == 'refs/heads/master' &&
+      !cancelled() && !contains(needs.*.result, 'failure') &&
+      (needs.check-versions.outputs.release-tag-exists != 'true' ||
+       needs.check-versions.outputs.github-release-needed == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Create and push the release tag
+        if: needs.check-versions.outputs.release-tag-exists != 'true'
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ needs.check-versions.outputs.release-tag }}" -m "rtsp-backchannel ${{ needs.check-versions.outputs.npm-version }}"
+          git push origin "${{ needs.check-versions.outputs.release-tag }}"
+
+      # Keep a Changelog sections start with "## [<version>] - <date>" and
+      # run until the next "## " heading. Match on the version rather than
+      # the date since the date isn't known here, and stop at the first
+      # following "## [" line so this can never bleed into [Unreleased]
+      # above it or the next dated section below it. A version with no
+      # section (this method is best-effort, not release-blocking) falls
+      # back to a short generated note instead of failing the job.
+      - name: Extract changelog section for this version
+        if: needs.check-versions.outputs.github-release-needed == 'true'
+        id: notes
+        run: |
+          set -euo pipefail
+
+          version="${{ needs.check-versions.outputs.npm-version }}"
+          notes_file="${RUNNER_TEMP}/release-notes.md"
+
+          awk -v ver="$version" '
+            /^## \[/ {
+              if (in_section) exit
+              esc = ver
+              gsub(/\./, "\\.", esc)
+              if ($0 ~ ("^## \\[" esc "\\]")) { in_section = 1 }
+            }
+            in_section { print }
+          ' CHANGELOG.md > "$notes_file"
+
+          if [ ! -s "$notes_file" ]; then
+            {
+              echo "rtsp-backchannel ${version}"
+              echo ""
+              echo "No changelog section found for this version."
+            } > "$notes_file"
+          fi
+
+          echo "notes-file=${notes_file}" >> "$GITHUB_OUTPUT"
+
+      - name: Download built binaries
+        if: needs.check-versions.outputs.github-release-needed == 'true'
+        uses: actions/download-artifact@v8
+        with:
+          path: dist-binaries
+
+      - name: Create GitHub Release
+        if: needs.check-versions.outputs.github-release-needed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          gh release create "${{ needs.check-versions.outputs.release-tag }}" \
+            --verify-tag \
+            --title "rtsp-backchannel ${{ needs.check-versions.outputs.npm-version }}" \
+            --notes-file "${{ steps.notes.outputs.notes-file }}" \
+            dist-binaries/*/*
