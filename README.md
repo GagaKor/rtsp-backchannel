@@ -407,6 +407,16 @@ quantities are `-1.0`..`1.0`; an absolute zoom *position* is `0.0`..`1.0`.
 marking the session closed, so a caller does not have to remember to stop
 movement on the way out.
 
+Every `continuousMove` call carries a device-side timeout, defaulting to
+1000 ms, that is sent to the camera as part of the request. The camera is
+responsible for halting the movement itself once that timeout elapses, so a
+single call moves the camera for only about a second; a caller that wants
+continuous motion must keep re-issuing `continuousMove` before the previous
+timeout runs out. `defaultMoveTimeoutMs` controls this default (a per-call
+`timeoutMs` overrides it for one call). This is a deliberate safety
+property: the camera stops on its own, so a crashed or disconnected client
+can never leave it moving indefinitely.
+
 Supply passwords through `ONVIF_PASSWORD` rather than source code:
 
 ```typescript

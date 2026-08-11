@@ -354,6 +354,17 @@ Pan/tilt 값과 대부분의 zoom 값은 `-1.0`~`1.0`이며, 절대 zoom *위치
 zoom 모두에 대해 best-effort로 `stop()`을 호출하므로, 호출자가 종료 시점에
 movement 정지를 따로 챙기지 않아도 됩니다.
 
+모든 `continuous_move` 호출에는 카메라로 전달되는 device-side timeout이
+포함되며, 기본값은 1000ms입니다. 카메라는 이 timeout이 지나면 스스로
+움직임을 멈추므로, 한 번의 호출로는 카메라가 약 1초 동안만 움직입니다.
+계속 움직이게 하려면 호출자가 이전 timeout이 끝나기 전에
+`continuous_move`를 다시 호출해야 합니다. 이 기본값은
+`PtzSessionOptions::default_move_timeout_ms`로 제어하며,
+`continuous_move`의 `timeout_ms` 인자로 호출마다 재정의할 수 있습니다. 이는
+의도된 안전장치입니다. 클라이언트가 멈추라고 지시하지 않아도 카메라가
+스스로 정지하므로, 클라이언트가 비정상 종료되거나 연결이 끊겨도 카메라가
+계속 움직이는 상태로 남지 않습니다.
+
 ```rust
 use rtsp_backchannel::onvif::{PtzSessionOptions, PtzVector, open_ptz_session};
 
@@ -364,10 +375,16 @@ options.device_urls = vec![
 ];
 let mut session = open_ptz_session(&options)?;
 
-session.continuous_move(Some(PtzVector { x: 0.5, y: 0.0 }), None, Some(2000.0))?;
-let status = session.get_status()?;
-println!("{:?} {:?}", status.pan_tilt, status.zoom);
+// close()는 오류가 발생한 경로에서도 실행됩니다. close()로 카메라 정지를
+// 보장하려는 호출자가 중간 호출 실패 때문에 이를 건너뛰면 안 되기 때문입니다.
+let result = (|| -> Result<(), String> {
+    session.continuous_move(Some(PtzVector { x: 0.5, y: 0.0 }), None, Some(2000.0))?;
+    let status = session.get_status()?;
+    println!("{:?} {:?}", status.pan_tilt, status.zoom);
+    Ok(())
+})();
 session.close();
+result?;
 # Ok::<(), String>(())
 ```
 

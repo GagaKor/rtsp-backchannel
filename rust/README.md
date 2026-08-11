@@ -362,6 +362,16 @@ zoom quantities are `-1.0`..`1.0`; an absolute zoom *position* is
 and zoom before marking the session closed, so a caller does not have to
 remember to stop movement on the way out.
 
+Every `continuous_move` call carries a device-side timeout, defaulting to
+1000 ms, that is sent to the camera as part of the request. The camera is
+responsible for halting the movement itself once that timeout elapses, so a
+single call moves the camera for only about a second; a caller that wants
+continuous motion must keep re-issuing `continuous_move` before the previous
+timeout runs out. `PtzSessionOptions::default_move_timeout_ms` controls this
+default (the `timeout_ms` argument to `continuous_move` overrides it for one
+call). This is a deliberate safety property: the camera stops on its own,
+so a crashed or disconnected client can never leave it moving indefinitely.
+
 ```rust
 use rtsp_backchannel::onvif::{PtzSessionOptions, PtzVector, open_ptz_session};
 
@@ -372,10 +382,17 @@ options.device_urls = vec![
 ];
 let mut session = open_ptz_session(&options)?;
 
-session.continuous_move(Some(PtzVector { x: 0.5, y: 0.0 }), None, Some(2000.0))?;
-let status = session.get_status()?;
-println!("{:?} {:?}", status.pan_tilt, status.zoom);
+// `close()` runs on the error path too (not just after a successful move),
+// since a caller relying on `close()` to stop the camera must not skip it
+// just because a call in between failed.
+let result = (|| -> Result<(), String> {
+    session.continuous_move(Some(PtzVector { x: 0.5, y: 0.0 }), None, Some(2000.0))?;
+    let status = session.get_status()?;
+    println!("{:?} {:?}", status.pan_tilt, status.zoom);
+    Ok(())
+})();
 session.close();
+result?;
 # Ok::<(), String>(())
 ```
 
