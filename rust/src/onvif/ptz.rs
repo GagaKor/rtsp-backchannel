@@ -3,9 +3,9 @@
 //! A session opens once (connect -> GetServices -> GetNodes -> resolve the
 //! profile token), caches the node's supported spaces, and rejects any
 //! operation the camera did not advertise before building a request.
-//! Control reuses the same authenticated transport
-//! [`super::OnvifDevice::soap_response`] the read-only capability report
-//! uses; it is a different SOAP body on the existing pipe, not a new one.
+//! Control reuses the same authenticated transport (`OnvifDevice`'s private
+//! `soap_response`) the read-only capability report uses; it is a different
+//! SOAP body on the existing pipe, not a new one.
 //!
 //! This module intentionally does not import `super::capabilities` (and vice
 //! versa) so the two stay independent; shared value types live in
