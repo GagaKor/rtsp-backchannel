@@ -31,7 +31,7 @@ FFmpeg가 필요하며 GStreamer는 사용하지 않습니다.
 npm install rtsp-backchannel
 ```
 
-현재 릴리스 계열은 `0.3`입니다.
+현재 릴리스 계열에 고정하려면 다음 명령을 사용합니다.
 
 ```bash
 npm install rtsp-backchannel@^0.3

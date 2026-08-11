@@ -31,7 +31,7 @@ Discovery and stream URI lookup do not require FFmpeg.
 npm install rtsp-backchannel
 ```
 
-The current release line is `0.2`:
+To pin the current release line:
 
 ```bash
 npm install rtsp-backchannel@^0.3

@@ -51,10 +51,14 @@ for this repository) and for authenticating locally.
 2. Update the version references that live outside the manifests, or the test
    suite will fail: the install pins in all six READMEs
    (`rtsp-backchannel@^X.Y` for npm, `'rtsp-backchannel>=X.Y,<X.Z'` for pip,
-   `rtsp-backchannel = "X.Y"` for Cargo), the release-series sentence in
-   `README.ko.md`, and the asserted version in
+   `rtsp-backchannel = "X.Y"` for Cargo) and the asserted version in
    `python/test_library_api.py::test_declares_installable_wheel_metadata`.
    `git grep` for the outgoing version to catch any others.
+
+   The version now appears exactly once per README, inside the install
+   command. It used to also appear in the surrounding prose, which is how
+   `README.md` shipped 0.3.0 still claiming the release line was `0.2` — the
+   prose and the command drifted apart. Keep it stated once.
 3. Move the pending entries in `CHANGELOG.md` to a dated release section and
    update the link references at the bottom of the file.
 4. Merge the version change to `master` and work from a clean checkout of that
