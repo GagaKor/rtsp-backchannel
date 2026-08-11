@@ -32,12 +32,21 @@ const PTZ_NS: &str = "http://www.onvif.org/ver20/ptz/wsdl";
 const MAX_XML_ELEMENT_DEPTH: usize = 64;
 
 const DEFAULT_MOVE_TIMEOUT_MS: f64 = 1000.0;
+// A caller-supplied move timeout above this is rejected outright: combined
+// with close()'s best-effort stop() (see PtzSession::close's doc comment),
+// an unbounded timeout would let a single continuous_move keep a camera
+// moving for as long as the caller likes, with no ceiling on how long the
+// device-side stop-on-close backstop takes to kick in.
+const MAX_MOVE_TIMEOUT_MS: f64 = 60_000.0;
 const PAN_TILT_RANGE: (f64, f64) = (-1.0, 1.0);
 /// Every zoom quantity is -1.0..1.0 except an absolute zoom *position*,
 /// which is 0.0..1.0.
 const ZOOM_GENERIC_RANGE: (f64, f64) = (-1.0, 1.0);
 const ZOOM_POSITION_RANGE: (f64, f64) = (0.0, 1.0);
 
+// Plain form, unlike capabilities.rs's IncludeCapability=true: this session
+// only needs the XAddr list, and capabilities would inflate the response
+// against the shared 1MB body cap for data this module discards.
 const GET_SERVICES: &str = "<GetServices xmlns=\"http://www.onvif.org/ver10/device/wsdl\"/>";
 const GET_NODES: &str = "<GetNodes xmlns=\"http://www.onvif.org/ver20/ptz/wsdl\"/>";
 const MEDIA1_GET_PROFILES: &str = "<GetProfiles xmlns=\"http://www.onvif.org/ver10/media/wsdl\"/>";
@@ -131,6 +140,12 @@ pub struct PtzStatus {
 // XML parsing infrastructure (own copy; see module docs)
 // ---------------------------------------------------------------------
 
+// This DTD/XML-depth guard (has_forbidden_declaration, xml_element_depth,
+// and parse_document below) is duplicated verbatim from capabilities.rs,
+// which this module cannot import (the two must stay independent). If you
+// harden this copy, check capabilities.rs's copy too. The tests at the
+// bottom of this file's own test module (DOCTYPE/ENTITY rejection and the
+// 64/65-element depth limit) exist so drift between the two fails a test.
 fn starts_with_ascii_case_insensitive(input: &[u8], prefix: &[u8]) -> bool {
     input.len() >= prefix.len() && input[..prefix.len()].eq_ignore_ascii_case(prefix)
 }
@@ -454,7 +469,11 @@ fn parsed_operation_response<T>(
     operation: &str,
     extract: impl FnOnce(roxmltree::Node<'_, '_>) -> T,
 ) -> Result<T, String> {
-    let document = parse_document(xml)?;
+    // Re-labeled, not propagated raw: `parse_document`'s own message never
+    // names an operation, so a caller who sees it has no way to tell which
+    // request failed. Mirrors ts/ptz.ts's and python/ptz.py's `operationResponse`,
+    // which both catch the parse failure and re-throw with the operation name.
+    let document = parse_document(xml).map_err(|_| format!("invalid {operation} response"))?;
     let response = operation_response(&document, namespace, response_name, operation)?;
     Ok(extract(response))
 }
@@ -478,6 +497,9 @@ fn format_ptz_number(value: f64) -> Result<String, String> {
 fn format_ptz_duration(milliseconds: f64) -> Result<String, String> {
     if !milliseconds.is_finite() || milliseconds <= 0.0 {
         return Err("PTZ timeout must be finite and greater than 0".to_owned());
+    }
+    if milliseconds > MAX_MOVE_TIMEOUT_MS {
+        return Err("PTZ timeout must not exceed 60000 ms".to_owned());
     }
     Ok(format!("PT{:.3}S", milliseconds / 1000.0))
 }
@@ -873,8 +895,17 @@ impl PtzSession {
         )
     }
 
-    /// Stop both axes and mark the session closed. A failing Stop is
-    /// swallowed: it must never mask a caller's in-flight error.
+    /// Stop both axes, then mark the session closed either way.
+    ///
+    /// A failing Stop is swallowed - it must never replace an error the
+    /// caller is already handling - but `close()` still becomes terminal:
+    /// every later call, including `stop()`, returns `Err("PTZ session is
+    /// closed")`. If that swallowed Stop failed mid-move (a network blip,
+    /// say), this session offers no further way to halt the camera. The
+    /// backstop is the camera itself: its move timeout
+    /// (`default_move_timeout_ms` / a move's own `timeout_ms`, both capped
+    /// at 60000 ms) always elapses on its own, so the camera stops moving
+    /// even though this session can no longer ask it to.
     pub fn close(&mut self) {
         if self.closed {
             return;
@@ -968,6 +999,10 @@ pub fn open_ptz_session(options: &PtzSessionOptions) -> Result<PtzSession, Strin
         }
     };
 
+    // Bounded at open, not deferred to the first move: an unbounded default
+    // would otherwise pass silently until a caller's first continuous_move.
+    format_ptz_duration(options.default_move_timeout_ms)?;
+
     Ok(PtzSession {
         device,
         ptz_xaddr,
@@ -1017,6 +1052,17 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_ptz_duration_above_the_60000ms_ceiling_but_accepts_the_boundary() {
+        assert_eq!(format_ptz_duration(60_000.0).unwrap(), "PT60.000S");
+        for bad in [60_001.0, 600_000.0] {
+            assert_eq!(
+                format_ptz_duration(bad).unwrap_err(),
+                "PTZ timeout must not exceed 60000 ms"
+            );
+        }
+    }
+
+    #[test]
     fn debug_formatting_of_ptz_session_options_redacts_the_password() {
         let secret_password = "super-secret-camera-password";
         let options = PtzSessionOptions::new("camera", "operator", secret_password);
@@ -1025,6 +1071,50 @@ mod tests {
 
         assert!(formatted.contains(REDACTED_PASSWORD_PLACEHOLDER));
         assert!(!formatted.contains(secret_password));
+    }
+
+    // -----------------------------------------------------------------
+    // DTD guard (own copy; see the comment above has_forbidden_declaration)
+    // -----------------------------------------------------------------
+    //
+    // Ported from capabilities.rs's own test module
+    // (rejects_faults_wrong_operations_malformed_xml_and_dtds_without_payloads
+    // and accepts_64_nested_xml_elements_and_rejects_depth_65_deterministically)
+    // so that deleting the guard from this copy — or letting it drift from
+    // capabilities.rs's — fails a test here instead of leaving this file's
+    // whole suite green.
+
+    #[test]
+    fn rejects_doctype_and_entity_declarations_without_leaking_the_injected_payload() {
+        for xml in [
+            format!(
+                "<!DOCTYPE s:Envelope [<!ENTITY injected \"payload-secret\">]>{}",
+                soap("<tptz:GetStatusResponse>&injected;</tptz:GetStatusResponse>"),
+            ),
+            "<!ENTITY injected \"payload-secret\"><n/>".to_owned(),
+            "<!doctype n [<!entity injected \"payload-secret\">]><n/>".to_owned(),
+        ] {
+            let error = parse_document(&xml).unwrap_err();
+            assert_eq!(error, "invalid XML document");
+            assert!(!error.contains("payload-secret"));
+        }
+    }
+
+    #[test]
+    fn accepts_64_nested_xml_elements_and_rejects_depth_65_deterministically() {
+        let depth_64 = format!("{}{}", "<n>".repeat(64), "</n>".repeat(64));
+        let document = parse_document(&depth_64).expect("64 levels of nesting must be accepted");
+        assert_eq!(
+            document
+                .descendants()
+                .filter(roxmltree::Node::is_element)
+                .count(),
+            64
+        );
+
+        let depth_65 = format!("{}{}", "<n>".repeat(65), "</n>".repeat(65));
+        let error = parse_document(&depth_65).unwrap_err();
+        assert_eq!(error, "invalid XML document");
     }
 
     // -----------------------------------------------------------------
@@ -1402,6 +1492,24 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_default_move_timeout_ms_above_60000ms_at_session_open() {
+        let (server, mut options) = fake_camera(FakeCameraConfig::default());
+        options.default_move_timeout_ms = 600_000.0;
+
+        let error = open_ptz_session(&options).unwrap_err();
+        assert_eq!(error, "PTZ timeout must not exceed 60000 ms");
+        // Rejected at open, before any move: no ContinuousMove should have
+        // been sent, since the whole point is to fail even if the caller
+        // never calls continuous_move at all.
+        assert!(
+            server
+                .request_bodies()
+                .iter()
+                .all(|body| !body.starts_with("<ContinuousMove "))
+        );
+    }
+
+    #[test]
     fn fails_to_open_when_get_nodes_returns_no_node() {
         let (_server, options) =
             fake_camera(FakeCameraConfig::default().nodes_xml("<tptz:GetNodesResponse/>"));
@@ -1677,6 +1785,21 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_per_call_continuous_move_timeout_ms_above_60000ms() {
+        let (server, session) = open(FakeCameraConfig::default().with_spaces(PtzSpaces {
+            continuous_zoom: true,
+            ..PtzSpaces::default()
+        }));
+        let before = server.request_bodies().len();
+
+        let error = session
+            .continuous_move(None, Some(0.5), Some(600_000.0))
+            .unwrap_err();
+        assert_eq!(error, "PTZ timeout must not exceed 60000 ms");
+        assert_eq!(server.request_bodies().len(), before);
+    }
+
+    #[test]
     fn continuous_move_uses_the_session_level_default_timeout_in_the_body() {
         let (server, options) = fake_camera(FakeCameraConfig::default().with_spaces(PtzSpaces {
             continuous_zoom: true,
@@ -1931,6 +2054,24 @@ mod tests {
         assert_eq!(
             session.get_status().unwrap_err(),
             "SOAP Fault: ActionNotSupported"
+        );
+    }
+
+    #[test]
+    fn labels_an_unparseable_response_with_the_failing_operation_instead_of_a_generic_xml_error() {
+        // parse_document's own message never names an operation; a caller
+        // who only sees "invalid XML document" cannot tell GetStatus failed
+        // rather than, say, GetNodes. ts/ptz.ts and python/ptz.py already
+        // re-label this failure with the operation name; this pins the same
+        // behavior for rust so the three languages agree.
+        let (_server, session) = open(FakeCameraConfig::default().respond(|body| {
+            body.starts_with("<GetStatus ")
+                .then(|| (200, "not XML at all".to_owned()))
+        }));
+
+        assert_eq!(
+            session.get_status().unwrap_err(),
+            "invalid PTZ GetStatus response"
         );
     }
 

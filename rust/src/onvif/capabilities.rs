@@ -211,6 +211,11 @@ fn find_bytes(haystack: &[u8], needle: &[u8], start: usize) -> Option<usize> {
         .map(|offset| start + offset)
 }
 
+// This DTD/XML-depth guard (has_forbidden_declaration, xml_element_depth,
+// and parse_document below) is duplicated verbatim in ptz.rs, which cannot
+// import this module (the two must stay independent). If you harden this
+// copy, check ptz.rs's copy too — its own test module has matching
+// DOCTYPE/ENTITY-rejection and depth-limit tests.
 fn has_forbidden_declaration(xml: &str) -> bool {
     let bytes = xml.as_bytes();
     let mut index = 0;
