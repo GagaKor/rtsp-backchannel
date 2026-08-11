@@ -143,9 +143,13 @@ pub struct PtzStatus {
 // This DTD/XML-depth guard (has_forbidden_declaration, xml_element_depth,
 // and parse_document below) is duplicated verbatim from capabilities.rs,
 // which this module cannot import (the two must stay independent). If you
-// harden this copy, check capabilities.rs's copy too. The tests at the
-// bottom of this file's own test module (DOCTYPE/ENTITY rejection and the
-// 64/65-element depth limit) exist so drift between the two fails a test.
+// harden this copy, check capabilities.rs's copy too. has_forbidden_declaration
+// is tested directly in this file's own test module: roxmltree::Document::parse
+// independently rejects DOCTYPE/ENTITY declarations, so a test that only
+// exercises parse_document would keep passing even with this guard deleted.
+// The depth limit doesn't have that problem — roxmltree has no depth cap of
+// its own — so xml_element_depth's own test, which does go through
+// parse_document, is genuinely load-bearing.
 fn starts_with_ascii_case_insensitive(input: &[u8], prefix: &[u8]) -> bool {
     input.len() >= prefix.len() && input[..prefix.len()].eq_ignore_ascii_case(prefix)
 }
@@ -1077,12 +1081,35 @@ mod tests {
     // DTD guard (own copy; see the comment above has_forbidden_declaration)
     // -----------------------------------------------------------------
     //
-    // Ported from capabilities.rs's own test module
-    // (rejects_faults_wrong_operations_malformed_xml_and_dtds_without_payloads
-    // and accepts_64_nested_xml_elements_and_rejects_depth_65_deterministically)
-    // so that deleting the guard from this copy — or letting it drift from
-    // capabilities.rs's — fails a test here instead of leaving this file's
-    // whole suite green.
+    // has_forbidden_declaration is tested directly below, not only through
+    // parse_document: roxmltree::Document::parse independently rejects
+    // DOCTYPE/ENTITY declarations with its own errors (DtdDetected,
+    // InvalidName), so a test that only calls parse_document would keep
+    // passing even if this guard were deleted or neutralized to always
+    // return `false`. The end-to-end test that follows it is ported from
+    // capabilities.rs's own test module
+    // (rejects_faults_wrong_operations_malformed_xml_and_dtds_without_payloads)
+    // and still covers parse_document's DOCTYPE/ENTITY rejection and its
+    // no-payload-leak behavior, but it is not what makes deleting the guard
+    // fail a test — the test above it is. The depth-limit test after both
+    // (ported from
+    // accepts_64_nested_xml_elements_and_rejects_depth_65_deterministically)
+    // has no such gap: roxmltree enforces no depth cap of its own, so
+    // removing xml_element_depth's check does fail that test.
+
+    #[test]
+    fn has_forbidden_declaration_flags_doctype_and_entity_but_not_ordinary_soap() {
+        for xml in [
+            "<!DOCTYPE s:Envelope [<!ENTITY injected \"payload-secret\">]><n/>",
+            "<!ENTITY injected \"payload-secret\"><n/>",
+            "<!doctype n [<!entity injected \"payload-secret\">]><n/>",
+        ] {
+            assert!(has_forbidden_declaration(xml));
+        }
+        assert!(!has_forbidden_declaration(&soap(
+            "<tptz:GetStatusResponse/>"
+        )));
+    }
 
     #[test]
     fn rejects_doctype_and_entity_declarations_without_leaking_the_injected_payload() {
