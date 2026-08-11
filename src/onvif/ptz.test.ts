@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
+import http from 'node:http';
 import { test } from 'node:test';
 
 import {
   formatPtzDuration,
   formatPtzNumber,
   openPtzSession,
+  openPtzSessionWithDependencies,
   type PtzSession,
   type PtzSessionDependencies,
 } from './ptz.ts';
@@ -51,6 +53,18 @@ test('formats PTZ durations as fixed three-decimal seconds', () => {
   assert.throws(
     () => formatPtzDuration(Number.NaN),
     { message: 'PTZ timeout must be finite and greater than 0' },
+  );
+});
+
+test('rejects a PTZ duration above the 60000ms ceiling but accepts the boundary', () => {
+  assert.equal(formatPtzDuration(60_000), 'PT60.000S');
+  assert.throws(
+    () => formatPtzDuration(60_001),
+    { message: 'PTZ timeout must not exceed 60000 ms' },
+  );
+  assert.throws(
+    () => formatPtzDuration(600_000),
+    { message: 'PTZ timeout must not exceed 60000 ms' },
   );
 });
 
@@ -173,7 +187,7 @@ function fakePtzDependencies(
 
 test('rejects an unsupported absolute move without sending a request', async () => {
   const calls: RecordedPtzCall[] = [];
-  const session = await openPtzSession(
+  const session = await openPtzSessionWithDependencies(
     { host: 'camera', user: 'operator', pass: 'secret' },
     fakePtzDependencies(calls, { absolutePanTilt: false }),
   );
@@ -193,7 +207,7 @@ test('rejects an unsupported absolute move without sending a request', async () 
 
 test('sends every continuous move with an explicit timeout', async () => {
   const calls: RecordedPtzCall[] = [];
-  const session = await openPtzSession(
+  const session = await openPtzSessionWithDependencies(
     { host: 'camera', user: 'operator', pass: 'secret' },
     fakePtzDependencies(calls, { continuousPanTilt: true }),
   );
@@ -207,7 +221,7 @@ test('sends every continuous move with an explicit timeout', async () => {
 
 test('rejects out-of-range values without sending a request', async () => {
   const calls: RecordedPtzCall[] = [];
-  const session = await openPtzSession(
+  const session = await openPtzSessionWithDependencies(
     { host: 'camera', user: 'operator', pass: 'secret' },
     fakePtzDependencies(calls, { continuousPanTilt: true }),
   );
@@ -220,7 +234,7 @@ test('rejects out-of-range values without sending a request', async () => {
 
 test('stops both axes on close and keeps the original error', async () => {
   const calls: RecordedPtzCall[] = [];
-  const session = await openPtzSession(
+  const session = await openPtzSessionWithDependencies(
     { host: 'camera', user: 'operator', pass: 'secret' },
     fakePtzDependencies(calls, { continuousPanTilt: true }),
   );
@@ -232,7 +246,7 @@ test('stops both axes on close and keeps the original error', async () => {
 
 test('close swallows a failing stop and still marks the session closed', async () => {
   const calls: RecordedPtzCall[] = [];
-  const session = await openPtzSession(
+  const session = await openPtzSessionWithDependencies(
     { host: 'camera', user: 'operator', pass: 'secret' },
     fakePtzDependencies(calls, { continuousPanTilt: true }, {
       respond: (body) => (body.startsWith('<Stop ') ? response('<s:Fault/>', 500) : undefined),
@@ -244,7 +258,7 @@ test('close swallows a failing stop and still marks the session closed', async (
 
 test('rejects every call after close with a fixed message', async () => {
   const calls: RecordedPtzCall[] = [];
-  const session = await openPtzSession(
+  const session = await openPtzSessionWithDependencies(
     { host: 'camera', user: 'operator', pass: 'secret' },
     fakePtzDependencies(calls, {
       continuousPanTilt: true,
@@ -269,7 +283,7 @@ test('rejects every call after close with a fixed message', async () => {
 
 test('rejects a move with neither pan/tilt nor zoom without sending a request', async () => {
   const calls: RecordedPtzCall[] = [];
-  const session = await openPtzSession(
+  const session = await openPtzSessionWithDependencies(
     { host: 'camera', user: 'operator', pass: 'secret' },
     fakePtzDependencies(calls, { continuousPanTilt: true, continuousZoom: true }),
   );
@@ -284,7 +298,7 @@ test('rejects a move with neither pan/tilt nor zoom without sending a request', 
 
 test('rejects unsupported continuous and relative zoom the same way as pan/tilt', async () => {
   const calls: RecordedPtzCall[] = [];
-  const session = await openPtzSession(
+  const session = await openPtzSessionWithDependencies(
     { host: 'camera', user: 'operator', pass: 'secret' },
     fakePtzDependencies(calls, { relativePanTilt: true }),
   );
@@ -341,7 +355,7 @@ test('rejects every unsupported guard in the table, each with zero additional re
 
   for (const { space, message, invoke } of cases) {
     const calls: RecordedPtzCall[] = [];
-    const session = await openPtzSession(
+    const session = await openPtzSessionWithDependencies(
       { host: 'camera', user: 'operator', pass: 'secret' },
       // Every space defaults to false; only the one under test is named, and
       // it stays false, so this always exercises an unsupported guard.
@@ -357,7 +371,7 @@ test('rejects every unsupported guard in the table, each with zero additional re
 test('fails to open when no PTZ service is advertised', async () => {
   const calls: RecordedPtzCall[] = [];
   await assert.rejects(
-    openPtzSession(
+    openPtzSessionWithDependencies(
       { host: 'camera' },
       fakePtzDependencies(calls, {}, { omitPtzService: true }),
     ),
@@ -369,7 +383,7 @@ test('fails to open when no PTZ service is advertised', async () => {
 test('fails to open when GetNodes returns no node', async () => {
   const calls: RecordedPtzCall[] = [];
   await assert.rejects(
-    openPtzSession(
+    openPtzSessionWithDependencies(
       { host: 'camera' },
       fakePtzDependencies(calls, {}, { nodesXml: '<tptz:GetNodesResponse/>' }),
     ),
@@ -379,7 +393,7 @@ test('fails to open when GetNodes returns no node', async () => {
 
 test('resolves the default profile token from the first profile carrying a PTZConfiguration', async () => {
   const calls: RecordedPtzCall[] = [];
-  const session = await openPtzSession(
+  const session = await openPtzSessionWithDependencies(
     { host: 'camera' },
     fakePtzDependencies(calls, {}, {
       profilesXml: '<trt:GetProfilesResponse>'
@@ -395,7 +409,7 @@ test('resolves the default profile token from the first profile carrying a PTZCo
 test('fails to open when no media profile carries a PTZConfiguration', async () => {
   const calls: RecordedPtzCall[] = [];
   await assert.rejects(
-    openPtzSession(
+    openPtzSessionWithDependencies(
       { host: 'camera' },
       fakePtzDependencies(calls, {}, {
         profilesXml: '<trt:GetProfilesResponse><trt:Profiles token="no-ptz"/></trt:GetProfilesResponse>',
@@ -407,7 +421,7 @@ test('fails to open when no media profile carries a PTZConfiguration', async () 
 
 test('falls back to Media2 and resolves a PTZ-capable profile Media1 does not have', async () => {
   const calls: RecordedPtzCall[] = [];
-  const session = await openPtzSession(
+  const session = await openPtzSessionWithDependencies(
     { host: 'camera' },
     fakePtzDependencies(calls, {}, {
       // Media1 has profiles, but none carries a PTZConfiguration.
@@ -433,7 +447,7 @@ test('falls back to Media2 and resolves a PTZ-capable profile Media1 does not ha
 test('fails to open when both Media1 and Media2 have no PTZ-capable profile', async () => {
   const calls: RecordedPtzCall[] = [];
   await assert.rejects(
-    openPtzSession(
+    openPtzSessionWithDependencies(
       { host: 'camera' },
       fakePtzDependencies(calls, {}, {
         profilesXml: '<trt:GetProfilesResponse><trt:Profiles token="media1-no-ptz"/></trt:GetProfilesResponse>',
@@ -455,7 +469,7 @@ test('fails to open when both Media1 and Media2 have no PTZ-capable profile', as
 
 test('skips Media1 GetProfiles entirely when an explicit profileToken is given', async () => {
   const calls: RecordedPtzCall[] = [];
-  const session = await openPtzSession(
+  const session = await openPtzSessionWithDependencies(
     { host: 'camera', profileToken: 'explicit-token' },
     fakePtzDependencies(calls),
   );
@@ -465,7 +479,7 @@ test('skips Media1 GetProfiles entirely when an explicit profileToken is given',
 
 test('builds an absoluteMove body with position, optional speed, and no Timeout', async () => {
   const calls: RecordedPtzCall[] = [];
-  const session = await openPtzSession(
+  const session = await openPtzSessionWithDependencies(
     { host: 'camera' },
     fakePtzDependencies(calls, { absolutePanTilt: true, absoluteZoom: true }),
   );
@@ -489,7 +503,7 @@ test('builds an absoluteMove body with position, optional speed, and no Timeout'
 
 test('builds a relativeMove body with translation and omits absent fields', async () => {
   const calls: RecordedPtzCall[] = [];
-  const session = await openPtzSession(
+  const session = await openPtzSessionWithDependencies(
     { host: 'camera' },
     fakePtzDependencies(calls, { relativeZoom: true }),
   );
@@ -506,7 +520,7 @@ test('builds a relativeMove body with translation and omits absent fields', asyn
 
 test('rejects an absolute zoom position above 1.0 while a continuous zoom velocity of the same magnitude is in range', async () => {
   const calls: RecordedPtzCall[] = [];
-  const session = await openPtzSession(
+  const session = await openPtzSessionWithDependencies(
     { host: 'camera' },
     fakePtzDependencies(calls, { absoluteZoom: true, continuousZoom: true }),
   );
@@ -517,7 +531,7 @@ test('rejects an absolute zoom position above 1.0 while a continuous zoom veloci
 
 test('sends stop with explicit per-axis booleans and getStatus with only the profile token', async () => {
   const calls: RecordedPtzCall[] = [];
-  const session = await openPtzSession(
+  const session = await openPtzSessionWithDependencies(
     { host: 'camera' },
     fakePtzDependencies(calls),
   );
@@ -536,7 +550,7 @@ test('sends stop with explicit per-axis booleans and getStatus with only the pro
 
 test('parses position, move status, and UTC time from GetStatus', async () => {
   const calls: RecordedPtzCall[] = [];
-  const session = await openPtzSession(
+  const session = await openPtzSessionWithDependencies(
     { host: 'camera' },
     fakePtzDependencies(calls, {}, {
       respond: (body) => (body.startsWith('<GetStatus ')
@@ -561,10 +575,31 @@ test('parses position, move status, and UTC time from GetStatus', async () => {
   });
 });
 
+test('reports unknown position for empty, whitespace, or hex PanTilt attributes', async () => {
+  for (const badAttribute of ['', '  ', '0x10']) {
+    const calls: RecordedPtzCall[] = [];
+    const session = await openPtzSessionWithDependencies(
+      { host: 'camera' },
+      fakePtzDependencies(calls, {}, {
+        respond: (body) => (body.startsWith('<GetStatus ')
+          ? response(
+            '<tptz:GetStatusResponse><tptz:PTZStatus>'
+            + `<tt:Position><tt:PanTilt x="${badAttribute}" y="${badAttribute}"/></tt:Position>`
+            + '</tptz:PTZStatus></tptz:GetStatusResponse>',
+          )
+          : undefined),
+      }),
+    );
+
+    const status = await session.getStatus();
+    assert.equal(status.panTilt, undefined, `expected unknown panTilt for x="${badAttribute}"`);
+  }
+});
+
 test('never surfaces a camera-supplied GetStatus Error anywhere in PtzStatus', async () => {
   const calls: RecordedPtzCall[] = [];
   const secretError = 'internal-diagnostic-marker-should-not-leak';
-  const session = await openPtzSession(
+  const session = await openPtzSessionWithDependencies(
     { host: 'camera' },
     fakePtzDependencies(calls, {}, {
       respond: (body) => (body.startsWith('<GetStatus ')
@@ -587,7 +622,7 @@ test('never surfaces a camera-supplied GetStatus Error anywhere in PtzStatus', a
 
 test('classifies a PTZ SOAP Fault the same way the capability report does', async () => {
   const calls: RecordedPtzCall[] = [];
-  const session = await openPtzSession(
+  const session = await openPtzSessionWithDependencies(
     { host: 'camera' },
     fakePtzDependencies(calls, {}, {
       respond: (body) => (body.startsWith('<GetStatus ')
@@ -608,9 +643,78 @@ test('classifies a PTZ SOAP Fault the same way the capability report does', asyn
   });
 });
 
+test('openPtzSession (public, default dependencies) opens a real session end-to-end', async () => {
+  // Everything above this test drives the session through the injectable
+  // openPtzSessionWithDependencies seam. This is the one test that proves
+  // the public single-argument openPtzSession — the only PTZ entry point
+  // that ships in dist's declarations — actually reaches a real OnvifDevice
+  // and a real HTTP server, not just a type-checks-but-never-runs wrapper.
+  let port = 0;
+  const server = http.createServer((request, response) => {
+    const chunks: Buffer[] = [];
+    request.on('data', (chunk: Buffer) => chunks.push(chunk));
+    request.on('end', () => {
+      const body = Buffer.concat(chunks).toString('utf8');
+      response.setHeader('Content-Type', 'application/soap+xml');
+      if (body.includes('GetSystemDateAndTime')) {
+        response.end(soap(
+          '<GetSystemDateAndTimeResponse><SystemDateAndTime><UTCDateTime>'
+          + '<Time><Hour>0</Hour></Time><Date><Year>2026</Year><Month>1</Month><Day>1</Day></Date>'
+          + '</UTCDateTime></SystemDateAndTime></GetSystemDateAndTimeResponse>',
+        ));
+      } else if (body.includes('GetDeviceInformation')) {
+        response.end(soap('<tds:GetDeviceInformationResponse/>'));
+      } else if (body.includes('<Category>Media</Category>')) {
+        response.end(soap(
+          `<GetCapabilitiesResponse><Capabilities><Media><XAddr>http://127.0.0.1:${port}/media</XAddr>`
+          + '</Media></Capabilities></GetCapabilitiesResponse>',
+        ));
+      } else if (body.includes(GET_SERVICES)) {
+        response.end(soap(
+          `<tds:GetServicesResponse><tds:Service><tds:Namespace>${PTZ_NS}</tds:Namespace>`
+          + `<tds:XAddr>http://127.0.0.1:${port}/ptz</tds:XAddr></tds:Service></tds:GetServicesResponse>`,
+        ));
+      } else if (body.includes(GET_NODES)) {
+        response.end(soap(
+          '<tptz:GetNodesResponse><tptz:PTZNode token="node-1"><tt:SupportedPTZSpaces/>'
+          + '</tptz:PTZNode></tptz:GetNodesResponse>',
+        ));
+      } else if (body.includes(MEDIA1_GET_PROFILES)) {
+        response.end(soap(
+          '<trt:GetProfilesResponse><trt:Profiles token="main">'
+          + '<tt:PTZConfiguration token="ptz-config"/></trt:Profiles></trt:GetProfilesResponse>',
+        ));
+      } else if (body.startsWith('<Stop ')) {
+        response.end(soap('<tptz:StopResponse/>'));
+      } else {
+        response.statusCode = 500;
+        response.end(soap('<s:Fault/>'));
+      }
+    });
+  });
+
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+  port = address.port;
+
+  try {
+    const session = await openPtzSession({
+      host: 'camera',
+      deviceUrls: [`http://127.0.0.1:${port}/onvif/device_service`],
+    });
+    assert.equal(session.node.token, 'node-1');
+    assert.equal(session.profileToken, 'main');
+    await session.close();
+  } finally {
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())));
+  }
+});
+
 test('exposes the cached PTZ node and resolved profile token on the session', async () => {
   const calls: RecordedPtzCall[] = [];
-  const session = await openPtzSession(
+  const session = await openPtzSessionWithDependencies(
     { host: 'camera', profileToken: 'fixed-token' },
     fakePtzDependencies(calls, { continuousPanTilt: true }),
   );
@@ -620,13 +724,33 @@ test('exposes the cached PTZ node and resolved profile token on the session', as
   assert.equal(session.node.spaces.absolutePanTilt, false);
 });
 
+test('parses MaximumNumberOfPresets like capabilities.ts: leading + accepted, i32 bound enforced', async () => {
+  const nodeXmlFor = (maximumNumberOfPresets: string): string =>
+    '<tptz:GetNodesResponse><tptz:PTZNode token="node-1">'
+    + '<tt:SupportedPTZSpaces/>'
+    + `<tt:MaximumNumberOfPresets>${maximumNumberOfPresets}</tt:MaximumNumberOfPresets>`
+    + '</tptz:PTZNode></tptz:GetNodesResponse>';
+
+  const accepted = await openPtzSessionWithDependencies(
+    { host: 'camera' },
+    fakePtzDependencies([], {}, { nodesXml: nodeXmlFor('+5') }),
+  );
+  assert.equal(accepted.node.maximumPresets, 5);
+
+  const outOfRange = await openPtzSessionWithDependencies(
+    { host: 'camera' },
+    fakePtzDependencies([], {}, { nodesXml: nodeXmlFor('2147483648') }),
+  );
+  assert.equal(outOfRange.node.maximumPresets, undefined);
+});
+
 test('continuousMove sends an explicit per-call timeout in the body', async () => {
   // The Timeout element is the runaway guard: it must reach the wire as the
   // value the caller actually asked for, not a hardcoded default. Every
   // other test in this suite uses the 1000ms default, so without this test
   // a hardcoded PT1.000S could pass the whole suite undetected.
   const calls: RecordedPtzCall[] = [];
-  const session = await openPtzSession(
+  const session = await openPtzSessionWithDependencies(
     { host: 'camera', user: 'operator', pass: 'secret' },
     fakePtzDependencies(calls, { continuousZoom: true }),
   );
@@ -637,13 +761,45 @@ test('continuousMove sends an explicit per-call timeout in the body', async () =
 
 test('continuousMove uses the session-level default timeout in the body', async () => {
   const calls: RecordedPtzCall[] = [];
-  const session = await openPtzSession(
+  const session = await openPtzSessionWithDependencies(
     { host: 'camera', user: 'operator', pass: 'secret', defaultMoveTimeoutMs: 250 },
     fakePtzDependencies(calls, { continuousZoom: true }),
   );
   await session.continuousMove({ zoom: 0.5 });
 
   assert.match(calls.at(-1)!.body, /<Timeout>PT0\.250S<\/Timeout>/);
+});
+
+test('rejects a defaultMoveTimeoutMs above 60000ms at session open, before any move', async () => {
+  const calls: RecordedPtzCall[] = [];
+  await assert.rejects(
+    openPtzSessionWithDependencies(
+      { host: 'camera', defaultMoveTimeoutMs: 600_000 },
+      fakePtzDependencies(calls, { continuousZoom: true }),
+    ),
+    { message: 'PTZ timeout must not exceed 60000 ms' },
+  );
+  // No lifecycle call should have been reached beyond what open itself
+  // issues before its own eager timeout validation ever asks the camera
+  // to move: the point of bounding at open is that a huge default is
+  // rejected even if the caller never calls continuousMove at all.
+  assert.ok(calls.every((call) => !call.body.startsWith('<ContinuousMove ')));
+});
+
+test('rejects a per-call continuousMove timeoutMs above 60000ms without sending a request', async () => {
+  const calls: RecordedPtzCall[] = [];
+  const session = await openPtzSessionWithDependencies(
+    { host: 'camera', user: 'operator', pass: 'secret' },
+    fakePtzDependencies(calls, { continuousZoom: true }),
+  );
+  const sentBefore = calls.length;
+
+  await assert.rejects(
+    session.continuousMove({ zoom: 0.5, timeoutMs: 600_000 }),
+    { message: 'PTZ timeout must not exceed 60000 ms' },
+  );
+
+  assert.equal(calls.length, sentBefore);
 });
 
 test('PTZ request bodies match shared cross-language fixture', async () => {
@@ -666,7 +822,7 @@ test('PTZ request bodies match shared cross-language fixture', async () => {
   const fixture = JSON.parse(readFileSync(fixtureUrl, 'utf8')) as Fixture;
 
   const calls: RecordedPtzCall[] = [];
-  const session = await openPtzSession(
+  const session = await openPtzSessionWithDependencies(
     { host: 'camera', profileToken: fixture.profileToken },
     fakePtzDependencies(calls, {
       absolutePanTilt: true,

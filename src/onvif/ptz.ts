@@ -36,6 +36,12 @@ const MEDIA2_NS = 'http://www.onvif.org/ver20/media/wsdl';
 const PTZ_NS = 'http://www.onvif.org/ver20/ptz/wsdl';
 
 const DEFAULT_MOVE_TIMEOUT_MS = 1000;
+// A caller-supplied move timeout above this is rejected outright: combined
+// with close()'s best-effort Stop (see PtzSession.close's doc comment), an
+// unbounded timeout would let a single continuousMove keep a camera moving
+// for as long as the caller likes, with no ceiling on how long the
+// device-side stop-on-close backstop takes to kick in.
+const MAX_MOVE_TIMEOUT_MS = 60_000;
 const PAN_TILT_RANGE: readonly [number, number] = [-1, 1];
 /** Every zoom quantity is -1..1 except an absolute zoom *position*, which is 0..1. */
 const ZOOM_GENERIC_RANGE: readonly [number, number] = [-1, 1];
@@ -253,6 +259,9 @@ export function formatPtzDuration(milliseconds: number): string {
   if (!Number.isFinite(milliseconds) || milliseconds <= 0) {
     throw new RangeError('PTZ timeout must be finite and greater than 0');
   }
+  if (milliseconds > MAX_MOVE_TIMEOUT_MS) {
+    throw new RangeError('PTZ timeout must not exceed 60000 ms');
+  }
   return `PT${(milliseconds / 1000).toFixed(3)}S`;
 }
 
@@ -283,6 +292,20 @@ const PTZ_SPACE_FIELDS: ReadonlyArray<[string, keyof PtzSpaces]> = [
   ['ContinuousZoomVelocitySpace', 'continuousZoom'],
 ];
 
+// Mirrors capabilities.ts's strictInteger + strictNonNegativeInteger
+// (capabilities.ts:130-141) rather than importing it, so ptz.ts and
+// capabilities.ts stay independent. Accepts a leading '+' and bounds the
+// result to a signed 32-bit integer before requiring it to be non-negative;
+// this affects only the informational `maximumPresets` field, never a
+// request body.
+function strictNonNegativePresetCount(value: string | undefined): number | undefined {
+  if (value === undefined || !/^[+-]?\d+$/.test(value)) return undefined;
+  const parsed = Number(value);
+  if (parsed < -2_147_483_648 || parsed > 2_147_483_647) return undefined;
+  const normalized = parsed === 0 ? 0 : parsed;
+  return normalized >= 0 ? normalized : undefined;
+}
+
 function parseNode(node: XmlElement): PtzNode | undefined {
   const token = attribute(node, '', 'token');
   const supported = firstChild(node, SCHEMA_NS, 'SupportedPTZSpaces');
@@ -300,9 +323,7 @@ function parseNode(node: XmlElement): PtzNode | undefined {
   }
   const name = textOf(firstChild(node, SCHEMA_NS, 'Name'));
   const maximumPresetsText = textOf(firstChild(node, SCHEMA_NS, 'MaximumNumberOfPresets'));
-  const maximumPresets = maximumPresetsText !== undefined && /^\d+$/.test(maximumPresetsText)
-    ? Number(maximumPresetsText)
-    : undefined;
+  const maximumPresets = strictNonNegativePresetCount(maximumPresetsText);
   const homeSupportedText = textOf(firstChild(node, SCHEMA_NS, 'HomeSupported'));
   const homeSupported = homeSupportedText === 'true' || homeSupportedText === '1'
     ? true
@@ -366,10 +387,19 @@ function findMedia2ProfileToken(response: XmlElement): string | undefined {
   return undefined;
 }
 
+// A plain decimal number: optional sign, digits (either side of an optional
+// decimal point), and an optional exponent. Deliberately anchored so
+// `Number()`'s wider grammar — hex (`0x10`), leading/trailing whitespace,
+// empty strings — can never turn a malformed attribute into a value; both
+// the Python and Rust siblings report unknown for the same inputs.
+const PLAIN_DECIMAL_NUMBER = /^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/;
+
 function numberAttribute(node: XmlElement | undefined, name: string): number | undefined {
   const raw = node ? attribute(node, '', name) : undefined;
   if (raw === undefined) return undefined;
-  const value = Number(raw.trim());
+  const trimmed = raw.trim();
+  if (!PLAIN_DECIMAL_NUMBER.test(trimmed)) return undefined;
+  const value = Number(trimmed);
   return Number.isFinite(value) ? value : undefined;
 }
 
@@ -397,19 +427,21 @@ function parseStatusResponse(response: XmlElement): PtzStatus {
   };
 }
 
-// Deliberately public, not doc-tagged as internal-only: openPtzSession is
-// fully public and takes a PtzSessionDependencies directly, so both this
-// interface and PtzSessionDevice must remain in the emitted declarations, or
-// the .d.ts would reference a name that no longer exists. The `serviceCall`
-// return type is spelled out structurally (matching deviceClient.ts's
-// internal-only OnvifRawResponse) so this module never needs to import that
-// type just to name it here.
+// Hidden the same way capabilities.ts hides CameraCapabilityDevice /
+// CameraCapabilityDependencies: openPtzSession takes options only, and this
+// injection seam is reachable solely through the internal-only
+// openPtzSessionWithDependencies below, so neither name reaches dist's
+// emitted declarations. The `serviceCall` return type is spelled out
+// structurally (matching deviceClient.ts's internal-only OnvifRawResponse)
+// so this module never needs to import that type just to name it here.
+/** @internal */
 export interface PtzSessionDevice {
   connect(): Promise<DeviceInfo>;
   connectedMediaUrl(): string;
   serviceCall(body: string, endpoint?: string): Promise<{ statusCode: number; xml: string }>;
 }
 
+/** @internal */
 export interface PtzSessionDependencies {
   createDevice(
     host: string,
@@ -423,6 +455,8 @@ const defaultDependencies: PtzSessionDependencies = {
   createDevice: (host, user, pass, options) => new OnvifDevice(host, user, pass, options),
 };
 
+// Plain form, unlike capabilities.ts's IncludeCapability=true: this session only needs the
+// XAddr list, and capabilities would inflate the response against the shared 1MB body cap.
 const GET_SERVICES = `<GetServices xmlns="${DEV_NS}"/>`;
 const GET_NODES = `<GetNodes xmlns="${PTZ_NS}"/>`;
 const MEDIA1_GET_PROFILES = `<GetProfiles xmlns="${MEDIA1_NS}"/>`;
@@ -533,6 +567,18 @@ class PtzSessionImpl implements PtzSession {
     return parseStatusResponse(response);
   }
 
+  /**
+   * Stop both axes, then mark the session closed either way.
+   *
+   * A failing Stop is swallowed — it must never replace an error the
+   * caller is already handling — but `close()` still becomes terminal:
+   * every later call, including `stop()`, throws `PTZ session is closed`.
+   * If that swallowed Stop failed mid-move (a network blip, say), this
+   * session offers no further way to halt the camera. The backstop is the
+   * camera itself: its move timeout (`defaultMoveTimeoutMs` / a move's own
+   * `timeoutMs`, both capped at 60000 ms) always elapses on its own, so the
+   * camera stops moving even though this session can no longer ask it to.
+   */
   async close(): Promise<void> {
     if (this.closed) return;
     try {
@@ -553,9 +599,14 @@ class PtzSessionImpl implements PtzSession {
  * and stop-on-close are covered by tests; that a camera actually moves as
  * intended is not.
  */
-export async function openPtzSession(
+export function openPtzSession(options: PtzSessionOptions): Promise<PtzSession> {
+  return openPtzSessionWithDependencies(options, defaultDependencies);
+}
+
+/** @internal */
+export async function openPtzSessionWithDependencies(
   options: PtzSessionOptions,
-  dependencies: PtzSessionDependencies = defaultDependencies,
+  dependencies: PtzSessionDependencies,
 ): Promise<PtzSession> {
   const user = options.user ?? '';
   const pass = options.pass ?? '';
@@ -615,5 +666,8 @@ export async function openPtzSession(
   }
 
   const defaultMoveTimeoutMs = options.defaultMoveTimeoutMs ?? DEFAULT_MOVE_TIMEOUT_MS;
+  // Bounded at open, not deferred to the first move: an unbounded default
+  // would otherwise pass silently until a caller's first continuousMove.
+  formatPtzDuration(defaultMoveTimeoutMs);
   return new PtzSessionImpl(device, ptzXAddr, node, profileToken, defaultMoveTimeoutMs);
 }

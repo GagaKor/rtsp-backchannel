@@ -329,6 +329,20 @@ test('ships clean public declarations without capability parser or injection sea
     /discoverDevices\(options\?: DiscoveryOptions\): Promise<DiscoveredDevice\[\]>/,
   );
 
+  // ptz.ts hides its injection seam the same way discovery.ts and
+  // capabilities.ts hide theirs: openPtzSession takes options only, and
+  // PtzSessionDependencies/PtzSessionDevice live behind the internal-only
+  // openPtzSessionWithDependencies. This is the ptz.d.ts counterpart of the
+  // discovery.d.ts and index.d.ts/cli.d.ts assertions above and below — the
+  // gap this closes is exactly what let PtzSessionDependencies and
+  // PtzSessionDevice leak into shipped declarations undetected.
+  const ptzDeclaration = readFileSync('dist/onvif/ptz.d.ts', 'utf8');
+  assert.doesNotMatch(ptzDeclaration, /PtzSessionDependencies|PtzSessionDevice|WithDependencies/);
+  assert.match(
+    ptzDeclaration,
+    /export declare function openPtzSession\(options: PtzSessionOptions\): Promise<PtzSession>;/,
+  );
+
   const indexDeclaration = readFileSync('dist/index.d.ts', 'utf8');
   const cliDeclaration = readFileSync('dist/cli.d.ts', 'utf8');
   assert.match(indexDeclaration, /export \{ getCameraCapabilities \}/);
