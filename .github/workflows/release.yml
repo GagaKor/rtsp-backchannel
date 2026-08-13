@@ -479,6 +479,26 @@ jobs:
                  end'
           }
 
+          wait_for_release_provenance() {
+            for attempt in {1..10}; do
+              fetch_release > "$release_json"
+              if [ -s "$release_json" ] && \
+                 jq -e --arg marker "$provenance_marker" \
+                   '(.body // "") | split("\n") | any(. == $marker)' \
+                   "$release_json" >/dev/null; then
+                return 0
+              fi
+
+              if [ "$attempt" -lt 10 ]; then
+                echo "Waiting for draft Release provenance (${attempt}/10)..."
+                sleep 2
+              fi
+            done
+
+            echo "Draft Release ${tag} did not expose the expected provenance marker." >&2
+            return 1
+          }
+
           verify_remote_tag_commit
           release_json=$(mktemp)
           fetch_release > "$release_json"
@@ -492,7 +512,10 @@ jobs:
               --verify-tag \
               --title "rtsp-backchannel ${version}" \
               --notes-file "$notes_file"
-            fetch_release > "$release_json"
+            # A newly created draft can briefly be absent or incomplete in
+            # the releases-list response. Never let that read-after-write lag
+            # masquerade as a missing provenance marker.
+            wait_for_release_provenance
           fi
 
           actual_body=$(jq -r '.body // ""' "$release_json")
