@@ -706,9 +706,8 @@ jobs:
   # Backfills and maintains GitHub Releases after pin-release-tag has durably
   # selected the source used by every registry and binary job. Release and
   # asset state are tracked separately so a retry can finish a prior partial
-  # run. All three packages are already at 0.3.0 with neither tag nor release,
-  # so the first run after this merges publishes nothing to registries but
-  # still creates v0.3.0 and its GitHub Release.
+  # run. The same path handles a version that needs registry publication and a
+  # version already present on every registry but missing its GitHub Release.
   # Blocked only by an actual failure upstream: skipped publish jobs mean
   # "nothing to publish" and are safe, while a failure prevents a release.
   tag-and-release:

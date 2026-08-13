@@ -159,7 +159,7 @@ the binaries under their exact release names, and extract the matching
 changelog section before creating the Release:
 
 ```bash
-VERSION=0.3.0
+VERSION=0.3.1
 TARGET=x86_64-unknown-linux-gnu # Select the native target for this host.
 SUFFIX=
 [ "$TARGET" = x86_64-pc-windows-msvc ] && SUFFIX=.exe
