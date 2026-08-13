@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-08-13
+
+### Changed
+
+- Refresh the packaged READMEs displayed on npm, PyPI, and crates.io with the
+  cross-language overview, registry links, and live version badges already
+  available in the GitHub repository.
+
 ## [0.3.0] - 2026-08-11
 
 ### Added
@@ -59,5 +67,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - External FFmpeg decoding for common input audio formats.
 - MIT OR Apache-2.0 dual licensing.
 
-[Unreleased]: https://github.com/GagaKor/rtsp-backchannel/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/GagaKor/rtsp-backchannel/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/GagaKor/rtsp-backchannel/releases/tag/v0.3.1
 [0.3.0]: https://github.com/GagaKor/rtsp-backchannel/releases/tag/v0.3.0
