@@ -6,7 +6,13 @@
  * on top of the same persistent socket.
  */
 import net from 'node:net';
-import crypto from 'node:crypto';
+import {
+  digestAuthorization,
+  generateCnonce,
+  parseDigestChallenge,
+  parseDigestParameters,
+  type DigestChallenge,
+} from './digest.ts';
 
 export const BACKCHANNEL_REQUIRE = 'www.onvif.org/ver20/backchannel';
 const MAX_RTSP_HEADER_BYTES = 64 * 1024;
@@ -20,65 +26,10 @@ export interface RtspResponse {
   body: string;
 }
 
-interface DigestChallenge {
-  realm: string;
-  nonce: string;
-  qop?: string;
-  opaque?: string;
-  algorithm?: string;
-}
-
 interface RtspResponseWaiter {
   expectedCSeq: number;
   wake(): void;
   fail(error: Error): void;
-}
-
-const md5 = (s: string) => crypto.createHash('md5').update(s).digest('hex');
-
-function parseDigestParameters(headerValue: string): Record<string, string> | undefined {
-  const digest = /\bDigest\s+/i.exec(headerValue);
-  if (!digest) return undefined;
-  const parameters: Record<string, string> = {};
-  let index = digest.index + digest[0].length;
-  while (index < headerValue.length) {
-    while (index < headerValue.length && /[\s,]/.test(headerValue[index])) index++;
-    const keyMatch = /^[a-z][a-z\d_-]*/i.exec(headerValue.slice(index));
-    if (!keyMatch) break;
-    const key = keyMatch[0].toLowerCase();
-    index += keyMatch[0].length;
-    while (headerValue[index] === ' ' || headerValue[index] === '\t') index++;
-    if (headerValue[index] !== '=') break;
-    index++;
-    while (headerValue[index] === ' ' || headerValue[index] === '\t') index++;
-
-    let value = '';
-    if (headerValue[index] === '"') {
-      index++;
-      while (index < headerValue.length) {
-        const character = headerValue[index++];
-        if (character === '"') break;
-        if (character === '\\' && index < headerValue.length) {
-          value += headerValue[index++];
-        } else {
-          value += character;
-        }
-      }
-    } else {
-      const end = headerValue.indexOf(',', index);
-      value = headerValue.slice(index, end < 0 ? headerValue.length : end).trim();
-      index = end < 0 ? headerValue.length : end;
-    }
-    parameters[key] = value;
-  }
-  return parameters;
-}
-
-function quoteDigestValue(name: string, value: string): string {
-  if (/[\x00-\x1f\x7f]/.test(value)) {
-    throw new Error(`RTSP Digest ${name} contains control characters`);
-  }
-  return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 }
 
 export class RtspClient {
@@ -149,70 +100,47 @@ export class RtspClient {
     if (this.basic) {
       return 'Basic ' + Buffer.from(`${this.user}:${this.pass}`).toString('base64');
     }
-    const c = this.challenge;
-    if (!c) return undefined;
-    const ha1 = md5(`${this.user}:${c.realm}:${this.pass}`);
-    const ha2 = md5(`${method}:${uri}`);
-    const username = quoteDigestValue('username', this.user);
-    const realm = quoteDigestValue('realm', c.realm);
-    const nonce = quoteDigestValue('nonce', c.nonce);
-    const digestUri = quoteDigestValue('uri', uri);
-    const opaque = c.opaque === undefined
-      ? ''
-      : `, opaque="${quoteDigestValue('opaque', c.opaque)}"`;
-    if (c.qop) {
-      const cnonce = crypto.randomBytes(8).toString('hex');
-      this.digestNonceCount += 1;
-      const nc = this.digestNonceCount.toString(16).padStart(8, '0');
-      const resp = md5(`${ha1}:${c.nonce}:${nc}:${cnonce}:${c.qop}:${ha2}`);
-      return (
-        `Digest username="${username}", realm="${realm}", nonce="${nonce}", ` +
-        `uri="${digestUri}", qop=${c.qop}, nc=${nc}, cnonce="${cnonce}", ` +
-        `response="${resp}"${opaque}`
-      );
-    }
-    const resp = md5(`${ha1}:${c.nonce}:${ha2}`);
-    return (
-      `Digest username="${username}", realm="${realm}", nonce="${nonce}", ` +
-      `uri="${digestUri}", response="${resp}"${opaque}`
-    );
+    const challenge = this.challenge;
+    if (!challenge) return undefined;
+    this.digestNonceCount += 1;
+    return digestAuthorization({
+      user: this.user,
+      pass: this.pass,
+      method,
+      uri,
+      challenge,
+      nonceCount: this.digestNonceCount,
+      cnonce: generateCnonce(),
+    });
   }
 
   private parseChallenge(headerValue: string): void {
-    const parameters = parseDigestParameters(headerValue);
-    if (!parameters && /^\s*Basic\b/i.test(headerValue)) {
+    const parsed = parseDigestChallenge(headerValue);
+    if (parsed === 'basic') {
       this.basic = true;
       this.challenge = undefined;
       this.digestNonceCount = 0;
       return;
     }
-    if (!parameters) return;
-    const realm = parameters.realm;
-    const nonce = parameters.nonce;
-    if (!realm || !nonce) {
-      throw new Error('invalid RTSP Digest challenge: missing realm or nonce');
+    if (parsed === undefined) return;
+    // ONVIF cameras only ever speak MD5; VIGI's SHA-256 support belongs to
+    // the VIGI talk client, not this one. Reject explicitly rather than
+    // silently authenticating with an algorithm this path never asked for.
+    if (parsed.algorithm !== 'MD5') {
+      throw new Error(`unsupported RTSP Digest algorithm: ${parsed.algorithm}`);
     }
-    const algorithm = parameters.algorithm || 'MD5';
-    if (algorithm.toLowerCase() !== 'md5') {
-      throw new Error(`unsupported RTSP Digest algorithm: ${algorithm}`);
-    }
-    let qop: string | undefined;
-    if (parameters.qop !== undefined) {
-      const options = parameters.qop.split(',').map((value) => value.trim().toLowerCase());
-      if (!options.includes('auth')) {
-        throw new Error(`unsupported RTSP Digest qop: ${parameters.qop}`);
+    // parseDigestChallenge silently drops a qop it doesn't recognise instead
+    // of throwing, so re-check the raw parameter to keep rejecting an
+    // unsupported qop (e.g. "auth-int") explicitly, as before extraction.
+    if (parsed.qop === undefined) {
+      const rawQop = parseDigestParameters(headerValue)?.qop;
+      if (rawQop !== undefined) {
+        throw new Error(`unsupported RTSP Digest qop: ${rawQop}`);
       }
-      qop = 'auth';
     }
-    if (this.challenge?.nonce !== nonce) this.digestNonceCount = 0;
+    if (this.challenge?.nonce !== parsed.nonce) this.digestNonceCount = 0;
     this.basic = false;
-    this.challenge = {
-      realm,
-      nonce,
-      ...(qop ? { qop } : {}),
-      ...(parameters.opaque !== undefined ? { opaque: parameters.opaque } : {}),
-      algorithm: 'MD5',
-    };
+    this.challenge = parsed;
   }
 
   /** Send a request and read exactly one RTSP response. */
