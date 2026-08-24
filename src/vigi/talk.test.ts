@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
+import { digestAuthorization } from '../rtsp/digest.ts';
 import {
   VIGI_TALK_CHANNEL,
   VIGI_TALK_PAYLOAD_TYPE,
@@ -363,4 +365,39 @@ test('close during an in-flight open aborts the handshake and destroys the conne
   await closePromise;
   assert.equal(socket.destroyed, true, 'the pending connection was destroyed, not leaked');
   assert.equal(socket.requests.length, 1, 'closed before the challenge reply was ever handled');
+});
+
+test('matches the cross-language request parity fixture', async () => {
+  const fixture = JSON.parse(
+    await readFile(
+      new URL('../../rust/tests/fixtures/vigi-request-parity.json', import.meta.url),
+      'utf8',
+    ),
+  );
+  assert.equal(
+    buildMultitransRequest({
+      uri: `rtsp://${fixture.host}/multitrans`,
+      cseq: 1,
+      json: fixture.requests.talkBody,
+    }),
+    fixture.requests.multitransUnauthenticated,
+  );
+  assert.equal(
+    digestAuthorization({
+      user: fixture.user,
+      pass: fixture.pass,
+      method: 'MULTITRANS',
+      uri: `rtsp://${fixture.host}/multitrans`,
+      challenge: {
+        realm: fixture.challenge.realm,
+        nonce: fixture.challenge.nonce,
+        qop: fixture.challenge.qop,
+        algorithm: 'SHA-256',
+      },
+      nonceCount: fixture.nonceCount,
+      cnonce: fixture.cnonce,
+      style: 'vigi',
+    }),
+    fixture.requests.authorizationHeader,
+  );
 });
