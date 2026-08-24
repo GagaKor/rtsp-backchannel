@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
+import https from 'node:https';
 import { test } from 'node:test';
 import {
   VigiControlError,
+  openVigiControl,
   openVigiControlWithDependencies,
   type VigiControlDependencies,
 } from './control.ts';
@@ -215,4 +217,55 @@ test('never puts the password in an error message', async () => {
       return true;
     },
   );
+});
+
+test('destroys the request and response sockets when a real HTTPS post times out', async () => {
+  // The default (non-injected) transport, postJsonOverHttps, is not part of
+  // this module's public seam, so it is exercised here through
+  // openVigiControl rather than exported just to make it reachable.
+  // node:https is a CJS built-in, so every importer in this process shares
+  // the same exports object — patching https.request here is visible to
+  // control.ts's own `import https from 'node:https'` for the life of this
+  // test, and is restored in `finally` regardless of outcome.
+  const originalRequest = https.request;
+  let requestDestroyedWith: unknown;
+  let responseDestroyedWith: unknown;
+  let deliverResponse: (response: unknown) => void = () => {};
+  const fakeResponse = {
+    on() {
+      return fakeResponse;
+    },
+    destroy(error?: Error) {
+      responseDestroyedWith = error;
+    },
+  };
+  const fakeRequest = {
+    on() {
+      return fakeRequest;
+    },
+    end() {
+      // A response arrives but never finishes, so it is still live when
+      // the timeout fires below.
+      deliverResponse(fakeResponse);
+    },
+    destroy(error?: Error) {
+      requestDestroyedWith = error;
+    },
+  };
+  https.request = ((_options: unknown, listener: (response: unknown) => void) => {
+    deliverResponse = listener;
+    return fakeRequest;
+  }) as unknown as typeof https.request;
+
+  try {
+    await assert.rejects(
+      openVigiControl({ host: 'cam', pass: 'secret', timeoutMs: 5 }),
+      { message: 'VIGI OpenAPI request timeout' },
+    );
+  } finally {
+    https.request = originalRequest;
+  }
+
+  assert.ok(requestDestroyedWith instanceof Error);
+  assert.ok(responseDestroyedWith instanceof Error);
 });

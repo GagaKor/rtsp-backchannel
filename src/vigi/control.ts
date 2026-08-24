@@ -7,6 +7,7 @@
  * counter and locks the account when it is exceeded.
  */
 import https from 'node:https';
+import type http from 'node:http';
 import crypto from 'node:crypto';
 
 export const DEFAULT_VIGI_CONTROL_PORT = 20443;
@@ -89,25 +90,35 @@ function postJsonOverHttps(
   };
   return new Promise((resolve, reject) => {
     let settled = false;
+    let req: http.ClientRequest | undefined;
+    let res: http.IncomingMessage | undefined;
     const settle = (error?: Error, value?: unknown) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      if (error) reject(error);
-      else resolve(value);
+      if (error) {
+        // Close the socket before rejecting — a timed-out or oversized
+        // exchange must not linger and hold the connection (and the event
+        // loop) open after the caller's promise has already settled.
+        req?.destroy(error);
+        res?.destroy(error);
+        reject(error);
+      } else {
+        resolve(value);
+      }
     };
     const timer = setTimeout(
       () => settle(new Error('VIGI OpenAPI request timeout')),
       timeoutMs,
     );
-    const request = https.request(options, (response) => {
+    req = https.request(options, (response) => {
+      res = response;
       const chunks: Buffer[] = [];
       let bytes = 0;
       response.on('data', (chunk: Buffer) => {
         bytes += chunk.byteLength;
         if (bytes > MAX_RESPONSE_BYTES) {
           settle(new Error('VIGI OpenAPI response too large'));
-          response.destroy();
           return;
         }
         chunks.push(chunk);
@@ -121,8 +132,8 @@ function postJsonOverHttps(
       });
       response.on('error', () => settle(new Error('VIGI OpenAPI response error')));
     });
-    request.on('error', () => settle(new Error('VIGI OpenAPI request failed')));
-    request.end(payload);
+    req.on('error', () => settle(new Error('VIGI OpenAPI request failed')));
+    req.end(payload);
   });
 }
 
