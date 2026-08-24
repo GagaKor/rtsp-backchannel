@@ -341,6 +341,14 @@ Interpret the report as evidence, not certification:
 - `timeout` is a per-request limit. One report performs several requests, so
   its total elapsed time can exceed one per-request timeout interval.
 
+This crate's `get_camera_capabilities` does not include the TypeScript
+package's default audio-send probe described in the root
+[README.md](https://github.com/GagaKor/rtsp-backchannel/blob/master/README.md#camera-capability-reports):
+`CameraCapabilityOptions` has no `probe_audio_send` field,
+`CameraCapabilityReport` has no `audio_send` field, and no extra ONVIF or
+VIGI OpenAPI round trip is performed here. This call's cost and behavior are
+unchanged.
+
 ### PTZ Control
 
 `open_ptz_session`, `PtzSession`, `PtzSessionOptions`, `PtzStatus`, and
@@ -492,6 +500,28 @@ let result = play_file_with_codec(&PlaybackConfig {
 Embedded credentials are parsed automatically; explicit non-empty fields
 override them. Prefer `%40` for `@` in a password. Raw `@` uses the final
 authority separator. Request URIs and logs strip credentials.
+
+### Audio Send Transports
+
+The TypeScript package in this repository added a second audio-send
+transport alongside the ONVIF backchannel: TP-Link's VIGI OpenAPI `talk`
+protocol, selected with `transport: 'auto' | 'onvif' | 'vigi'` (`--transport`
+on its CLI). It targets cameras that have a working speaker but no working
+ONVIF backchannel — confirmed, for example, on a TP-Link VIGI C540V whose
+ONVIF answers a backchannel `DESCRIBE` with a receive-only track and reports
+no audio output configuration, yet whose VIGI OpenAPI speaker plays audio
+normally. `'auto'` tries ONVIF first and only falls back to VIGI when the
+camera's SDP has no sendonly track; every other failure still propagates.
+See the root
+[README.md](https://github.com/GagaKor/rtsp-backchannel/blob/master/README.md#audio-send-transports)
+for the full details, including the OpenAPI setup step and its G.711-only,
+model-dependent nature.
+
+This crate does not implement that transport. `play_file_with_codec` and the
+lower-level RTSP backchannel support here speak ONVIF backchannel only —
+there is no `transport` field and no VIGI fallback. A camera whose only
+working audio-send path is VIGI OpenAPI cannot be reached from this crate
+today.
 
 ## CLI
 

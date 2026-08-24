@@ -342,6 +342,11 @@ scope에서 얻은 자기 보고일 뿐 독립적인 ONVIF 인증 결과가 아�
   generic canonical message만 사용하며 credentials, WSSE digest material,
   URL userinfo, raw or real camera response payload를 포함하지 않습니다. 최초 연결 또는
   인증 실패는 치명적이며 Promise를 reject하므로 warning으로 바뀌지 않습니다.
+- `audioSend`는 카메라로 오디오를 보낼 수 있는 전송 방식이 있는지를 보고합니다.
+  `onvifBackchannel`과 `vigiTalk`는 서로 독립적인 3상 probe 결과이고, `transport`는
+  그중 성공한 쪽의 이름(`'onvif'`, `'vigi'`, 둘 다 실패하면 `null`)이며, `detected`는
+  둘 중 하나라도 성공했을 때만 `true`입니다. 이 probe의 비용과 끄는 방법은 아래를
+  참고하십시오.
 
 인증된 서비스 요청의 신뢰 기준은 선택된 Device Service URL입니다. 연결된 Media
 endpoint와 광고된 모든 Media1, Media2, PTZ XAddr는 같은 scheme과 canonical
@@ -367,6 +372,18 @@ option 보강은 유용한 근거이지만 Profile T 인증의 증명은 아닙�
 수행하므로 전체 소요 시간은 timeout 한 구간보다 길 수 있습니다. 선택적인 보강
 요청은 실패 시 warning을 추가하고 계속할 수 있지만 단일 요청의 timeout을 늘리지는
 않습니다.
+
+**기본값에서는 이 호출이 보이는 것보다 비쌉니다.** `getCameraCapabilities`는
+`audioSend`를 채우기 위해 카메라에 오디오를 보낼 수 있는 경로가 있는지도 기본적으로
+함께 확인합니다. 이 probe는 위에서 이미 연 연결을 다시 읽는 것이 아니라, 실제
+backchannel `DESCRIBE`를 보내려고 처음부터 새로 인증하는 ONVIF 세션(자체 서비스
+검색과 로그인 포함)을 하나 더 엽니다. 그 결과 송신 가능한 track을 찾지 못했을 때만
+VIGI OpenAPI `doAuth` 핸드셰이크를 한 번 더 시도합니다. 구체적으로는 기본 호출마다
+여러 번의 추가 SOAP 왕복과 ONVIF 재인증·재검색 한 번이 붙고, ONVIF backchannel이
+없는 흔한 경우에는 대부분의 카메라가 아예 응답하지 않는 VIGI 제어 포트로의 HTTPS
+요청이 한 번 더 붙습니다. 이 전부를 건너뛰려면 `probeAudioSend: false`를
+넘기십시오. 이 경우 `audioSend`는 중립적인 기본값(`detected`, `transport`,
+`onvifBackchannel`, `vigiTalk` 모두 `null`)으로 남습니다.
 
 ### PTZ 제어
 
@@ -470,6 +487,33 @@ try {
 
 PCM 생성, 인코딩 또는 페이싱을 직접 제어할 수 있도록 `pcm16ToG711`,
 `linearToALaw`, `linearToMuLaw`, `generateTonePcm`, `sendPacedG711`도 공개합니다.
+
+### 오디오 송신 전송
+
+`openBackchannel`과 `playFile`은 `transport` 옵션으로 `'auto'`(기본값),
+`'onvif'`, `'vigi'`를 받아들이며, CLI도 같은 선택지를 `--transport`로 제공합니다.
+`'onvif'`와 `'vigi'`는 각각 하나의 전송 방식을 확정적으로 사용합니다. `'auto'`는
+먼저 ONVIF 백채널을 시도하고, 카메라가 응답은 했지만 SDP에 sendonly 오디오 track이
+없을 때만 VIGI로 대체합니다. 그 밖의 모든 실패 — 네트워크 오류, 자격 증명 거부,
+잘못된 응답 — 는 다른 전송 방식으로 조용히 넘어가지 않고 그대로 전파되므로, 고장난
+카메라를 단순히 벤더 API가 없는 카메라로 오인하지 않습니다.
+
+VIGI 전송 방식은 ONVIF 백채널 대신 TP-Link의 VIGI OpenAPI `talk` 프로토콜을
+사용합니다. 스피커는 동작하지만 ONVIF 백채널이 없거나 제대로 동작하지 않는 카메라를
+위한 것입니다. 카메라 자체의 웹 UI에서 Settings > Network Settings > OpenAPI로
+OpenAPI를 켜야 하며, 제어 연결은 기본적으로 20443 포트를 사용합니다. 이 전송
+방식은 G.711 a-law만 전달합니다. G.711이 아닌 코덱을 명시적으로 요청하면
+resampling이나 조용한 다운그레이드 대신 세션을 여는 시점에 실패합니다. 라이브러리는
+장치의 스피커 볼륨을 직접 바꾸지 않습니다 — 카메라에 설정된 값(기본값 80/100이며
+실내에서는 큰 편입니다)이 그대로 재생되며, 볼륨을 바꾸려면 이 라이브러리가 아니라
+카메라 자체 UI를 사용해야 합니다.
+
+VIGI 배지가 붙어 있다고 해서 모든 카메라가 이 API를 지원하는 것은 아닙니다.
+TP-Link는 지원하는 IPC 및 NVR 모델 목록을
+https://www.tp-link.com/en/vigi-open-api/product-list/ 에 공개해 두었으므로,
+브랜드만 보고 지원 여부를 가정하지 말고 실제 모델을 그 목록과 대조하십시오. VIGI
+NVR도 이 목록에 함께 실려 있지만 전혀 다른 프로토콜을 사용하므로 이 전송 방식의
+지원 대상이 아닙니다.
 
 ## CLI
 

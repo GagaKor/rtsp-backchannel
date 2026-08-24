@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A second audio-send transport in the TypeScript package: TP-Link's VIGI
+  OpenAPI `talk` protocol, for cameras that have a speaker but expose no
+  ONVIF backchannel. Select it with `transport: 'onvif' | 'vigi' | 'auto'`
+  (`--transport` on the CLI); the default `'auto'` tries ONVIF first and
+  falls back only when the camera offers no sendonly audio track, so a
+  network or authentication fault is never reported as a missing vendor API.
+  The Python and Rust packages are unchanged and do not implement this
+  transport.
+- `getCameraCapabilities` gains an `audioSend` block naming the transport
+  (`'onvif'`, `'vigi'`, or neither) that can reach a given camera. **This
+  probe runs by default and adds real cost to every call**: it opens a
+  second, fully authenticated ONVIF session to issue a real backchannel
+  `DESCRIBE` — several extra SOAP round trips plus one full ONVIF
+  re-authentication and re-discovery — and, when that finds no sendonly
+  track, one additional VIGI OpenAPI `doAuth` attempt. Pass
+  `probeAudioSend: false` to skip it. This addition is TypeScript-only; the
+  Python and Rust capability reports are unaffected and perform no such
+  probe.
+
 ### Fixed
 
 - PTZ sessions now send the mandatory `IncludeCapability` element in their
