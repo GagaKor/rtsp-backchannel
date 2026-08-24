@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- CommonJS support for the npm package. `exports` now declares a `require`
+  condition alongside `import`, so `require('rtsp-backchannel')` works instead
+  of failing with `ERR_PACKAGE_PATH_NOT_EXPORTED`. Both conditions resolve to
+  the same ES module build, which Node loads synchronously from CommonJS, so
+  there is no second copy of the library or its state in a process.
+- A Module Formats section in both TypeScript READMEs covering the ESM and
+  CommonJS entry points, and explaining that the `MODULE_TYPELESS_PACKAGE_JSON`
+  warning comes from the consumer's own `package.json` missing a `"type"`
+  field rather than from this package.
+
+### Changed
+
+- Raised the npm package's minimum Node.js version from 22 to 22.12.0, the
+  release that enabled loading an ES module from `require()` by default. Every
+  Node.js 22 LTS release meets this.
+
 ## [0.3.1] - 2026-08-13
 
 ### Changed

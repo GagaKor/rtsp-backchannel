@@ -21,7 +21,7 @@ FFmpeg가 필요하며 GStreamer는 사용하지 않습니다.
 
 ## 요구 사항
 
-- Node.js 22 이상
+- Node.js 22.12 이상
 - 파일 재생 시 `PATH`에서 실행할 수 있는 `ffmpeg`
 - ONVIF `sendonly` 오디오 백채널을 제공하는 카메라
 
@@ -58,6 +58,42 @@ sudo apt-get install ffmpeg
 
 Windows에서는 [FFmpeg 다운로드 페이지](https://ffmpeg.org/download.html)에서 빌드를
 설치한 뒤 `ffmpeg.exe`가 있는 디렉터리를 `PATH`에 추가합니다.
+
+## 모듈 형식
+
+이 패키지는 ES 모듈 빌드 하나만 배포하며, 두 모듈 시스템 모두에서 불러올 수 있습니다.
+
+```typescript
+// ES 모듈
+import { playFile } from 'rtsp-backchannel';
+```
+
+```javascript
+// CommonJS
+const { playFile } = require('rtsp-backchannel');
+```
+
+`require()`가 동작하는 이유는 Node 22.12.0부터 CommonJS에서 ES 모듈을 동기적으로 불러올 수
+있기 때문이며, 이것이 최소 버전인 이유이기도 합니다. 두 진입점이 같은 파일을 가리키므로 한
+프로세스가 라이브러리와 그 상태를 두 벌 들고 있는 일은 발생하지 않습니다.
+
+### MODULE_TYPELESS_PACKAGE_JSON 경고 없애기
+
+`.js` 파일에서 `import` 문을 실행하면 다음 경고가 나타납니다.
+
+```
+[MODULE_TYPELESS_PACKAGE_JSON] Warning: Module type of file:///.../use.js is not
+specified and it doesn't parse as CommonJS. Reparsing as ES module because module
+syntax was detected. This incurs a performance overhead.
+```
+
+이 경고는 이 패키지가 아니라 실행 중인 파일에 대한 것입니다. Node가 가장 가까운
+`package.json`에서 `"type"` 필드를 찾지 못해 CommonJS로 추측했다가 실패하고 다시 파싱한
+것입니다. 다음 중 하나로 해결됩니다.
+
+- 자신의 `package.json`에 `"type": "module"` 추가
+- 파일 확장자를 `.mjs`로 변경
+- `import` 대신 `require()` 사용
 
 ## 빠른 재생
 

@@ -196,7 +196,7 @@ test('exports the complete PTZ session contract', () => {
   ]);
 });
 
-test('declares an installable npm package with ESM types and CLI exports', () => {
+test('declares an installable npm package with ESM and CommonJS entry points', () => {
   const manifest = JSON.parse(readFileSync('package.json', 'utf8'));
   const lockfile = JSON.parse(readFileSync('package-lock.json', 'utf8'));
 
@@ -224,6 +224,12 @@ test('declares an installable npm package with ESM types and CLI exports', () =>
   assert.equal(manifest.types, './dist/index.d.ts');
   assert.equal(manifest.exports['.'].import, './dist/index.js');
   assert.equal(manifest.exports['.'].types, './dist/index.d.ts');
+  // Both conditions resolve to the same ESM file: CommonJS callers reach it
+  // through Node's require(esm), unflagged since 22.12.0. Pointing them at one
+  // artifact is what makes the dual-package hazard impossible rather than
+  // merely unlikely -- a process can only ever hold one module instance.
+  assert.equal(manifest.exports['.'].require, './dist/index.js');
+  assert.equal(manifest.engines.node, '>=22.12.0');
   assert.equal(manifest.bin['rtsp-backchannel'], 'dist/bin.js');
   assert.equal(
     manifest.repository.url,
@@ -252,6 +258,15 @@ test('ships separate English and Korean TypeScript documentation', () => {
   assert.match(korean, /README\.md/);
   assert.doesNotMatch(korean, /```(?:python|rust)/);
   for (const readme of [english, korean]) {
+    // Both module entry points, and the consumer-side cause of the
+    // MODULE_TYPELESS_PACKAGE_JSON warning, have to be documented in both
+    // languages -- the warning names the reader's own package.json, so a
+    // reader who only has the Korean README still needs to be told that.
+    assert.match(readme, /require\('rtsp-backchannel'\)/);
+    assert.match(readme, /"type": "module"/);
+    assert.match(readme, /MODULE_TYPELESS_PACKAGE_JSON/);
+    assert.match(readme, /\.mjs/);
+    assert.match(readme, /22\.12/);
     assert.match(readme, /cidrs/);
     assert.match(readme, /10\.0\.0\.0\/24/);
     assert.match(readme, /10\.128\.0\.10/);
@@ -382,5 +397,48 @@ test('ships clean public declarations without capability parser or injection sea
   assert.doesNotMatch(
     publicDeclarations,
     /PtzResponseError|formatPtzNumber|formatPtzDuration/,
+  );
+});
+
+test('loads from CommonJS with the same export surface as ESM', () => {
+  const build = spawnSync('npm', ['run', 'build'], { encoding: 'utf8' });
+  assert.equal(build.status, 0, build.stderr || build.stdout);
+
+  const probe = spawnSync(
+    process.execPath,
+    [
+      '-e',
+      // Requiring by package name rather than by path is what puts the
+      // exports "require" condition under test: a path require bypasses
+      // exports entirely and would keep passing if the condition were dropped.
+      "const loaded = require('rtsp-backchannel');\n" +
+        'process.stdout.write(JSON.stringify({\n' +
+        '  playFile: typeof loaded.playFile,\n' +
+        '  openPtzSession: typeof loaded.openPtzSession,\n' +
+        '  sampleRate: loaded.SAMPLE_RATE,\n' +
+        "  keys: Object.keys(loaded).filter((key) => key !== 'default').sort(),\n" +
+        '}));\n',
+    ],
+    { encoding: 'utf8' },
+  );
+
+  // package.json exposes one artifact under both the import and require
+  // conditions, so CommonJS callers arrive here through Node's require(esm).
+  // That path refuses an asynchronous module outright
+  // (ERR_REQUIRE_ASYNC_MODULE), which makes this assertion the guard that
+  // keeps top-level await out of the published graph: adding one anywhere
+  // reachable from index.ts breaks every require() consumer, and this test
+  // is what says so before a release does.
+  assert.equal(probe.status, 0, probe.stderr);
+
+  const loaded = JSON.parse(probe.stdout);
+  assert.equal(loaded.playFile, 'function');
+  assert.equal(loaded.openPtzSession, 'function');
+  assert.equal(loaded.sampleRate, library.SAMPLE_RATE);
+  assert.deepEqual(
+    loaded.keys,
+    Object.keys(library)
+      .filter((key) => key !== 'default')
+      .sort(),
   );
 });
