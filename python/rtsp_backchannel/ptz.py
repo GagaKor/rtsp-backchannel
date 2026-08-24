@@ -62,10 +62,17 @@ _AUTH_FAULT_PATTERNS = (
     ),
 )
 
-# Plain form, unlike capabilities.py's IncludeCapability=true: this session
-# only needs the XAddr list, and capabilities would inflate the response
-# against the shared 1MB body cap for data this module discards.
-_GET_SERVICES = f'<GetServices xmlns="{_DEVICE_NS}"/>'
+# IncludeCapability=false, unlike capabilities.py's true: this session only
+# needs the XAddr list, and capabilities would inflate the response against
+# the shared 1MB body cap for data this module discards. The element itself
+# is not optional -- it is minOccurs=1 in the Device WSDL, and a strict gSOAP
+# stack (TP-Link VIGI C540V, firmware 2.2.0 and 2.3.3) answers a bare
+# <GetServices/>
+# with HTTP 400 and a SOAP-ENV:Sender Fault.
+_GET_SERVICES = (
+    f'<GetServices xmlns="{_DEVICE_NS}">'
+    "<IncludeCapability>false</IncludeCapability></GetServices>"
+)
 _GET_NODES = f'<GetNodes xmlns="{_PTZ_NS}"/>'
 _MEDIA1_GET_PROFILES = f'<GetProfiles xmlns="{_MEDIA1_NS}"/>'
 _MEDIA2_GET_PROFILES = (
@@ -303,7 +310,16 @@ def format_ptz_duration(milliseconds: float) -> str:
         raise ValueError("PTZ timeout must be finite and greater than 0")
     if milliseconds > _MAX_MOVE_TIMEOUT_MS:
         raise ValueError("PTZ timeout must not exceed 60000 ms")
-    return f"PT{milliseconds / 1000:.3f}S"
+    # Whole seconds are emitted without a fraction: "PT1S", not "PT1.000S". Both
+    # are valid xs:duration, but a strict gSOAP stack (TP-Link VIGI C540V, firmware
+    # 2.2.0 and 2.3.3) rejects any decimal point with ter:InvalidArgVal, and the
+    # default move
+    # timeout is a whole second. Sub-second timeouts keep the fractional form -- it
+    # is the only faithful representation, and such a camera rejects them either way.
+    seconds = milliseconds / 1000
+    if seconds == int(seconds):
+        return f"PT{int(seconds)}S"
+    return f"PT{seconds:.3f}S"
 
 
 def _require_finite_in_range(value: float, value_range: tuple[float, float]) -> float:
@@ -689,10 +705,13 @@ class PtzSession:
 def open_ptz_session(options: PtzSessionOptions) -> PtzSession:
     """Open a PTZ control session.
 
-    Experimental: physical movement is unverified against real PTZ
-    hardware. Request construction, capability guarding, the device-side
-    move timeout, and stop-on-close are covered by tests; that a camera
-    actually moves as intended is not.
+    Experimental: physical movement is verified against one camera only --
+    a TP-Link VIGI C540V, firmware 2.2.0 and 2.3.3, on which every move method
+    moved
+    both pan/tilt and zoom in the requested direction and returned to its
+    starting coordinates. Request construction, capability guarding, the
+    device-side move timeout, and stop-on-close are covered by tests. No
+    optical-zoom or preset-tour camera has been exercised.
     """
 
     device = OnvifDevice(

@@ -26,7 +26,10 @@ MEDIA1_NS = "http://www.onvif.org/ver10/media/wsdl"
 MEDIA2_NS = "http://www.onvif.org/ver20/media/wsdl"
 PTZ_NS = "http://www.onvif.org/ver20/ptz/wsdl"
 
-GET_SERVICES = f'<GetServices xmlns="{DEV_NS}"/>'
+GET_SERVICES = (
+    f'<GetServices xmlns="{DEV_NS}">'
+    "<IncludeCapability>false</IncludeCapability></GetServices>"
+)
 GET_NODES = f'<GetNodes xmlns="{PTZ_NS}"/>'
 MEDIA1_GET_PROFILES = f'<GetProfiles xmlns="{MEDIA1_NS}"/>'
 MEDIA2_GET_PROFILES = (
@@ -199,8 +202,9 @@ class FormatterTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "^PTZ value must be finite$"):
                     format_ptz_number(bad)
 
-    def test_formats_ptz_durations_as_fixed_three_decimals(self):
-        self.assertEqual(format_ptz_duration(1000), "PT1.000S")
+    def test_formats_whole_seconds_without_a_fraction_and_the_rest_to_three_decimals(self):
+        self.assertEqual(format_ptz_duration(1000), "PT1S")
+        self.assertEqual(format_ptz_duration(2000), "PT2S")
         self.assertEqual(format_ptz_duration(1500), "PT1.500S")
         self.assertEqual(format_ptz_duration(250), "PT0.250S")
 
@@ -213,7 +217,7 @@ class FormatterTests(unittest.TestCase):
                     format_ptz_duration(bad)
 
     def test_rejects_a_ptz_duration_above_the_60000ms_ceiling_but_accepts_the_boundary(self):
-        self.assertEqual(format_ptz_duration(60_000), "PT60.000S")
+        self.assertEqual(format_ptz_duration(60_000), "PT60S")
         for bad in (60_001, 600_000):
             with self.subTest(value=bad):
                 with self.assertRaisesRegex(
@@ -521,14 +525,14 @@ class PtzRequestBodyTests(unittest.TestCase):
             body,
             f'<ContinuousMove xmlns="{PTZ_NS}"><ProfileToken>main</ProfileToken>'
             f'<Velocity><PanTilt xmlns="{SCHEMA_NS}" x="0.500000" y="-0.250000"/>'
-            "</Velocity><Timeout>PT1.000S</Timeout></ContinuousMove>",
+            "</Velocity><Timeout>PT1S</Timeout></ContinuousMove>",
         )
 
     def test_continuous_move_sends_an_explicit_per_call_timeout_in_the_body(self):
         # The Timeout element is the runaway guard: it must reach the wire as
         # the value the caller actually asked for, not a hardcoded default.
         # Every other test in this suite uses the 1000ms default, so without
-        # this test PT1.000S could be hardcoded and nothing would notice.
+        # this test PT1S could be hardcoded and nothing would notice.
         calls: list = []
         session = open_session(FakePtzDevice(calls, {"continuous_zoom": True}))
         session.continuous_move(zoom=0.5, timeout_ms=1500)

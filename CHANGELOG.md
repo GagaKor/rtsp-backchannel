@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- PTZ sessions now send the mandatory `IncludeCapability` element in their
+  `GetServices` request. A strict ONVIF stack answered the previous bare
+  `<GetServices/>` with HTTP 400 and a `SOAP-ENV:Sender` Fault, so
+  `openPtzSession` / `open_ptz_session` could not open against such a camera at
+  all.
+- Whole-second PTZ move timeouts are sent as `PT1S` rather than `PT1.000S`.
+  Both spell the same `xs:duration`, but a strict stack rejects the decimal
+  point with `ter:InvalidArgVal`, which made `continuousMove` fail at every
+  timeout value — including the 1000 ms default. Sub-second timeouts keep the
+  fractional form, so a caller's requested duration is never silently changed.
+
+### Changed
+
+- PTZ movement is no longer marked unverified against hardware. Every move
+  method is now confirmed on a TP-Link VIGI C540V (firmware 2.2.0 and 2.3.3)
+  for both
+  pan/tilt and zoom. The feature stays experimental: only that one model has
+  been exercised.
+
 ## [0.3.1] - 2026-08-13
 
 ### Changed

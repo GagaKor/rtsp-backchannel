@@ -398,9 +398,19 @@ result?;
 # Ok::<(), String>(())
 ```
 
-**Experimental.** Verified: session open, capability guarding, request
-construction, timeout inclusion, and stop-on-close. Unverified: that a
-camera physically moves as intended — no PTZ hardware was available.
+**Experimental.** Physical movement is now verified, against one camera: a
+TP-Link VIGI C540V (firmware 2.2.0 and 2.3.3), where `relativeMove`,
+`continuousMove`,
+and `absoluteMove` each moved the camera in the requested direction on both
+pan/tilt and zoom, `getStatus` tracked every move, and an `absoluteMove` back
+to the starting coordinates restored them exactly. Session open, capability
+guarding, request construction, timeout inclusion, and stop-on-close remain
+covered by tests. Unverified beyond that one model — no camera with optical
+zoom (the C540V's is digital) or with mechanical preset tours has been
+exercised. That camera also rejects any sub-second `Timeout`, so
+`continuousMove` with `timeoutMs` under 1000 fails on it; whole seconds are
+sent as `PT1S` rather than `PT1.000S` precisely because it rejects the
+decimal point.
 
 ### Device Discovery
 

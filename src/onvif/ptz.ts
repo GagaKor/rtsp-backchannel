@@ -274,7 +274,13 @@ export function formatPtzDuration(milliseconds: number): string {
   if (milliseconds > MAX_MOVE_TIMEOUT_MS) {
     throw new RangeError('PTZ timeout must not exceed 60000 ms');
   }
-  return `PT${(milliseconds / 1000).toFixed(3)}S`;
+  // Whole seconds are emitted without a fraction: `PT1S`, not `PT1.000S`. Both are
+  // valid xs:duration, but a strict gSOAP stack (TP-Link VIGI C540V, firmware 2.2.0 and 2.3.3)
+  // rejects any decimal point with ter:InvalidArgVal, and the default move timeout is
+  // a whole second. Sub-second timeouts keep the fractional form — it is the only
+  // faithful representation, and such a camera rejects them either way.
+  const seconds = milliseconds / 1000;
+  return Number.isInteger(seconds) ? `PT${seconds}S` : `PT${seconds.toFixed(3)}S`;
 }
 
 function vectorXml(tag: string, panTilt?: PtzVector, zoom?: number): string {
@@ -467,9 +473,13 @@ const defaultDependencies: PtzSessionDependencies = {
   createDevice: (host, user, pass, options) => new OnvifDevice(host, user, pass, options),
 };
 
-// Plain form, unlike capabilities.ts's IncludeCapability=true: this session only needs the
+// IncludeCapability=false, unlike capabilities.ts's true: this session only needs the
 // XAddr list, and capabilities would inflate the response against the shared 1MB body cap.
-const GET_SERVICES = `<GetServices xmlns="${DEV_NS}"/>`;
+// The element itself is not optional — it is minOccurs=1 in the Device WSDL, and a strict
+// gSOAP stack (TP-Link VIGI C540V, firmware 2.2.0 and 2.3.3) answers a bare
+// <GetServices/> with
+// HTTP 400 and a SOAP-ENV:Sender Fault, which used to fail openPtzSession outright.
+const GET_SERVICES = `<GetServices xmlns="${DEV_NS}"><IncludeCapability>false</IncludeCapability></GetServices>`;
 const GET_NODES = `<GetNodes xmlns="${PTZ_NS}"/>`;
 const MEDIA1_GET_PROFILES = `<GetProfiles xmlns="${MEDIA1_NS}"/>`;
 // Same body capabilities.ts sends for Media2 GetProfiles — not a second dialect.
@@ -596,10 +606,12 @@ class PtzSessionImpl implements PtzSession {
 /**
  * Open a PTZ control session.
  *
- * @experimental Physical movement is unverified against real PTZ hardware.
- * Request construction, capability guarding, the device-side move timeout,
- * and stop-on-close are covered by tests; that a camera actually moves as
- * intended is not.
+ * @experimental Physical movement is verified against one camera only — a
+ * TP-Link VIGI C540V, firmware 2.2.0 and 2.3.3, on which every move method moved
+ * pan/tilt and zoom in the requested direction and returned to its starting
+ * coordinates. Request construction, capability guarding, the device-side
+ * move timeout, and stop-on-close are covered by tests. No optical-zoom or
+ * preset-tour camera has been exercised.
  */
 export function openPtzSession(options: PtzSessionOptions): Promise<PtzSession> {
   return openPtzSessionWithDependencies(options, defaultDependencies);

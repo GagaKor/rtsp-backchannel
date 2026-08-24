@@ -44,10 +44,17 @@ const PAN_TILT_RANGE: (f64, f64) = (-1.0, 1.0);
 const ZOOM_GENERIC_RANGE: (f64, f64) = (-1.0, 1.0);
 const ZOOM_POSITION_RANGE: (f64, f64) = (0.0, 1.0);
 
-// Plain form, unlike capabilities.rs's IncludeCapability=true: this session
-// only needs the XAddr list, and capabilities would inflate the response
-// against the shared 1MB body cap for data this module discards.
-const GET_SERVICES: &str = "<GetServices xmlns=\"http://www.onvif.org/ver10/device/wsdl\"/>";
+// IncludeCapability=false, unlike capabilities.rs's true: this session only
+// needs the XAddr list, and capabilities would inflate the response against
+// the shared 1MB body cap for data this module discards. The element itself
+// is not optional -- it is minOccurs=1 in the Device WSDL, and a strict gSOAP
+// stack (TP-Link VIGI C540V, firmware 2.2.0 and 2.3.3) answers a bare
+// <GetServices/>
+// with HTTP 400 and a SOAP-ENV:Sender Fault.
+const GET_SERVICES: &str = concat!(
+    "<GetServices xmlns=\"http://www.onvif.org/ver10/device/wsdl\">",
+    "<IncludeCapability>false</IncludeCapability></GetServices>"
+);
 const GET_NODES: &str = "<GetNodes xmlns=\"http://www.onvif.org/ver20/ptz/wsdl\"/>";
 const MEDIA1_GET_PROFILES: &str = "<GetProfiles xmlns=\"http://www.onvif.org/ver10/media/wsdl\"/>";
 const MEDIA2_GET_PROFILES: &str = concat!(
@@ -505,7 +512,17 @@ fn format_ptz_duration(milliseconds: f64) -> Result<String, String> {
     if milliseconds > MAX_MOVE_TIMEOUT_MS {
         return Err("PTZ timeout must not exceed 60000 ms".to_owned());
     }
-    Ok(format!("PT{:.3}S", milliseconds / 1000.0))
+    // Whole seconds are emitted without a fraction: `PT1S`, not `PT1.000S`. Both are
+    // valid xs:duration, but a strict gSOAP stack (TP-Link VIGI C540V, firmware 2.2.0
+    // and 2.3.3)
+    // rejects any decimal point with ter:InvalidArgVal, and the default move timeout is
+    // a whole second. Sub-second timeouts keep the fractional form -- it is the only
+    // faithful representation, and such a camera rejects them either way.
+    let seconds = milliseconds / 1000.0;
+    if seconds.fract() == 0.0 {
+        return Ok(format!("PT{}S", seconds as i64));
+    }
+    Ok(format!("PT{seconds:.3}S"))
 }
 
 fn require_finite_in_range(value: f64, range: (f64, f64)) -> Result<f64, String> {
@@ -706,10 +723,12 @@ fn parse_status(response: roxmltree::Node<'_, '_>) -> PtzStatus {
 ///
 /// # Experimental
 ///
-/// Physical movement is unverified against real PTZ hardware. Request
-/// construction, capability guarding, the device-side move timeout, and
-/// stop-on-close are covered by tests; that a camera actually moves as
-/// intended is not.
+/// Physical movement is verified against one camera only — a TP-Link VIGI
+/// C540V, firmware 2.2.0 and 2.3.3, on which every move method moved both pan/tilt and
+/// zoom in the requested direction and returned to its starting coordinates.
+/// Request construction, capability guarding, the device-side move timeout,
+/// and stop-on-close are covered by tests. No optical-zoom or preset-tour
+/// camera has been exercised.
 pub struct PtzSession {
     device: OnvifDevice,
     ptz_xaddr: String,
@@ -921,10 +940,12 @@ impl PtzSession {
 
 /// Open a PTZ control session.
 ///
-/// **Experimental.** Physical movement is unverified against real PTZ
-/// hardware. Request construction, capability guarding, the device-side move
-/// timeout, and stop-on-close are covered by tests; that a camera actually
-/// moves as intended is not.
+/// **Experimental.** Physical movement is verified against one camera only — a
+/// TP-Link VIGI C540V, firmware 2.2.0 and 2.3.3, on which every move method moved both
+/// pan/tilt and zoom in the requested direction and returned to its starting
+/// coordinates. Request construction, capability guarding, the device-side
+/// move timeout, and stop-on-close are covered by tests. No optical-zoom or
+/// preset-tour camera has been exercised.
 pub fn open_ptz_session(options: &PtzSessionOptions) -> Result<PtzSession, String> {
     let device_urls = if options.device_urls.is_empty() {
         vec![
@@ -1040,7 +1061,9 @@ mod tests {
 
     #[test]
     fn formats_ptz_durations_as_fixed_three_decimals() {
-        assert_eq!(format_ptz_duration(1000.0).unwrap(), "PT1.000S");
+        assert_eq!(format_ptz_duration(1000.0).unwrap(), "PT1S");
+        assert_eq!(format_ptz_duration(2000.0).unwrap(), "PT2S");
+        assert_eq!(format_ptz_duration(1500.0).unwrap(), "PT1.500S");
         assert_eq!(format_ptz_duration(250.0).unwrap(), "PT0.250S");
         assert!(format_ptz_duration(0.0).is_err());
     }
@@ -1057,7 +1080,7 @@ mod tests {
 
     #[test]
     fn rejects_a_ptz_duration_above_the_60000ms_ceiling_but_accepts_the_boundary() {
-        assert_eq!(format_ptz_duration(60_000.0).unwrap(), "PT60.000S");
+        assert_eq!(format_ptz_duration(60_000.0).unwrap(), "PT60S");
         for bad in [60_001.0, 600_000.0] {
             assert_eq!(
                 format_ptz_duration(bad).unwrap_err(),
@@ -1783,7 +1806,7 @@ mod tests {
             &format!(
                 "<ContinuousMove xmlns=\"{PTZ_NS}\"><ProfileToken>main</ProfileToken>\
                  <Velocity><PanTilt xmlns=\"{SCHEMA_NS}\" x=\"0.500000\" y=\"-0.250000\"/></Velocity>\
-                 <Timeout>PT1.000S</Timeout></ContinuousMove>"
+                 <Timeout>PT1S</Timeout></ContinuousMove>"
             )
         );
     }
@@ -1793,7 +1816,7 @@ mod tests {
         // The Timeout element is the runaway guard: it must reach the wire
         // as the value the caller actually asked for, not a hardcoded
         // default. Every other test in this suite uses the 1000ms default,
-        // so without this test PT1.000S could be hardcoded undetected.
+        // so without this test PT1S could be hardcoded undetected.
         let (server, session) = open(FakeCameraConfig::default().with_spaces(PtzSpaces {
             continuous_zoom: true,
             ..PtzSpaces::default()

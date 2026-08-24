@@ -426,9 +426,17 @@ try {
 }
 ```
 
-**실험적 기능입니다.** 검증됨: 세션 열기, 기능 지원 확인(guard), 요청 구성,
-timeout 포함, close 시 stop 호출. 미검증: 카메라가 의도한 대로 실제로
-움직이는지 여부 — 실제 PTZ 하드웨어가 없어 확인하지 못했습니다.
+**실험적 기능입니다.** 물리적 움직임은 이제 카메라 한 대에서 검증되었습니다.
+TP-Link VIGI C540V(펌웨어 2.2.0 및 2.3.3)에서 `relativeMove`, `continuousMove`,
+`absoluteMove`가 pan/tilt와 zoom 양쪽 모두 요청한 방향으로 카메라를 움직였고,
+`getStatus`가 매 이동을 추적했으며, 시작 좌표로의 `absoluteMove`가 원위치를
+정확히 복원했습니다. 세션 열기, 기능 지원 확인(guard), 요청 구성, timeout 포함,
+close 시 stop 호출은 그대로 테스트로 덮여 있습니다. 이 한 모델을 넘어서는
+미검증입니다 — 광학 zoom(C540V는 디지털입니다)이나 기계식 preset tour를 갖춘
+카메라는 확인하지 못했습니다. 또한 이 카메라는 1초 미만 `Timeout`을 거부하므로
+`timeoutMs`가 1000 미만인 `continuousMove`는 실패합니다. 정수 초를
+`PT1.000S`가 아니라 `PT1S`로 보내는 것도 이 카메라가 소수점을 거부하기
+때문입니다.
 
 ### 저수준 백채널 API
 
