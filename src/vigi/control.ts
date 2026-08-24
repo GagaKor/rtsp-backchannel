@@ -87,6 +87,16 @@ function postJsonOverHttps(
       'Content-Length': payload.byteLength,
     },
     rejectUnauthorized: false,
+    // This camera closes the TCP connection after answering each request.
+    // https.globalAgent pools keep-alive sockets by default in modern
+    // Node, so the *next* postJsonOverHttps call (e.g. the doAuth response
+    // that follows the doAuth challenge) can get handed a socket the peer
+    // has already closed, failing with ECONNRESET ("socket hang up").
+    // agent: false opts every call out of pooling so each gets its own
+    // fresh socket. Verified against hardware: with the default agent,
+    // request 2 of doAuth fails with ECONNRESET; with agent: false it
+    // succeeds. Do not remove this to "optimise" the agent back in.
+    agent: false,
   };
   return new Promise((resolve, reject) => {
     let settled = false;

@@ -269,3 +269,61 @@ test('destroys the request and response sockets when a real HTTPS post times out
   assert.ok(requestDestroyedWith instanceof Error);
   assert.ok(responseDestroyedWith instanceof Error);
 });
+
+test('never lets the pooled keep-alive agent hand a call a stale socket', async () => {
+  // This camera closes its TCP connection after answering each request. The
+  // default https.globalAgent pools keep-alive sockets, so a later call
+  // (e.g. the doAuth response that follows the doAuth challenge) can be
+  // handed a socket the peer already closed and fail with ECONNRESET
+  // ("socket hang up") — reproduced against real hardware. postJsonOverHttps
+  // must pass agent: false on every request so each gets its own fresh
+  // socket; this guards against that regressing silently, since every other
+  // test here injects a fake postJson and never reaches the real transport.
+  const originalRequest = https.request;
+  const capturedOptions: https.RequestOptions[] = [];
+  https.request = ((
+    options: https.RequestOptions,
+    listener: (response: unknown) => void,
+  ) => {
+    capturedOptions.push(options);
+    const dataHandlers: Array<(chunk: Buffer) => void> = [];
+    const endHandlers: Array<() => void> = [];
+    const fakeResponse = {
+      on(event: string, handler: (...args: unknown[]) => void) {
+        if (event === 'data') dataHandlers.push(handler as (chunk: Buffer) => void);
+        if (event === 'end') endHandlers.push(handler as () => void);
+        return fakeResponse;
+      },
+    };
+    const fakeRequest = {
+      on() {
+        return fakeRequest;
+      },
+      end() {
+        listener(fakeResponse);
+        // A challenge with no `authenticate` field is enough to make
+        // openVigiControl reject right away, with exactly one HTTP call.
+        const body = Buffer.from(
+          JSON.stringify({ method: 'doAuth', errCode: -10020 }),
+          'utf8',
+        );
+        for (const handler of dataHandlers) handler(body);
+        for (const handler of endHandlers) handler();
+      },
+      destroy() {},
+    };
+    return fakeRequest;
+  }) as unknown as typeof https.request;
+
+  try {
+    await assert.rejects(
+      openVigiControl({ host: 'cam', pass: 'secret' }),
+      { message: 'invalid VIGI doAuth challenge' },
+    );
+  } finally {
+    https.request = originalRequest;
+  }
+
+  assert.equal(capturedOptions.length, 1);
+  assert.equal(capturedOptions[0].agent, false);
+});
