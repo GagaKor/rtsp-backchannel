@@ -2,6 +2,10 @@ import assert from 'node:assert/strict';
 import net from 'node:net';
 import { test } from 'node:test';
 import * as backchannel from './backchannel.ts';
+import {
+  BackchannelUnavailableError,
+  selectBackchannelTransport,
+} from './backchannel.ts';
 import { RtpPacketizer } from './rtp/sender.ts';
 
 interface TestClock {
@@ -589,4 +593,82 @@ test('preserves the keepalive deadline across encoding and paced RTP send', asyn
   assert.ok(keepAlive >= 0, 'expected keepalive at the original session deadline');
   assert.ok(activeSession.slice(0, keepAlive).includes('RTP'));
   assert.ok(activeSession.slice(keepAlive + 1).includes('RTP'));
+});
+
+test('BackchannelUnavailableError keeps the historical message', () => {
+  const error = new BackchannelUnavailableError();
+  assert.equal(error.message, 'no sendonly backchannel audio track');
+  assert.equal(error.kind, 'no-sendonly-track');
+});
+
+test('onvif transport returns the ONVIF session and never probes VIGI', async () => {
+  const calls: string[] = [];
+  const session = await selectBackchannelTransport('onvif', {
+    openOnvif: async () => { calls.push('onvif'); return 'onvif-session' as never; },
+    openVigi: async () => { calls.push('vigi'); return 'vigi-session' as never; },
+  });
+  assert.equal(session, 'onvif-session');
+  assert.deepEqual(calls, ['onvif']);
+});
+
+test('vigi transport returns the VIGI session and never tries ONVIF', async () => {
+  const calls: string[] = [];
+  const session = await selectBackchannelTransport('vigi', {
+    openOnvif: async () => { calls.push('onvif'); return 'onvif-session' as never; },
+    openVigi: async () => { calls.push('vigi'); return 'vigi-session' as never; },
+  });
+  assert.equal(session, 'vigi-session');
+  assert.deepEqual(calls, ['vigi']);
+});
+
+test('auto prefers ONVIF when a backchannel exists', async () => {
+  const calls: string[] = [];
+  const session = await selectBackchannelTransport('auto', {
+    openOnvif: async () => { calls.push('onvif'); return 'onvif-session' as never; },
+    openVigi: async () => { calls.push('vigi'); return 'vigi-session' as never; },
+  });
+  assert.equal(session, 'onvif-session');
+  assert.deepEqual(calls, ['onvif'], 'VIGI is not probed when ONVIF succeeds');
+});
+
+test('auto falls back to VIGI only on the no-sendonly-track condition', async () => {
+  const calls: string[] = [];
+  const session = await selectBackchannelTransport('auto', {
+    openOnvif: async () => {
+      calls.push('onvif');
+      throw new BackchannelUnavailableError();
+    },
+    openVigi: async () => { calls.push('vigi'); return 'vigi-session' as never; },
+  });
+  assert.equal(session, 'vigi-session');
+  assert.deepEqual(calls, ['onvif', 'vigi']);
+});
+
+test('auto propagates a non-backchannel ONVIF failure without probing VIGI', async () => {
+  const calls: string[] = [];
+  await assert.rejects(
+    selectBackchannelTransport('auto', {
+      openOnvif: async () => {
+        calls.push('onvif');
+        throw new Error('ONVIF connect failed: request failed');
+      },
+      openVigi: async () => { calls.push('vigi'); return 'vigi-session' as never; },
+    }),
+    { message: 'ONVIF connect failed: request failed' },
+  );
+  assert.deepEqual(calls, ['onvif'], 'a real fault must not be masked by a VIGI attempt');
+});
+
+test('auto reports both attempts when VIGI also fails', async () => {
+  await assert.rejects(
+    selectBackchannelTransport('auto', {
+      openOnvif: async () => { throw new BackchannelUnavailableError(); },
+      openVigi: async () => { throw new Error('VIGI OpenAPI port 20443 unreachable'); },
+    }),
+    {
+      message:
+        'no audio send path: ONVIF backchannel absent (no sendonly track); '
+        + 'VIGI OpenAPI port 20443 unreachable',
+    },
+  );
 });
