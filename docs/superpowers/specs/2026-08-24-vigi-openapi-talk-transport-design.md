@@ -178,7 +178,16 @@ Most of what the transport needs already exists and is used unchanged:
 - `src/rtp/sender.ts` — `RtpPacketizer` and `interleave(channel, rtp)` already
   produce the exact `$ / channel / length / RTP` framing VIGI specifies.
 - `src/audio/g711.ts` — `pcm16ToG711` for a-law encoding.
-- `src/backchannel.ts` — `sendPacedG711` for real-time pacing.
+- `src/backchannel.ts` — `sendPacedFrames`, the generic pacer, driven by a 20 ms
+  frame generator. Not `sendPacedG711`: that helper is fixed at the ONVIF
+  backchannel's 40 ms `PACKET_MS`, and only 20 ms / 160-byte frames have been
+  confirmed against this camera. Asserting 40 ms works would be asserting
+  something untested.
+- `src/onvif/deviceClient.ts` — the HTTPS request shape to copy for the control
+  client: `node:https` with `rejectUnauthorized: false` for the camera's
+  self-signed certificate, an explicit per-request timeout, `maxHeaderSize`, and
+  a response body cap. The control client follows the same pattern rather than
+  global `fetch`, which cannot accept a self-signed certificate.
 
 Genuinely new: the control client and the `MULTITRANS` handshake.
 
