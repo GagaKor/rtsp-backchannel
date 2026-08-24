@@ -52,6 +52,7 @@ export type {
 
 export { getCameraCapabilities } from './onvif/capabilities.ts';
 export type {
+  CameraCapabilityAudioSend,
   CameraCapabilityOptions,
   CameraCapabilityProfile,
   CameraCapabilityReport,

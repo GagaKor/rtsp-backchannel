@@ -8,6 +8,7 @@ import type {
   AdtsFrame,
   AudioCodecName,
   BackchannelOptions,
+  CameraCapabilityAudioSend,
   CameraCapabilityOptions,
   CameraCapabilityProfile,
   CameraCapabilityReport,
@@ -110,6 +111,12 @@ test('exports the complete camera capability report contract', () => {
     operation: 'PTZ GetNodes',
     message: 'request timeout',
   };
+  const audioSend: CameraCapabilityAudioSend = {
+    detected: true,
+    transport: 'onvif',
+    onvifBackchannel: true,
+    vigiTalk: null,
+  };
   const report: CameraCapabilityReport = {
     device: { manufacturer: 'Example Camera Vendor' },
     scopes: ['onvif://www.onvif.org/Profile/Streaming'],
@@ -130,6 +137,7 @@ test('exports the complete camera capability report contract', () => {
       encodings: ['H264', 'H265'],
       h265Supported: true,
     },
+    audioSend,
     warnings: [warning],
   };
   const getCapabilities: (
@@ -348,6 +356,7 @@ test('ships clean public declarations without capability parser or injection sea
   const cliDeclaration = readFileSync('dist/cli.d.ts', 'utf8');
   assert.match(indexDeclaration, /export \{ getCameraCapabilities \}/);
   for (const typeName of [
+    'CameraCapabilityAudioSend',
     'CameraCapabilityOptions',
     'CameraCapabilityProfile',
     'CameraCapabilityReport',

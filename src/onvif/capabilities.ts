@@ -14,6 +14,10 @@ import {
   textOf,
   type XmlElement,
 } from './xml.ts';
+import { parseRtspTarget } from '../backchannel.ts';
+import { RtspClient } from '../rtsp/backchannelClient.ts';
+import { findBackchannelAudio, parseSdp } from '../rtsp/sdp.ts';
+import { openVigiControl } from '../vigi/control.ts';
 
 const SOAP_12_NS = 'http://www.w3.org/2003/05/soap-envelope';
 const SOAP_11_NS = 'http://schemas.xmlsoap.org/soap/envelope/';
@@ -31,6 +35,8 @@ export interface CameraCapabilityOptions {
   pass?: string;
   deviceUrls?: string[];
   timeoutMs?: number;
+  /** Probe whether ONVIF backchannel or VIGI talk can send audio. Default true. */
+  probeAudioSend?: boolean;
 }
 
 export interface CameraCapabilityService {
@@ -55,6 +61,13 @@ export interface CameraCapabilityWarning {
   message: string;
 }
 
+export interface CameraCapabilityAudioSend {
+  detected: boolean | null;
+  transport: 'onvif' | 'vigi' | null;
+  onvifBackchannel: boolean | null;
+  vigiTalk: boolean | null;
+}
+
 export interface CameraCapabilityReport {
   device: DeviceInfo;
   scopes: string[];
@@ -75,6 +88,7 @@ export interface CameraCapabilityReport {
     encodings: string[];
     h265Supported: boolean | null;
   };
+  audioSend: CameraCapabilityAudioSend;
   warnings: CameraCapabilityWarning[];
 }
 
@@ -586,6 +600,20 @@ export interface CameraCapabilityDependencies {
     pass: string,
     options: OnvifOptions,
   ): CameraCapabilityDevice;
+  /** Whether the camera offers a usable ONVIF backchannel sendonly audio track. */
+  probeOnvifBackchannel(
+    host: string,
+    user: string,
+    pass: string,
+    options: OnvifOptions,
+  ): Promise<boolean>;
+  /** Whether the VIGI OpenAPI reports a speaker (audio send via VIGI talk). */
+  probeVigiTalk(
+    host: string,
+    user: string,
+    pass: string,
+    options: OnvifOptions,
+  ): Promise<boolean>;
 }
 
 class OnvifHttpError extends Error {
@@ -595,8 +623,58 @@ class OnvifHttpError extends Error {
   }
 }
 
+/**
+ * Opens a fresh ONVIF device/media session and performs a backchannel
+ * DESCRIBE, exactly as `openOnvifBackchannel` does, but stops after reading
+ * the SDP instead of proceeding to SETUP/PLAY: this probe only answers
+ * "is a sendonly audio track offered", it never sends audio. The RTSP
+ * socket is always closed before returning, whether the probe succeeds or
+ * throws, so a failed probe cannot leak a socket.
+ */
+async function defaultProbeOnvifBackchannel(
+  host: string,
+  user: string,
+  pass: string,
+  options: OnvifOptions,
+): Promise<boolean> {
+  const device = new OnvifDevice(host, user, pass, options);
+  await device.connect();
+  const profiles = await device.getProfiles();
+  if (profiles.length === 0) throw new Error('no media profiles');
+  const endpoint = parseRtspTarget(await device.getStreamUri(profiles[0].token), user, pass);
+  const rtsp = new RtspClient(endpoint.host, endpoint.port, endpoint.user, endpoint.pass, options.timeoutMs);
+  try {
+    await rtsp.connect();
+    const desc = await rtsp.describe(endpoint.uri, { backchannel: true });
+    if (desc.status !== 200) throw new Error(`backchannel DESCRIBE ${desc.statusLine}`);
+    const track = findBackchannelAudio(parseSdp(desc.body));
+    return Boolean(track?.control);
+  } finally {
+    rtsp.close();
+  }
+}
+
+/** Asks the VIGI OpenAPI control channel whether the device reports a speaker. */
+async function defaultProbeVigiTalk(
+  host: string,
+  user: string,
+  pass: string,
+  options: OnvifOptions,
+): Promise<boolean> {
+  const control = await openVigiControl({
+    host,
+    ...(user ? { user } : {}),
+    pass,
+    ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+  });
+  const capability = await control.getAudioCapability();
+  return capability.speaker;
+}
+
 const defaultDependencies: CameraCapabilityDependencies = {
   createDevice: (host, user, pass, options) => new OnvifDevice(host, user, pass, options),
+  probeOnvifBackchannel: defaultProbeOnvifBackchannel,
+  probeVigiTalk: defaultProbeVigiTalk,
 };
 
 const GET_SCOPES = `<GetScopes xmlns="${DEV_NS}"/>`;
@@ -795,6 +873,42 @@ export async function getCameraCapabilitiesWithDependencies(
       .map((profile) => profile.token),
   )].sort(compareText);
 
+  // Optional enrichment, run only after every ONVIF fact above has been
+  // collected: the device is already authenticated by this point, so the
+  // VIGI probe below issues its single doAuth attempt against a host we
+  // already know accepts these credentials, and never advances the
+  // device's failed-auth lockout counter with a bad password.
+  const audioSend: CameraCapabilityAudioSend = {
+    detected: null, transport: null, onvifBackchannel: null, vigiTalk: null,
+  };
+  if (options.probeAudioSend ?? true) {
+    try {
+      audioSend.onvifBackchannel = await dependencies.probeOnvifBackchannel(
+        options.host, user, pass, clientOptions,
+      );
+    } catch (error) {
+      warn('AudioSendProbe', error);
+    }
+    if (audioSend.onvifBackchannel === true) {
+      audioSend.detected = true;
+      audioSend.transport = 'onvif';
+    } else {
+      try {
+        audioSend.vigiTalk = await dependencies.probeVigiTalk(
+          options.host, user, pass, clientOptions,
+        );
+      } catch (error) {
+        warn('AudioSendProbe', error);
+      }
+      if (audioSend.vigiTalk === true) {
+        audioSend.detected = true;
+        audioSend.transport = 'vigi';
+      } else if (audioSend.onvifBackchannel !== null || audioSend.vigiTalk !== null) {
+        audioSend.detected = false;
+      }
+    }
+  }
+
   return {
     device,
     scopes,
@@ -815,6 +929,7 @@ export async function getCameraCapabilitiesWithDependencies(
       encodings,
       h265Supported,
     },
+    audioSend,
     warnings,
   };
 }

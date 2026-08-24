@@ -16,6 +16,8 @@ import {
   parseServicesResponse,
   selectService,
   type CameraCapabilityDependencies,
+  type CameraCapabilityOptions,
+  type CameraCapabilityReport,
 } from './capabilities.ts';
 
 const SOAP_NS = 'http://www.w3.org/2003/05/soap-envelope';
@@ -629,6 +631,11 @@ function fakeCapabilityDependencies(
         return respond(body, endpoint);
       },
     }),
+    // Fixture tests are about the ONVIF facts above; default the audioSend
+    // probes to a quiet "no answer" so they never add unexpected warnings
+    // or network attempts. Tests that care override these explicitly.
+    probeOnvifBackchannel: async () => false,
+    probeVigiTalk: async () => false,
   };
 }
 
@@ -668,6 +675,28 @@ async function assertCanonicalAuthFailure(
   assert.deepEqual(calls.map(({ body }) => body), [GET_SCOPES, GET_SERVICES]);
 }
 
+/**
+ * Builds a report using the same fake-device plumbing as every other test
+ * here. None of the ONVIF SOAP calls are stubbed to succeed — every one
+ * throws and is absorbed as an ordinary warning by the existing enrichment
+ * try/catches — so each test can focus purely on the two audioSend probes
+ * it injects, which run only after every other fact-gathering step has
+ * already failed or succeeded.
+ */
+function capabilityReportWithProbes(
+  probes: Pick<CameraCapabilityDependencies, 'probeOnvifBackchannel' | 'probeVigiTalk'>,
+  options: Partial<CameraCapabilityOptions> = {},
+): Promise<CameraCapabilityReport> {
+  const calls: RecordedCapabilityCall[] = [];
+  const dependencies: CameraCapabilityDependencies = {
+    ...fakeCapabilityDependencies(calls, async () => {
+      throw new Error('onvif call not stubbed for audioSend fixture');
+    }),
+    ...probes,
+  };
+  return getCameraCapabilitiesWithDependencies({ host: 'camera', ...options }, dependencies);
+}
+
 test('orchestrates exact authenticated bodies and routes advertised services deterministically', async () => {
   const calls: RecordedCapabilityCall[] = [];
   const createCalls: unknown[] = [];
@@ -705,6 +734,7 @@ test('orchestrates exact authenticated bodies and routes advertised services det
     throw new Error(`unexpected fake operation: ${body} at ${endpoint}`);
   });
   const wrappedDependencies: CameraCapabilityDependencies = {
+    ...dependencies,
     createDevice: (host, user, pass, options) => {
       createCalls.push({ host, user, pass, options });
       return dependencies.createDevice(host, user, pass, options);
@@ -1125,6 +1155,10 @@ test('retains cross-host advertised XAddr facts but warns without contacting the
       user: 'viewer',
       pass: 'camera-secret',
       deviceUrls: [`http://127.0.0.1:${deviceAddress.port}/onvif/device_service`],
+      // This test is about ONVIF service-discovery safety, not audioSend;
+      // disable the probes so the real default dependencies never open a
+      // second device connection or dispatch real network I/O to VIGI.
+      probeAudioSend: false,
     });
 
     assert.equal(report.device.manufacturer, 'Acme & Co');
@@ -1232,12 +1266,74 @@ test('capability report matches shared cross-language fixture', async () => {
       pass: 'camera-secret',
       deviceUrls: [`${baseUrl}/device`],
       timeoutMs: 2_000,
+      // audioSend is TypeScript-only so far; the shared fixture (consumed
+      // by the Rust parity test too) does not describe it. Disable the
+      // probes here and compare the rest of the report exactly.
+      probeAudioSend: false,
     });
 
     assert.deepEqual(operationsSeen, expectedOperations);
-    assert.deepEqual(JSON.parse(JSON.stringify(report)), fixture.expectedReport);
+    assert.deepEqual(JSON.parse(JSON.stringify(report)), {
+      ...(fixture.expectedReport as object),
+      audioSend: { detected: null, transport: null, onvifBackchannel: null, vigiTalk: null },
+    });
   } finally {
     await new Promise<void>((resolve, reject) =>
       server.close((error) => (error ? reject(error) : resolve())));
   }
+});
+
+test('reports an ONVIF backchannel as the audio-send transport', async () => {
+  const report = await capabilityReportWithProbes({
+    probeOnvifBackchannel: async () => true,
+    probeVigiTalk: async () => { throw new Error('must not be probed'); },
+  });
+  assert.deepEqual(report.audioSend, {
+    detected: true, transport: 'onvif', onvifBackchannel: true, vigiTalk: null,
+  });
+});
+
+test('falls through to VIGI when no sendonly track is offered', async () => {
+  const report = await capabilityReportWithProbes({
+    probeOnvifBackchannel: async () => false,
+    probeVigiTalk: async () => true,
+  });
+  assert.deepEqual(report.audioSend, {
+    detected: true, transport: 'vigi', onvifBackchannel: false, vigiTalk: true,
+  });
+});
+
+test('reports no audio-send path when neither transport answers', async () => {
+  const report = await capabilityReportWithProbes({
+    probeOnvifBackchannel: async () => false,
+    probeVigiTalk: async () => false,
+  });
+  assert.deepEqual(report.audioSend, {
+    detected: false, transport: null, onvifBackchannel: false, vigiTalk: false,
+  });
+});
+
+test('a failed probe warns and leaves the fact null instead of failing the report', async () => {
+  const report = await capabilityReportWithProbes({
+    probeOnvifBackchannel: async () => { throw new Error('describe blew up'); },
+    probeVigiTalk: async () => false,
+  });
+  assert.equal(report.audioSend.onvifBackchannel, null);
+  assert.equal(report.audioSend.detected, false);
+  assert.ok(report.warnings.some((w) => w.operation === 'AudioSendProbe'));
+});
+
+test('probeAudioSend false leaves every audioSend fact null and runs no probe', async () => {
+  let probed = false;
+  const report = await capabilityReportWithProbes(
+    {
+      probeOnvifBackchannel: async () => { probed = true; return true; },
+      probeVigiTalk: async () => { probed = true; return true; },
+    },
+    { probeAudioSend: false },
+  );
+  assert.equal(probed, false);
+  assert.deepEqual(report.audioSend, {
+    detected: null, transport: null, onvifBackchannel: null, vigiTalk: null,
+  });
 });
