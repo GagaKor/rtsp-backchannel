@@ -211,6 +211,7 @@ test('declares an installable npm package with ESM types and CLI exports', () =>
     'dist/onvif',
     'dist/rtp',
     'dist/rtsp',
+    'dist/vigi',
     'README.md',
     'README.ko.md',
     'LICENSE',

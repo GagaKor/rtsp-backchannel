@@ -247,6 +247,21 @@ test('accepts only public codec preference values', () => {
   );
 });
 
+test('accepts only public transport preference values', () => {
+  const required = ['--host', 'camera', '--file', 'event.mp3'];
+  const transports = ['auto', 'onvif', 'vigi'];
+  for (const transport of transports) {
+    const parsed = cli.parseCliArgs([...required, '--transport', transport]) as unknown as {
+      transport?: string;
+    };
+    assert.equal(parsed.transport, transport);
+  }
+  assert.throws(
+    () => cli.parseCliArgs([...required, '--transport', 'nope']),
+    /transport must be one of/,
+  );
+});
+
 test('uses ONVIF_PASSWORD when --pass is omitted', () => {
   type Parsed = { pass: string };
   type Parser = (argv: string[]) => Parsed;
@@ -366,7 +381,7 @@ test('passes codec preference through negotiation and sends codec-neutral file f
         host: string,
         user?: string,
         pass?: string,
-        options?: { codec?: string },
+        options?: { codec?: string; transport?: string },
       ): Promise<{
         codec: typeof codec;
         payloadType: number;
@@ -422,8 +437,75 @@ test('passes codec preference through negotiation and sends codec-neutral file f
     host: 'rtsp://embedded:secret@camera/live',
     user: '',
     pass: '',
-    options: { codec: 'g726-32' },
+    options: { codec: 'g726-32', transport: 'auto' },
   }]);
+});
+
+test('playFile passes the transport through to openBackchannel', async () => {
+  const seen: Array<Record<string, unknown>> = [];
+  const dependencies: PublicPlaybackDependencies = {
+    openBackchannel: async (_host, _user, _pass, options) => {
+      seen.push({ ...options });
+      return {
+        codec: { name: 'pcma', payloadType: 8, encoding: 'PCMA', clockRate: 8000 },
+        payloadType: 8,
+        clockRate: 8000,
+        rtpChannel: 0,
+        send: async () => 1,
+        close: async () => {},
+      };
+    },
+    fileToG711,
+    fileToRtpAudio: async () => ({
+      codec: 'pcma',
+      clockRate: 8000,
+      frames: [{ payload: Buffer.alloc(160), samples: 160 }],
+      byteLength: 160,
+      sampleCount: 160,
+    }),
+    log: () => {},
+  };
+
+  await cli.playFile({ host: 'cam', file: '/tmp/a.wav', transport: 'vigi' }, dependencies);
+
+  assert.equal(seen[0].transport, 'vigi');
+});
+
+test('playFile defaults the transport to auto', async () => {
+  const seen: Array<Record<string, unknown>> = [];
+  const dependencies: PublicPlaybackDependencies = {
+    openBackchannel: async (_host, _user, _pass, options) => {
+      seen.push({ ...options });
+      return {
+        codec: { name: 'pcma', payloadType: 8, encoding: 'PCMA', clockRate: 8000 },
+        payloadType: 8,
+        clockRate: 8000,
+        rtpChannel: 0,
+        send: async () => 1,
+        close: async () => {},
+      };
+    },
+    fileToG711,
+    fileToRtpAudio: async () => ({
+      codec: 'pcma',
+      clockRate: 8000,
+      frames: [{ payload: Buffer.alloc(160), samples: 160 }],
+      byteLength: 160,
+      sampleCount: 160,
+    }),
+    log: () => {},
+  };
+
+  await cli.playFile({ host: 'cam', file: '/tmp/a.wav' }, dependencies);
+
+  assert.equal(seen[0].transport, 'auto');
+});
+
+test('the play command rejects an unknown --transport value', () => {
+  assert.throws(
+    () => cli.parseCliArgs(['--host', 'cam', '--file', '/tmp/a.wav', '--transport', 'nope']),
+    /transport must be one of/,
+  );
 });
 
 test('keeps the RTSP session alive while codec-neutral file encoding runs', async () => {

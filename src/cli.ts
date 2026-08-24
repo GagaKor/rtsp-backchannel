@@ -12,6 +12,7 @@ import {
   redactRtspCredentials,
   SAMPLE_RATE,
   type BackchannelSession,
+  type BackchannelTransport,
 } from './backchannel.ts';
 import { fileToG711, fileToRtpAudio } from './audio/transcode.ts';
 import { pathToFileURL } from 'node:url';
@@ -34,6 +35,7 @@ Options:
   --user <name>       ONVIF/RTSP user
   --pass <password>   ONVIF/RTSP password (or set ONVIF_PASSWORD)
   --codec <name>      auto|pcma|pcmu|g726-16|g726-24|g726-32|g726-40|aac
+  --transport <name>  auto|onvif|vigi (default: auto)
   --volume <0..1>     linear volume (default: 0.05)
 
 Discovery options:
@@ -60,6 +62,7 @@ const CODEC_PREFERENCES: readonly CodecPreference[] = [
   'g726-40',
   'aac',
 ];
+const TRANSPORTS: readonly BackchannelTransport[] = ['auto', 'onvif', 'vigi'];
 const MAX_CAPABILITY_TIMEOUT_MS = 86_400_000;
 const CAPABILITY_TIMEOUT_RANGE_ERROR = 'timeout-ms exceeds the 24-hour maximum';
 const CAPABILITY_TERMINATOR_ERROR = 'capabilities does not accept an argument terminator';
@@ -79,6 +82,7 @@ export interface PlaybackOptions {
   file: string;
   volume?: number;
   codec?: CodecPreference;
+  transport?: BackchannelTransport;
 }
 
 type PlaybackBackchannelSession = Omit<BackchannelSession, 'withKeepAlive'> & {
@@ -222,6 +226,10 @@ export function parseCliArgs(argv: string[]): PlaybackOptions {
   if (!CODEC_PREFERENCES.includes(codecValue as CodecPreference)) {
     throw new RangeError(`codec must be one of: ${CODEC_PREFERENCES.join(', ')}`);
   }
+  const transportValue = arg(argv, 'transport', 'auto').toLowerCase();
+  if (!TRANSPORTS.includes(transportValue as BackchannelTransport)) {
+    throw new RangeError(`transport must be one of: ${TRANSPORTS.join(', ')}`);
+  }
   return {
     host: arg(argv, 'host'),
     user: arg(argv, 'user', ''),
@@ -229,6 +237,7 @@ export function parseCliArgs(argv: string[]): PlaybackOptions {
     file: arg(argv, 'file'),
     volume,
     codec: codecValue as CodecPreference,
+    transport: transportValue as BackchannelTransport,
   };
 }
 
@@ -243,9 +252,10 @@ export async function playFile(
     file,
     volume = 0.05,
     codec = 'auto',
+    transport = 'auto',
   } = options;
   dependencies.log(`# play "${file}" -> ${displayRtspTarget(host)} speaker (backchannel)`);
-  const session = await dependencies.openBackchannel(host, user, pass, { codec });
+  const session = await dependencies.openBackchannel(host, user, pass, { codec, transport });
   let sent = 0;
   let playbackFailed = false;
   let playbackError: unknown;
