@@ -84,6 +84,8 @@ interface RtspReply {
   status: number;
   headers: string;
   body: string;
+  /** Characters of `raw` this reply consumed; the caller must keep the rest. */
+  consumed: number;
 }
 
 function parseReply(raw: string): RtspReply | undefined {
@@ -93,10 +95,17 @@ function parseReply(raw: string): RtspReply | undefined {
   const statusLine = headers.split('\r\n')[0];
   const lengthMatch = /\r\nContent-Length:\s*(\d+)/i.exec(headers);
   const length = lengthMatch ? Number(lengthMatch[1]) : 0;
-  const body = raw.slice(split + 4);
+  const bodyStart = split + 4;
+  const body = raw.slice(bodyStart);
   if (Buffer.byteLength(body, 'binary') < length) return undefined;
   const status = Number(/^RTSP\/\d\.\d\s+(\d+)/.exec(statusLine)?.[1] ?? 0);
-  return { statusLine, status, headers, body: body.slice(0, length) };
+  return {
+    statusLine,
+    status,
+    headers,
+    body: body.slice(0, length),
+    consumed: bodyStart + length,
+  };
 }
 
 const defaultDependencies: VigiTalkDependencies = {
@@ -121,11 +130,17 @@ export function createVigiTalkSession(
   let packetizer: RtpPacketizer | undefined;
   let closed = false;
   let opening: Promise<VigiTalkSocket> | undefined;
+  // Lets close() cut a handshake short instead of leaking the connection: set
+  // while a handshake is in flight, cleared as soon as it settles either way.
+  let abortOpening: ((error: Error) => void) | undefined;
 
   function open(): Promise<VigiTalkSocket> {
     if (opening) return opening;
     opening = new Promise<VigiTalkSocket>((resolve, reject) => {
       const connection = dependencies.connect(options.streamPort, options.host);
+      // Track the connection as soon as it exists, not only once the
+      // handshake succeeds, so close() can always reach it.
+      socket = connection;
       let buffer = '';
       let cseq = 1;
       let challenge: DigestChallenge | undefined;
@@ -134,15 +149,17 @@ export function createVigiTalkSession(
       const settle = (error?: Error): void => {
         if (settled) return;
         settled = true;
+        abortOpening = undefined;
         clearTimeout(timer);
         if (error) {
           connection.destroy();
+          socket = undefined;
           reject(error);
         } else {
-          socket = connection;
           resolve(connection);
         }
       };
+      abortOpening = settle;
       const timer = setTimeout(
         () => settle(new Error('VIGI talk MULTITRANS timeout')),
         timeoutMs,
@@ -154,10 +171,15 @@ export function createVigiTalkSession(
 
       connection.on('error', () => settle(new Error('VIGI talk connection failed')));
       connection.on('data', ((chunk: Buffer) => {
+        // The handshake is over; anything arriving now — a keepalive, a
+        // coalesced trailing byte, or downlink audio in aec mode — is not a
+        // MULTITRANS reply. Ignore it instead of feeding a text parser with
+        // binary audio, which would never match and would buffer unbounded.
+        if (settled) return;
         buffer += chunk.toString('binary');
         const reply = parseReply(buffer);
         if (!reply) return;
-        buffer = '';
+        buffer = buffer.slice(reply.consumed);
 
         if (reply.status === 401 && !challenge) {
           const header = /\r\nWWW-Authenticate:\s*(Digest [^\r]+)/i.exec(reply.headers);
@@ -249,6 +271,10 @@ export function createVigiTalkSession(
     async close(): Promise<void> {
       if (closed) return;
       closed = true;
+      // If a handshake is still in flight, reject it (consistent with "send
+      // after close is rejected") instead of letting it resolve to a
+      // connection nothing will ever use again.
+      abortOpening?.(new Error('VIGI talk session is closed'));
       socket?.end();
       socket = undefined;
     },

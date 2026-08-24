@@ -296,3 +296,71 @@ test('send after close is rejected', async () => {
     { message: 'VIGI talk session is closed' },
   );
 });
+
+test('a single data event carrying the 200 OK plus trailing bytes still opens', async () => {
+  const socket = new FakeSocket();
+  let replies = 0;
+  const original = socket.write.bind(socket);
+  socket.write = (chunk: Buffer | string): boolean => {
+    const result = original(chunk);
+    const text = Buffer.isBuffer(chunk) ? '' : String(chunk);
+    if (text.startsWith('MULTITRANS')) {
+      replies += 1;
+      // The OK reply arrives coalesced with bytes that belong to whatever
+      // comes next on the wire (a keepalive, the start of downlink audio).
+      const reply = replies === 1 ? CHALLENGE : `${OK}TRAILING-BYTES-NOT-PART-OF-THIS-REPLY`;
+      queueMicrotask(() => socket.emit('data', Buffer.from(reply, 'binary')));
+    }
+    return result;
+  };
+  const session = createVigiTalkSession(
+    { ...OPTIONS, clock: instantClock },
+    { connect: () => socket },
+  );
+
+  const sent = await session.send(Buffer.alloc(VIGI_TALK_SAMPLES_PER_PACKET, 0xd5));
+  assert.equal(sent, 1, 'the trailing bytes did not stop the session opening');
+  assert.equal(socket.rtpFrames.length, 1);
+});
+
+test('bytes arriving after the handshake settles are ignored, not reprocessed', async () => {
+  const { socket, dependencies } = harness();
+  autoRespond(socket);
+  const session = createVigiTalkSession(
+    { ...OPTIONS, clock: instantClock },
+    dependencies,
+  );
+  await session.send(Buffer.alloc(VIGI_TALK_SAMPLES_PER_PACKET, 0xd5));
+  assert.equal(socket.requests.length, 2, 'handshake done: one challenge, one authenticated request');
+
+  // Simulate stray post-handshake traffic on the same socket: downlink audio
+  // (arbitrary binary, never framed as an RTSP reply) and a duplicate of the
+  // camera's own success reply (as a keepalive echo might look). Neither
+  // should be fed back into the handshake state machine.
+  assert.doesNotThrow(() => socket.emit('data', Buffer.alloc(4096, 0xaa)));
+  assert.doesNotThrow(() => socket.emit('data', Buffer.from(OK, 'binary')));
+
+  // The session must still work normally afterwards: no re-authentication,
+  // no extra MULTITRANS request, and audio still frames correctly.
+  const sent = await session.send(Buffer.alloc(VIGI_TALK_SAMPLES_PER_PACKET, 0xd5));
+  assert.equal(sent, 1);
+  assert.equal(socket.requests.length, 2, 'no additional handshake request was triggered');
+  assert.equal(socket.rtpFrames.length, 2);
+});
+
+test('close during an in-flight open aborts the handshake and destroys the connection', async () => {
+  const { socket, dependencies } = harness();
+  autoRespond(socket);
+  const session = createVigiTalkSession(
+    { ...OPTIONS, clock: instantClock },
+    dependencies,
+  );
+
+  const sendPromise = session.send(Buffer.alloc(VIGI_TALK_SAMPLES_PER_PACKET, 0xd5));
+  const closePromise = session.close();
+
+  await assert.rejects(sendPromise, { message: 'VIGI talk session is closed' });
+  await closePromise;
+  assert.equal(socket.destroyed, true, 'the pending connection was destroyed, not leaked');
+  assert.equal(socket.requests.length, 1, 'closed before the challenge reply was ever handled');
+});
