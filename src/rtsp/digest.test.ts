@@ -110,6 +110,22 @@ test('parses a SHA-256 challenge with qop', () => {
   });
 });
 
+test('parses a mixed-case qop token to lowercase auth, matching the pre-extraction behavior', () => {
+  const upper = parseDigestChallenge('Digest realm="cam", nonce="abc", qop="AUTH"');
+  assert.deepEqual(upper, { realm: 'cam', nonce: 'abc', algorithm: 'MD5', qop: 'auth' });
+
+  const lower = parseDigestChallenge('Digest realm="cam", nonce="abc", qop="auth"');
+  assert.deepEqual(lower, upper);
+
+  const input = {
+    user: 'admin', pass: 'secret', method: 'DESCRIBE', uri: 'rtsp://cam/s1',
+    nonceCount: 1, cnonce: 'deadbeefdeadbeef',
+  };
+  const headerFromUpper = digestAuthorization({ ...input, challenge: upper as DigestChallenge });
+  const headerFromLower = digestAuthorization({ ...input, challenge: lower as DigestChallenge });
+  assert.equal(headerFromUpper, headerFromLower);
+});
+
 test('reports a Basic-only challenge instead of parsing it as Digest', () => {
   assert.equal(parseDigestChallenge('Basic realm="cam"'), 'basic');
 });

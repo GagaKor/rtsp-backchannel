@@ -120,7 +120,7 @@ export function parseDigestChallenge(
   if (parameters.qop !== undefined) {
     const auth = parameters.qop
       .split(',')
-      .map((value) => value.trim())
+      .map((value) => value.trim().toLowerCase())
       .find((value) => value === 'auth');
     if (auth) challenge.qop = auth;
   }
