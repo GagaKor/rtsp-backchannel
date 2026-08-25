@@ -42,6 +42,7 @@ export interface VigiControlOptions {
   timeoutMs?: number;
 }
 
+/** @internal Exported for tests; the HTTP transport is injected. */
 export interface VigiControlDependencies {
   postJson(url: string, body: unknown, timeoutMs: number): Promise<unknown>;
 }

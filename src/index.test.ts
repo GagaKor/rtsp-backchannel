@@ -28,6 +28,36 @@ import type {
 } from './index.ts';
 
 test('exports the supported npm library surface from one entry point', () => {
+  // Every export is a compatibility commitment (0.4.0 dropped
+  // openOnvifBackchannel/openVigiBackchannel for exactly this reason: they
+  // were redundant with openBackchannel(..., { transport })). A presence-only
+  // check can never catch an unintended addition, only a removal, so this
+  // asserts the exact runtime export set — an unreviewed new export fails the
+  // suite the same way a removed one would.
+  assert.deepEqual(Object.keys(library).sort(), [
+    'BackchannelUnavailableError',
+    'PACKET_MS',
+    'SAMPLE_RATE',
+    'VigiControlError',
+    'aacRfc3640Payload',
+    'createVigiTalkSession',
+    'discoverDevices',
+    'fileToG711',
+    'fileToRtpAudio',
+    'generateTonePcm',
+    'getCameraCapabilities',
+    'getStreamUris',
+    'linearToALaw',
+    'linearToMuLaw',
+    'openBackchannel',
+    'openPtzSession',
+    'openVigiControl',
+    'parseAdtsFrames',
+    'pcm16ToG711',
+    'playFile',
+    'sendPacedFrames',
+    'sendPacedG711',
+  ]);
   assert.equal(typeof library.playFile, 'function');
   assert.equal(typeof library.openBackchannel, 'function');
   assert.equal(typeof library.fileToG711, 'function');
@@ -41,8 +71,23 @@ test('exports the supported npm library surface from one entry point', () => {
   assert.equal(typeof library.getStreamUris, 'function');
   assert.equal(typeof library.getCameraCapabilities, 'function');
   assert.equal(typeof library.openPtzSession, 'function');
+  assert.equal(typeof library.openVigiControl, 'function');
+  assert.equal(typeof library.VigiControlError, 'function');
+  assert.equal(typeof library.createVigiTalkSession, 'function');
+  assert.equal(typeof library.BackchannelUnavailableError, 'function');
+  assert.equal(typeof library.generateTonePcm, 'function');
+  assert.equal(typeof library.linearToMuLaw, 'function');
   assert.equal(library.SAMPLE_RATE, 8000);
   assert.equal(library.PACKET_MS, 40);
+});
+
+test('does not export the removed transport-specific backchannel openers', () => {
+  // openOnvifBackchannel and openVigiBackchannel are redundant with
+  // openBackchannel(host, user, pass, { transport: 'onvif' | 'vigi' }).
+  // They still exist as exports of src/backchannel.ts itself for the
+  // internal tests, but must not reappear on the curated public surface.
+  assert.equal((library as Record<string, unknown>).openOnvifBackchannel, undefined);
+  assert.equal((library as Record<string, unknown>).openVigiBackchannel, undefined);
 });
 
 test('exports the codec-neutral public API types', () => {
@@ -350,6 +395,33 @@ test('ships clean public declarations without capability parser or injection sea
   assert.match(
     ptzDeclaration,
     /export declare function openPtzSession\(options: PtzSessionOptions\): Promise<PtzSession>;/,
+  );
+
+  // vigi/talk.ts and vigi/control.ts hide their injection seams the same
+  // way: createVigiTalkSession and openVigiControl take no dependencies
+  // parameter, and VigiTalkSocket/VigiTalkDependencies/VigiControlDependencies
+  // live behind the internal-only *WithDependencies variants. package.json
+  // ships the whole dist/vigi directory (not just index.d.ts), so a leak
+  // here is reachable by a deep import even though src/index.ts never
+  // re-exports these types — exactly the gap this closes.
+  const vigiTalkDeclaration = readFileSync('dist/vigi/talk.d.ts', 'utf8');
+  assert.doesNotMatch(
+    vigiTalkDeclaration,
+    /VigiTalkSocket|VigiTalkDependencies|WithDependencies/,
+  );
+  assert.match(
+    vigiTalkDeclaration,
+    /export declare function createVigiTalkSession\(options: VigiTalkOptions\): VigiTalkSession;/,
+  );
+
+  const vigiControlDeclaration = readFileSync('dist/vigi/control.d.ts', 'utf8');
+  assert.doesNotMatch(
+    vigiControlDeclaration,
+    /VigiControlDependencies|WithDependencies/,
+  );
+  assert.match(
+    vigiControlDeclaration,
+    /export declare function openVigiControl\(options: VigiControlOptions\): Promise<VigiControlSession>;/,
   );
 
   const indexDeclaration = readFileSync('dist/index.d.ts', 'utf8');

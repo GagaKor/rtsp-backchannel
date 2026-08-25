@@ -6,8 +6,6 @@ export {
   SAMPLE_RATE,
   BackchannelUnavailableError,
   openBackchannel,
-  openOnvifBackchannel,
-  openVigiBackchannel,
   sendPacedFrames,
   sendPacedG711,
 } from './backchannel.ts';
