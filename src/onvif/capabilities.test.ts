@@ -15,6 +15,7 @@ import {
   parseScopesResponse,
   parseServicesResponse,
   selectService,
+  OnvifResponseError,
   type CameraCapabilityDependencies,
   type CameraCapabilityOptions,
   type CameraCapabilityReport,
@@ -1327,6 +1328,53 @@ test('a failed ONVIF probe warns, skips VIGI entirely, and leaves every fact nul
   assert.equal(report.audioSend.vigiTalk, null);
   assert.equal(report.audioSend.detected, null);
   assert.equal(report.audioSend.transport, null);
+  assert.ok(report.warnings.some((w) => w.operation === 'AudioSendProbe'));
+});
+
+test('a failed VIGI probe warns and leaves detected null rather than false', async () => {
+  // The ONVIF fact is established (no sendonly track), but the VIGI probe
+  // never answered, so "this camera cannot receive audio" is unproven. A
+  // false here is the exact false negative this module exists to prevent:
+  // a caller reading detected === false stops looking for a speaker that
+  // may well be there.
+  const report = await capabilityReportWithProbes({
+    probeOnvifBackchannel: async () => false,
+    probeVigiTalk: async () => { throw new Error('doAuth timed out'); },
+  });
+  assert.deepEqual(report.audioSend, {
+    detected: null, transport: null, onvifBackchannel: false, vigiTalk: null,
+  });
+  assert.ok(report.warnings.some((w) => w.operation === 'AudioSendProbe'));
+});
+
+test('an auth-classified probe failure warns instead of discarding the report', async () => {
+  // `warn` re-throws authentication failures so that bad credentials fail fast
+  // rather than yielding a report made entirely of warnings. The audioSend
+  // probes must not inherit that: the device already connected with these
+  // credentials, so `ter:NotAuthorized` from GetStreamUri is a fact about one
+  // operation's permissions, and the report is already fully assembled by the
+  // time the probe runs. Aborting here throws away work that succeeded.
+  const report = await capabilityReportWithProbes({
+    probeOnvifBackchannel: async () => {
+      throw new OnvifResponseError('fault', 'SOAP Fault: ter:NotAuthorized', 'Unauthorized');
+    },
+    probeVigiTalk: async () => { throw new Error('must not be probed'); },
+  });
+  assert.deepEqual(report.audioSend, {
+    detected: null, transport: null, onvifBackchannel: null, vigiTalk: null,
+  });
+  assert.ok(report.warnings.some((w) => w.operation === 'AudioSendProbe'));
+});
+
+test('an auth-classified VIGI probe failure also warns instead of aborting', async () => {
+  const report = await capabilityReportWithProbes({
+    probeOnvifBackchannel: async () => false,
+    probeVigiTalk: async () => {
+      throw new OnvifResponseError('fault', 'SOAP Fault: ter:NotAuthorized', 'Unauthorized');
+    },
+  });
+  assert.equal(report.audioSend.onvifBackchannel, false);
+  assert.equal(report.audioSend.detected, null);
   assert.ok(report.warnings.some((w) => w.operation === 'AudioSendProbe'));
 });
 

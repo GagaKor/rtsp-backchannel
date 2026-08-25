@@ -765,6 +765,19 @@ export async function getCameraCapabilitiesWithDependencies(
     if (isAuthenticationFailure(error)) throw error;
     warnings.push({ operation, message: sanitizedWarningMessage(error) });
   };
+  /**
+   * Records a warning for an operation that must never abort the report, even
+   * on an authentication failure. Reserved for the optional `audioSend`
+   * probes: the device client has already completed `connect()` with these
+   * credentials, so an auth-classified probe error is a fact about one
+   * operation's permissions rather than evidence the session is unusable —
+   * and by the time the probes run the report is already fully assembled, so
+   * there is nothing left to fail fast for. Every genuine ONVIF service call
+   * above uses `warn`, which keeps its fail-fast contract.
+   */
+  const warnOnly = (operation: string, error: unknown) => {
+    warnings.push({ operation, message: sanitizedWarningMessage(error) });
+  };
   const call = async <T>(
     body: string,
     parser: (xml: string) => T,
@@ -895,7 +908,7 @@ export async function getCameraCapabilitiesWithDependencies(
         options.host, user, pass, clientOptions,
       );
     } catch (error) {
-      warn('AudioSendProbe', error);
+      warnOnly('AudioSendProbe', error);
     }
     if (audioSend.onvifBackchannel === true) {
       audioSend.detected = true;
@@ -906,14 +919,20 @@ export async function getCameraCapabilitiesWithDependencies(
           options.host, user, pass, clientOptions,
         );
       } catch (error) {
-        warn('AudioSendProbe', error);
+        warnOnly('AudioSendProbe', error);
       }
       if (audioSend.vigiTalk === true) {
         audioSend.detected = true;
         audioSend.transport = 'vigi';
-      } else {
+      } else if (audioSend.vigiTalk === false) {
+        // Both transports answered and neither offers a path: the only
+        // state in which "no audio send" is an established fact.
         audioSend.detected = false;
       }
+      // else: vigiTalk === null (the probe threw) — ONVIF proved there is no
+      // sendonly track, but nothing proved the absence of a VIGI speaker, so
+      // detected stays null. Reporting false here would be the same false
+      // negative this whole audioSend block exists to eliminate.
     }
     // else: onvifBackchannel === null (the probe threw) — the ONVIF fact
     // itself could not be established, so VIGI must not be attempted and
