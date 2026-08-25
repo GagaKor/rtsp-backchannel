@@ -66,13 +66,14 @@ function describeErrorCode(code: number, operation: string): string {
  * RTSP URI from the same string.
  *
  * `VigiControlOptions.host` is documented as a hostname and the OpenAPI
- * control port has its own option, but every route into this function accepts
- * a `host:port` string for a *different* service: `openBackchannel('cam:2020')`
- * and `getCameraCapabilities({ host: 'cam:2020' })` both forward it verbatim,
- * and an ONVIF service on a non-default port is exactly how VIGI hardware
- * ships. Concatenating produced `https://cam:2020:20443` and threw
- * `Invalid URL`, which the audioSend probe swallowed as "no VIGI speaker" --
- * observed on a VIGI C540V whose OpenAPI reports speaker=true.
+ * control port has its own option, but `host:port` is a working input form on
+ * the ONVIF side -- `deviceClient` builds `http://${host}/onvif/device_service`,
+ * so a port in `host` simply lands in the URL -- and `openBackchannel(host)`
+ * and `getCameraCapabilities({ host })` forward that same string here verbatim.
+ * The port in it belongs to the ONVIF service, not to this API. Concatenating
+ * produced `https://cam:2020:20443`, which throws `Invalid URL`; the audioSend
+ * probe then swallowed that as "no VIGI speaker", turning a caller's port
+ * choice into a false negative about the hardware.
  *
  * `URL.hostname` keeps IPv6 literals bracketed, so `[2001:db8::1]:2020`
  * survives as `[2001:db8::1]`.

@@ -193,10 +193,10 @@ export function createVigiTalkSessionWithDependencies(
   const channel = options.channel ?? VIGI_TALK_CHANNEL;
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   // The same `host:port` string that reaches openVigiControl reaches here, and
-  // the port in it belongs to some other service (ONVIF on 2020, say) -- the
-  // talk stream is on `streamPort`. Left in, it made net.connect resolve a
-  // hostname with a colon in it and advertised the wrong port in the RTSP URI
-  // that the digest response is computed over.
+  // the port in it belongs to whichever service the caller named (the ONVIF
+  // one, typically) -- the talk stream is on `streamPort`. Left in, it made
+  // net.connect resolve a hostname with a colon in it and advertised the wrong
+  // port in the RTSP URI that the digest response is computed over.
   const authority = vigiAuthority(options.host);
   const uri = `rtsp://${authority}/multitrans`;
   const talkJson = JSON.stringify({

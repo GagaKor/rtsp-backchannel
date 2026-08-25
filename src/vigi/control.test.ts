@@ -87,10 +87,10 @@ test('strips a port already carried by host instead of building an invalid URL',
   // `host` is documented as a hostname and the control port has its own
   // option, but callers reach this through APIs that accept `host:port` --
   // `openBackchannel('cam:2020', ...)` and `getCameraCapabilities({host})`
-  // both forward it verbatim. Concatenating produced `https://cam:2020:20443`,
-  // which throws `Invalid URL`; reproduced on a real VIGI C540V whose ONVIF
-  // service listens on 2020, where it silently turned a working OpenAPI
-  // speaker into "no audio-send path".
+  // both forward it verbatim, and that form works on the ONVIF side. So a
+  // caller who names an ONVIF port gets `https://cam:2020:20443` here, which
+  // throws `Invalid URL`, which the audioSend probe reports as "no VIGI
+  // speaker" -- a false negative produced by the caller's port choice alone.
   const posts: RecordedPost[] = [];
   await openVigiControlWithDependencies({ ...OPTIONS, host: 'cam:2020' }, fakeControl(posts));
   assert.equal(posts[0].url, 'https://cam:20443');
