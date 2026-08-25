@@ -343,10 +343,12 @@ scope에서 얻은 자기 보고일 뿐 독립적인 ONVIF 인증 결과가 아�
   URL userinfo, raw or real camera response payload를 포함하지 않습니다. 최초 연결 또는
   인증 실패는 치명적이며 Promise를 reject하므로 warning으로 바뀌지 않습니다.
 - `audioSend`는 카메라로 오디오를 보낼 수 있는 전송 방식이 있는지를 보고합니다.
-  `onvifBackchannel`과 `vigiTalk`는 서로 독립적인 3상 probe 결과이고, `transport`는
-  그중 성공한 쪽의 이름(`'onvif'`, `'vigi'`, 둘 다 실패하면 `null`)이며, `detected`는
-  둘 중 하나라도 성공했을 때만 `true`입니다. 이 probe의 비용과 끄는 방법은 아래를
-  참고하십시오.
+  `onvifBackchannel`과 `vigiTalk`는 서로 독립적인 probe가 아니라, 서로 다른 두 개의
+  3상 사실입니다. `vigiTalk`는 `onvifBackchannel`이 확정적으로 `false`로 확인된
+  경우에만 probe되고 그 외에는 `null`로 남으므로, ONVIF backchannel이 정상 동작하는
+  카메라에서는 VIGI probe 자체가 실행되지 않습니다. `transport`는 그중 성공한 쪽의
+  이름(`'onvif'`, `'vigi'`, 둘 다 실패하면 `null`)이며, `detected`는 둘 중 하나라도
+  성공했을 때만 `true`입니다. 이 probe의 비용과 끄는 방법은 아래를 참고하십시오.
 
 인증된 서비스 요청의 신뢰 기준은 선택된 Device Service URL입니다. 연결된 Media
 endpoint와 광고된 모든 Media1, Media2, PTZ XAddr는 같은 scheme과 canonical

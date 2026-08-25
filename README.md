@@ -361,8 +361,11 @@ The public report fields have these meanings:
   Initial connection and authentication failures are fatal; they reject the
   promise instead of becoming warnings.
 - `audioSend` reports which transport, if any, can deliver audio to the
-  camera. `onvifBackchannel` and `vigiTalk` are independent tri-state probe
-  results, `transport` names whichever one succeeded (`'onvif'`, `'vigi'`, or
+  camera. `onvifBackchannel` and `vigiTalk` are two separate tri-state facts,
+  not independent probes: `vigiTalk` is attempted (and otherwise stays
+  `null`) only once `onvifBackchannel` comes back a confirmed `false`, so a
+  camera with a working ONVIF backchannel never triggers a VIGI probe at
+  all. `transport` names whichever one succeeded (`'onvif'`, `'vigi'`, or
   `null` if neither did), and `detected` is `true` only once one of them has.
   See below for what this probe costs and how to turn it off.
 
