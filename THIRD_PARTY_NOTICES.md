@@ -36,3 +36,11 @@ a third-party ONVIF SDK.
 
 ONVIF is a trademark of ONVIF, Inc. This project is not affiliated with or
 endorsed by ONVIF, Inc. and does not claim ONVIF Profile conformance.
+
+## Trademarks
+
+TP-Link and VIGI are trademarks of TP-Link Systems Inc. This project is not
+affiliated with, endorsed by, or sponsored by TP-Link. The VIGI OpenAPI
+transport is an independent implementation written from TP-Link's publicly
+published protocol documentation; no TP-Link code or documentation is
+redistributed here.

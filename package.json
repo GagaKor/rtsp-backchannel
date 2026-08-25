@@ -35,6 +35,7 @@
     "dist/onvif",
     "dist/rtp",
     "dist/rtsp",
+    "dist/vigi",
     "README.md",
     "README.ko.md",
     "LICENSE",

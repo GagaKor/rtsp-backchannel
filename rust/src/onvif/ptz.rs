@@ -37,6 +37,7 @@ const DEFAULT_MOVE_TIMEOUT_MS: f64 = 1000.0;
 // an unbounded timeout would let a single continuous_move keep a camera
 // moving for as long as the caller likes, with no ceiling on how long the
 // device-side stop-on-close backstop takes to kick in.
+const MIN_MOVE_TIMEOUT_MS: f64 = 1.0;
 const MAX_MOVE_TIMEOUT_MS: f64 = 60_000.0;
 const PAN_TILT_RANGE: (f64, f64) = (-1.0, 1.0);
 /// Every zoom quantity is -1.0..1.0 except an absolute zoom *position*,
@@ -44,10 +45,17 @@ const PAN_TILT_RANGE: (f64, f64) = (-1.0, 1.0);
 const ZOOM_GENERIC_RANGE: (f64, f64) = (-1.0, 1.0);
 const ZOOM_POSITION_RANGE: (f64, f64) = (0.0, 1.0);
 
-// Plain form, unlike capabilities.rs's IncludeCapability=true: this session
-// only needs the XAddr list, and capabilities would inflate the response
-// against the shared 1MB body cap for data this module discards.
-const GET_SERVICES: &str = "<GetServices xmlns=\"http://www.onvif.org/ver10/device/wsdl\"/>";
+// IncludeCapability=false, unlike capabilities.rs's true: this session only
+// needs the XAddr list, and capabilities would inflate the response against
+// the shared 1MB body cap for data this module discards. The element itself
+// is not optional -- it is minOccurs=1 in the Device WSDL, and a strict gSOAP
+// stack (TP-Link VIGI C540V, firmware 2.2.0 and 2.3.3) answers a bare
+// <GetServices/>
+// with HTTP 400 and a SOAP-ENV:Sender Fault.
+const GET_SERVICES: &str = concat!(
+    "<GetServices xmlns=\"http://www.onvif.org/ver10/device/wsdl\">",
+    "<IncludeCapability>false</IncludeCapability></GetServices>"
+);
 const GET_NODES: &str = "<GetNodes xmlns=\"http://www.onvif.org/ver20/ptz/wsdl\"/>";
 const MEDIA1_GET_PROFILES: &str = "<GetProfiles xmlns=\"http://www.onvif.org/ver10/media/wsdl\"/>";
 const MEDIA2_GET_PROFILES: &str = concat!(
@@ -499,13 +507,32 @@ fn format_ptz_number(value: f64) -> Result<String, String> {
 }
 
 fn format_ptz_duration(milliseconds: f64) -> Result<String, String> {
-    if !milliseconds.is_finite() || milliseconds <= 0.0 {
-        return Err("PTZ timeout must be finite and greater than 0".to_owned());
+    // The lower bound is 1 ms, not 0: anything smaller renders as PT0.000S, a
+    // device-side stop deadline of zero. `Timeout` is what makes a crashed
+    // client safe, so emitting a guard of zero is worse than refusing the value.
+    if !milliseconds.is_finite() || milliseconds < MIN_MOVE_TIMEOUT_MS {
+        return Err("PTZ timeout must be finite and at least 1 ms".to_owned());
     }
     if milliseconds > MAX_MOVE_TIMEOUT_MS {
         return Err("PTZ timeout must not exceed 60000 ms".to_owned());
     }
-    Ok(format!("PT{:.3}S", milliseconds / 1000.0))
+    // Whole seconds are emitted without a fraction: `PT1S`, not `PT1.000S`. Both are
+    // valid xs:duration, but a strict gSOAP stack (TP-Link VIGI C540V, firmware 2.2.0
+    // and 2.3.3)
+    // rejects any decimal point with ter:InvalidArgVal, and the default move timeout is
+    // a whole second. Sub-second timeouts keep the fractional form -- it is the only
+    // faithful representation, and such a camera rejects them either way.
+    //
+    // The test is on the *rendered* text, not on the raw quotient. Deciding on the
+    // quotient meant testing one value and printing another: 999.9999 ms has a
+    // non-integral quotient but renders as `1.000`, so it went out as PT1.000S --
+    // the one spelling this rule exists to avoid, for a value PT1S expresses
+    // exactly. See docs/decisions/2026-08-25-ptz-duration-decide-on-rendered-text.md.
+    let text = format!("{:.3}", milliseconds / 1000.0);
+    match text.split_once('.') {
+        Some((whole, "000")) => Ok(format!("PT{whole}S")),
+        _ => Ok(format!("PT{text}S")),
+    }
 }
 
 fn require_finite_in_range(value: f64, range: (f64, f64)) -> Result<f64, String> {
@@ -706,10 +733,12 @@ fn parse_status(response: roxmltree::Node<'_, '_>) -> PtzStatus {
 ///
 /// # Experimental
 ///
-/// Physical movement is unverified against real PTZ hardware. Request
-/// construction, capability guarding, the device-side move timeout, and
-/// stop-on-close are covered by tests; that a camera actually moves as
-/// intended is not.
+/// Physical movement is verified against one camera only — a TP-Link VIGI
+/// C540V, firmware 2.2.0 and 2.3.3, on which every move method moved both pan/tilt and
+/// zoom in the requested direction and returned to its starting coordinates.
+/// Request construction, capability guarding, the device-side move timeout,
+/// and stop-on-close are covered by tests. No optical-zoom or preset-tour
+/// camera has been exercised.
 pub struct PtzSession {
     device: OnvifDevice,
     ptz_xaddr: String,
@@ -921,10 +950,12 @@ impl PtzSession {
 
 /// Open a PTZ control session.
 ///
-/// **Experimental.** Physical movement is unverified against real PTZ
-/// hardware. Request construction, capability guarding, the device-side move
-/// timeout, and stop-on-close are covered by tests; that a camera actually
-/// moves as intended is not.
+/// **Experimental.** Physical movement is verified against one camera only — a
+/// TP-Link VIGI C540V, firmware 2.2.0 and 2.3.3, on which every move method moved both
+/// pan/tilt and zoom in the requested direction and returned to its starting
+/// coordinates. Request construction, capability guarding, the device-side
+/// move timeout, and stop-on-close are covered by tests. No optical-zoom or
+/// preset-tour camera has been exercised.
 pub fn open_ptz_session(options: &PtzSessionOptions) -> Result<PtzSession, String> {
     let device_urls = if options.device_urls.is_empty() {
         vec![
@@ -1040,8 +1071,27 @@ mod tests {
 
     #[test]
     fn formats_ptz_durations_as_fixed_three_decimals() {
-        assert_eq!(format_ptz_duration(1000.0).unwrap(), "PT1.000S");
+        assert_eq!(format_ptz_duration(1000.0).unwrap(), "PT1S");
+        assert_eq!(format_ptz_duration(2000.0).unwrap(), "PT2S");
+        assert_eq!(format_ptz_duration(1500.0).unwrap(), "PT1.500S");
         assert_eq!(format_ptz_duration(250.0).unwrap(), "PT0.250S");
+        // Decided on the rendered text, not the raw quotient: 999.9999 ms
+        // renders as "1.000", so deciding on the quotient emitted PT1.000S --
+        // the spelling a strict gSOAP stack rejects, for a value PT1S
+        // expresses exactly.
+        assert_eq!(format_ptz_duration(999.9999).unwrap(), "PT1S");
+        assert_eq!(format_ptz_duration(1000.0001).unwrap(), "PT1S");
+        assert_eq!(format_ptz_duration(1.0).unwrap(), "PT0.001S");
+        // PT0.000S is a device-side stop deadline of zero, so anything that
+        // cannot render as a non-zero guard is rejected instead.
+        for bad in [0.4_f64, 0.9999_f64] {
+            assert!(
+                format_ptz_duration(bad)
+                    .unwrap_err()
+                    .contains("at least 1 ms"),
+                "expected a lower-bound error for {bad}"
+            );
+        }
         assert!(format_ptz_duration(0.0).is_err());
     }
 
@@ -1050,14 +1100,14 @@ mod tests {
         for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
             assert_eq!(
                 format_ptz_duration(bad).unwrap_err(),
-                "PTZ timeout must be finite and greater than 0"
+                "PTZ timeout must be finite and at least 1 ms"
             );
         }
     }
 
     #[test]
     fn rejects_a_ptz_duration_above_the_60000ms_ceiling_but_accepts_the_boundary() {
-        assert_eq!(format_ptz_duration(60_000.0).unwrap(), "PT60.000S");
+        assert_eq!(format_ptz_duration(60_000.0).unwrap(), "PT60S");
         for bad in [60_001.0, 600_000.0] {
             assert_eq!(
                 format_ptz_duration(bad).unwrap_err(),
@@ -1783,7 +1833,7 @@ mod tests {
             &format!(
                 "<ContinuousMove xmlns=\"{PTZ_NS}\"><ProfileToken>main</ProfileToken>\
                  <Velocity><PanTilt xmlns=\"{SCHEMA_NS}\" x=\"0.500000\" y=\"-0.250000\"/></Velocity>\
-                 <Timeout>PT1.000S</Timeout></ContinuousMove>"
+                 <Timeout>PT1S</Timeout></ContinuousMove>"
             )
         );
     }
@@ -1793,7 +1843,7 @@ mod tests {
         // The Timeout element is the runaway guard: it must reach the wire
         // as the value the caller actually asked for, not a hardcoded
         // default. Every other test in this suite uses the 1000ms default,
-        // so without this test PT1.000S could be hardcoded undetected.
+        // so without this test PT1S could be hardcoded undetected.
         let (server, session) = open(FakeCameraConfig::default().with_spaces(PtzSpaces {
             continuous_zoom: true,
             ..PtzSpaces::default()

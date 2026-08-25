@@ -435,6 +435,14 @@ The public report fields have these meanings:
   WSSE digest material, URL userinfo, or raw or real camera response payload.
   Initial connection and authentication failures are fatal; they reject the
   promise instead of becoming warnings.
+- `audioSend` reports which transport, if any, can deliver audio to the
+  camera. `onvifBackchannel` and `vigiTalk` are two separate tri-state facts,
+  not independent probes: `vigiTalk` is attempted (and otherwise stays
+  `null`) only once `onvifBackchannel` comes back a confirmed `false`, so a
+  camera with a working ONVIF backchannel never triggers a VIGI probe at
+  all. `transport` names whichever one succeeded (`'onvif'`, `'vigi'`, or
+  `null` if neither did), and `detected` is `true` only once one of them has.
+  See below for what this probe costs and how to turn it off.
 
 Authenticated service routing is anchored to the selected Device Service URL.
 The connected Media endpoint and every advertised Media1, Media2, or PTZ
@@ -463,6 +471,20 @@ certification.
 requests, so total elapsed time can exceed one timeout interval. Optional
 enrichment failures can add warnings and continue; they do not extend a single
 request's timeout.
+
+**By default, this call is more expensive than it looks.** `getCameraCapabilities`
+also probes whether the camera has a usable audio-send path, to populate
+`audioSend`. That probe is not another read against the connection already
+open above — it opens a second, fully authenticated ONVIF session from
+scratch (its own service discovery and login) purely to issue a real
+backchannel `DESCRIBE`, and only if that finds no sendonly track does it also
+attempt one VIGI OpenAPI `doAuth` handshake. Concretely: several extra SOAP
+round trips and one full ONVIF re-authentication and re-discovery on every
+default call, plus, for the common case of a camera with no ONVIF
+backchannel, one additional HTTPS request to a VIGI control port most
+cameras never answer. Pass `probeAudioSend: false` to skip all of it and
+leave `audioSend` at its neutral default (`detected`, `transport`,
+`onvifBackchannel`, and `vigiTalk` all `null`).
 
 ### PTZ Control
 
@@ -523,9 +545,19 @@ try {
 }
 ```
 
-**Experimental.** Verified: session open, capability guarding, request
-construction, timeout inclusion, and stop-on-close. Unverified: that a
-camera physically moves as intended — no PTZ hardware was available.
+**Experimental.** Physical movement is now verified, against one camera: a
+TP-Link VIGI C540V (firmware 2.2.0 and 2.3.3), where `relativeMove`,
+`continuousMove`,
+and `absoluteMove` each moved the camera in the requested direction on both
+pan/tilt and zoom, `getStatus` tracked every move, and an `absoluteMove` back
+to the starting coordinates restored them exactly. Session open, capability
+guarding, request construction, timeout inclusion, and stop-on-close remain
+covered by tests. Unverified beyond that one model — no camera with optical
+zoom (the C540V's is digital) or with mechanical preset tours has been
+exercised. That camera also rejects any sub-second `Timeout`, so
+`continuousMove` with `timeoutMs` under 1000 fails on it; whole seconds are
+sent as `PT1S` rather than `PT1.000S` precisely because it rejects the
+decimal point.
 
 ### Low-Level Backchannel API
 
@@ -582,6 +614,35 @@ const packetsSent = await playFile({
 Prefer `%40` for a password containing `@`. A raw `@` is interpreted using the
 final `@` in the authority. Request URIs and displayed errors strip embedded
 credentials.
+
+### Audio Send Transports
+
+`openBackchannel` and `playFile` accept a `transport` option —
+`'auto'` (the default), `'onvif'`, or `'vigi'` — and the CLI exposes the same
+choice as `--transport`. `'onvif'` and `'vigi'` each commit to one transport
+outright. `'auto'` tries the ONVIF backchannel first and falls back to VIGI
+only when the camera answered but its SDP offered no sendonly audio track;
+every other failure — a network error, a rejected credential, a malformed
+response — propagates instead of silently trying the other transport, so a
+broken camera is never mistaken for one that simply lacks a vendor API.
+
+The VIGI transport speaks TP-Link's VIGI OpenAPI `talk` protocol rather than
+an ONVIF backchannel, for cameras that have a working speaker but no working
+ONVIF backchannel. It requires OpenAPI to be turned on in the camera's own
+web UI, under Settings > Network Settings > OpenAPI, and connects to a
+control port that defaults to 20443. The transport carries G.711 a-law only;
+requesting an explicit non-G.711 codec over it fails when the session opens
+rather than being resampled or silently downgraded. The library never
+changes the device's own speaker volume — whatever level is set on the
+camera (80 out of 100 by default, which is loud indoors) is what plays, and
+adjusting it means using the camera's UI, not this library.
+
+Not every camera with a VIGI badge implements this API. TP-Link publishes the
+list of IPC and NVR models it covers at
+https://www.tp-link.com/en/vigi-open-api/product-list/; check a specific
+model against that list rather than assuming support from the brand alone.
+VIGI NVRs appear on that list too, but they speak a different, unrelated
+protocol and are out of scope for this transport.
 
 ## CLI
 

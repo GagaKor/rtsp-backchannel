@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A second audio-send transport in the TypeScript package: TP-Link's VIGI
+  OpenAPI `talk` protocol, for cameras that have a speaker but expose no
+  ONVIF backchannel. Select it with `transport: 'onvif' | 'vigi' | 'auto'`
+  (`--transport` on the CLI); the default `'auto'` tries ONVIF first and
+  falls back only when the camera offers no sendonly audio track, so a
+  network or authentication fault is never reported as a missing vendor API.
+  The Python and Rust packages are unchanged and do not implement this
+  transport. Verified end to end on a TP-Link VIGI C540V, firmware 2.3.3
+  Build 260713: with `transport` left at its default, `playFile` fell back
+  from the absent ONVIF backchannel to VIGI, opened a `pcma/8000 pt=8 ch=0`
+  session, and played an audible tone through the camera's speaker.
+- `getCameraCapabilities` gains an `audioSend` block naming the transport
+  (`'onvif'`, `'vigi'`, or neither) that can reach a given camera. **The ONVIF
+  half of this probe runs by default and adds real cost to every call**: it
+  opens a second, fully authenticated ONVIF session to issue a real
+  backchannel `DESCRIBE` — several extra SOAP round trips plus one full ONVIF
+  re-authentication and re-discovery. Pass `probeAudioSend: false` to skip it.
+  The VIGI half sends a credential-bearing `doAuth` to a port that counts
+  failed attempts toward a device lockout, so it runs only when device
+  information identifies TP-Link/VIGI hardware; `probeVigiTalk`
+  (`'auto' | 'always' | 'never'`, `--probe-vigi-talk`) overrides that. Any
+  fact a probe could not establish stays `null` rather than becoming `false`.
+  This addition is TypeScript-only; the Python and Rust capability reports are
+  unaffected and perform no such probe.
 - CommonJS support for the npm package. `exports` now declares a `require`
   condition alongside `import`, so `require('rtsp-backchannel')` works instead
   of failing with `ERR_PACKAGE_PATH_NOT_EXPORTED`. Both conditions resolve to
@@ -25,8 +49,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ERR_PACKAGE_PATH_NOT_EXPORTED` that the `require` condition was added to
   fix; neither does now.
 
+### Fixed
+
+- PTZ sessions now send the mandatory `IncludeCapability` element in their
+  `GetServices` request. A strict ONVIF stack answered the previous bare
+  `<GetServices/>` with HTTP 400 and a `SOAP-ENV:Sender` Fault, so
+  `openPtzSession` / `open_ptz_session` could not open against such a camera at
+  all.
+- Whole-second PTZ move timeouts are sent as `PT1S` rather than `PT1.000S`.
+  Both spell the same `xs:duration`, but a strict stack rejects the decimal
+  point with `ter:InvalidArgVal`, which made `continuousMove` fail at every
+  timeout value — including the 1000 ms default. The whole-second test is
+  applied to the rendered three-decimal text rather than to the raw quotient,
+  so a timeout such as 999.9999 ms — which renders as `1.000` — is also sent
+  as `PT1S` instead of the rejected spelling. Sub-second timeouts keep the
+  fractional form, so a caller's requested duration is never silently changed.
+  The minimum timeout is now 1 ms: anything smaller rendered as `PT0.000S`,
+  a device-side runaway guard of zero. All three packages.
+- A failed VIGI OpenAPI `doAuth` challenge is reported by its error code
+  rather than as a malformed reply, so an account locked by the device's retry
+  limit says so instead of surfacing as `invalid VIGI doAuth challenge`.
+
 ### Changed
 
+- PTZ movement is no longer marked unverified against hardware. Every move
+  method is now confirmed on a TP-Link VIGI C540V (firmware 2.2.0 and 2.3.3)
+  for both
+  pan/tilt and zoom. The feature stays experimental: only that one model has
+  been exercised.
 - The npm package's minimum Node.js version stays at `>=22`. `import` works on
   every Node.js 22, and the 22.12.0 floor applies only to `require()`, which is
   documented in both TypeScript READMEs rather than enforced for every

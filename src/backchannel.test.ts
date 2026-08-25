@@ -2,7 +2,12 @@ import assert from 'node:assert/strict';
 import net from 'node:net';
 import { test } from 'node:test';
 import * as backchannel from './backchannel.ts';
+import {
+  BackchannelUnavailableError,
+  selectBackchannelTransport,
+} from './backchannel.ts';
 import { RtpPacketizer } from './rtp/sender.ts';
+import { createVigiTalkSessionWithDependencies, type VigiTalkSocket } from './vigi/talk.ts';
 
 interface TestClock {
   now(): number;
@@ -102,6 +107,73 @@ function trackUriResolver(): ResolveTrackUri {
   }).resolveTrackUri;
   assert.ok(candidate);
   return candidate;
+}
+
+/**
+ * Minimal VigiTalkSocket double for driving the real
+ * createVigiTalkSessionWithDependencies (not a fake talk session) through
+ * openVigiBackchannelWithDependencies's injected `createVigiTalkSession`.
+ * Answers the first MULTITRANS write with
+ * an unchallenged 200 OK — the digest handshake itself is already covered by
+ * src/vigi/talk.test.ts, so this fixture only needs it to succeed — and
+ * records every interleaved RTP frame written afterward.
+ */
+class FakeTalkSocket implements VigiTalkSocket {
+  readonly written: Buffer[] = [];
+  ended = false;
+  private handlers = new Map<string, Array<(arg?: unknown) => void>>();
+
+  write(chunk: Buffer | string): boolean {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, 'utf8');
+    this.written.push(buffer);
+    if (this.written.length === 1) {
+      const body = '{"type":"response","seq":1,"params":{"error_code":0,"session_id":"0"}}';
+      const reply =
+        `RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`;
+      queueMicrotask(() => this.emit('data', Buffer.from(reply, 'utf8')));
+    }
+    return true;
+  }
+  on(event: string, handler: (arg?: unknown) => void): unknown {
+    const list = this.handlers.get(event) ?? [];
+    list.push(handler);
+    this.handlers.set(event, list);
+    return this;
+  }
+  once(event: string, handler: (arg?: unknown) => void): unknown {
+    const wrapped: { (arg?: unknown): void; listener?: typeof handler } = (arg?: unknown) => {
+      this.off(event, wrapped);
+      handler(arg);
+    };
+    // Mirrors node:events so off(event, originalHandler) below can find and
+    // remove a once() listener registered with the wrapper, not the handler
+    // itself — see the identical comment in vigi/talk.test.ts.
+    wrapped.listener = handler;
+    return this.on(event, wrapped);
+  }
+  off(event: string, handler: (arg?: unknown) => void): unknown {
+    const list = this.handlers.get(event);
+    if (list) {
+      this.handlers.set(
+        event,
+        list.filter((candidate) => {
+          const wrapped = candidate as { listener?: typeof handler };
+          return candidate !== handler && wrapped.listener !== handler;
+        }),
+      );
+    }
+    return this;
+  }
+  end(): void { this.ended = true; }
+  destroy(): void {}
+  setTimeout(): unknown { return this; }
+  emit(event: string, arg?: unknown): void {
+    for (const handler of [...(this.handlers.get(event) ?? [])]) handler(arg);
+  }
+  /** Every interleaved ($-framed) RTP packet written after the handshake. */
+  get rtpFrames(): Buffer[] {
+    return this.written.filter((chunk) => chunk[0] === 0x24);
+  }
 }
 
 test('sends G.711 in fixed 40ms packets and waits through the final sample', async () => {
@@ -589,4 +661,254 @@ test('preserves the keepalive deadline across encoding and paced RTP send', asyn
   assert.ok(keepAlive >= 0, 'expected keepalive at the original session deadline');
   assert.ok(activeSession.slice(0, keepAlive).includes('RTP'));
   assert.ok(activeSession.slice(keepAlive + 1).includes('RTP'));
+});
+
+test('BackchannelUnavailableError keeps the historical message', () => {
+  const error = new BackchannelUnavailableError();
+  assert.equal(error.message, 'no sendonly backchannel audio track');
+  assert.equal(error.kind, 'no-sendonly-track');
+});
+
+test('onvif transport returns the ONVIF session and never probes VIGI', async () => {
+  const calls: string[] = [];
+  const session = await selectBackchannelTransport('onvif', {
+    openOnvif: async () => { calls.push('onvif'); return 'onvif-session' as never; },
+    openVigi: async () => { calls.push('vigi'); return 'vigi-session' as never; },
+  });
+  assert.equal(session, 'onvif-session');
+  assert.deepEqual(calls, ['onvif']);
+});
+
+test('vigi transport returns the VIGI session and never tries ONVIF', async () => {
+  const calls: string[] = [];
+  const session = await selectBackchannelTransport('vigi', {
+    openOnvif: async () => { calls.push('onvif'); return 'onvif-session' as never; },
+    openVigi: async () => { calls.push('vigi'); return 'vigi-session' as never; },
+  });
+  assert.equal(session, 'vigi-session');
+  assert.deepEqual(calls, ['vigi']);
+});
+
+test('auto prefers ONVIF when a backchannel exists', async () => {
+  const calls: string[] = [];
+  const session = await selectBackchannelTransport('auto', {
+    openOnvif: async () => { calls.push('onvif'); return 'onvif-session' as never; },
+    openVigi: async () => { calls.push('vigi'); return 'vigi-session' as never; },
+  });
+  assert.equal(session, 'onvif-session');
+  assert.deepEqual(calls, ['onvif'], 'VIGI is not probed when ONVIF succeeds');
+});
+
+test('auto falls back to VIGI only on the no-sendonly-track condition', async () => {
+  const calls: string[] = [];
+  const session = await selectBackchannelTransport('auto', {
+    openOnvif: async () => {
+      calls.push('onvif');
+      throw new BackchannelUnavailableError();
+    },
+    openVigi: async () => { calls.push('vigi'); return 'vigi-session' as never; },
+  });
+  assert.equal(session, 'vigi-session');
+  assert.deepEqual(calls, ['onvif', 'vigi']);
+});
+
+test('auto propagates a non-backchannel ONVIF failure without probing VIGI', async () => {
+  const calls: string[] = [];
+  await assert.rejects(
+    selectBackchannelTransport('auto', {
+      openOnvif: async () => {
+        calls.push('onvif');
+        throw new Error('ONVIF connect failed: request failed');
+      },
+      openVigi: async () => { calls.push('vigi'); return 'vigi-session' as never; },
+    }),
+    { message: 'ONVIF connect failed: request failed' },
+  );
+  assert.deepEqual(calls, ['onvif'], 'a real fault must not be masked by a VIGI attempt');
+});
+
+test('auto reports both attempts when VIGI also fails', async () => {
+  await assert.rejects(
+    selectBackchannelTransport('auto', {
+      openOnvif: async () => { throw new BackchannelUnavailableError(); },
+      openVigi: async () => { throw new Error('VIGI OpenAPI port 20443 unreachable'); },
+    }),
+    {
+      message:
+        'no audio send path: ONVIF backchannel absent (no sendonly track); '
+        + 'VIGI OpenAPI port 20443 unreachable',
+    },
+  );
+});
+
+test('openVigiBackchannel rejects a non-G.711 codec preference before opening a control session', async () => {
+  let controlOpened = false;
+  await assert.rejects(
+    backchannel.openVigiBackchannelWithDependencies(
+      'camera.test',
+      '',
+      'secret',
+      { codec: 'aac' },
+      {
+        openVigiControl: async () => {
+          controlOpened = true;
+          throw new Error('must not be called');
+        },
+        createVigiTalkSession: () => {
+          throw new Error('must not be called');
+        },
+      },
+    ),
+    { message: 'VIGI talk supports G.711 a-law only, not aac' },
+  );
+  assert.equal(controlOpened, false);
+});
+
+test('openVigiBackchannel rejects a control session that reports no speaker', async () => {
+  let talkCreated = false;
+  await assert.rejects(
+    backchannel.openVigiBackchannelWithDependencies(
+      'camera.test',
+      '',
+      'secret',
+      {},
+      {
+        openVigiControl: async () => ({
+          stok: 'STOK1',
+          getStreamPort: async () => 1080,
+          getAudioCapability: async () => ({ speaker: false, microphone: true }),
+        }),
+        createVigiTalkSession: () => {
+          talkCreated = true;
+          throw new Error('must not be called');
+        },
+      },
+    ),
+    { message: 'VIGI OpenAPI reports no speaker' },
+  );
+  assert.equal(talkCreated, false);
+});
+
+test('openVigiBackchannel opens a PCMA session backed by the real talk layer', async () => {
+  const controlRequests: Array<{ host: string; user: string; pass: string }> = [];
+  const socket = new FakeTalkSocket();
+  const session = await backchannel.openVigiBackchannelWithDependencies(
+    'camera.test',
+    '',
+    'secret',
+    {},
+    {
+      openVigiControl: async (opts) => {
+        controlRequests.push({ host: opts.host, user: opts.user ?? '', pass: opts.pass });
+        return {
+          stok: 'STOK1',
+          getStreamPort: async () => 1080,
+          getAudioCapability: async () => ({ speaker: true, microphone: false }),
+        };
+      },
+      createVigiTalkSession: (talkOptions) =>
+        createVigiTalkSessionWithDependencies(talkOptions, { connect: () => socket }),
+    },
+  );
+
+  assert.deepEqual(controlRequests, [{ host: 'camera.test', user: 'admin', pass: 'secret' }]);
+  assert.equal(session.codec.name, 'pcma');
+  assert.equal(session.codec.clockRate, 8000);
+  assert.equal(session.codec.payloadType, 8);
+  assert.equal(session.rtpChannel, 0);
+  assert.equal(session.variant, 'PCMA');
+
+  let ranDirectly = false;
+  const result = await session.withKeepAlive(async () => {
+    ranDirectly = true;
+    return 'ran';
+  });
+  assert.equal(ranDirectly, true, 'withKeepAlive must run the operation without deferring it');
+  assert.equal(result, 'ran');
+
+  // No send() happened, so the talk socket was never opened in the first
+  // place (see the "socket is not opened until the first send" comment on
+  // withKeepAlive) — close() has nothing to end.
+  await session.close();
+  assert.equal(socket.ended, false);
+});
+
+test(
+  "openVigiBackchannel.send flattens a 40ms EncodedAudio frame into the talk layer's "
+    + '20ms/160-byte RTP packets',
+  async () => {
+    const socket = new FakeTalkSocket();
+    const session = await backchannel.openVigiBackchannelWithDependencies(
+      'camera.test',
+      '',
+      'secret',
+      {},
+      {
+        openVigiControl: async () => ({
+          stok: 'STOK1',
+          getStreamPort: async () => 1080,
+          getAudioCapability: async () => ({ speaker: true, microphone: false }),
+        }),
+        createVigiTalkSession: (talkOptions) =>
+          createVigiTalkSessionWithDependencies(talkOptions, { connect: () => socket }),
+      },
+    );
+
+    // One 40ms PCMA frame at 8000 Hz is 320 bytes (one byte per sample); the
+    // real talk layer must re-cut the flattened buffer into two 20ms/160-byte
+    // RTP payloads — this is the behaviour the frame-flattening fix depends on.
+    const frame = Buffer.alloc(320, 0x5a);
+    const sent = await session.send({
+      codec: 'pcma',
+      clockRate: 8000,
+      frames: [{ payload: frame, samples: 320 }],
+      byteLength: frame.length,
+      sampleCount: 320,
+    });
+
+    assert.equal(sent, 2);
+    const rtpFrames = socket.rtpFrames;
+    assert.equal(rtpFrames.length, 2);
+    for (const framed of rtpFrames) {
+      assert.equal(framed[0], 0x24);
+      assert.equal(framed[1], 0, 'VIGI_TALK_CHANNEL is 0');
+      assert.equal(framed.readUInt16BE(2), 12 + 160, 'RTP header (12) + 160-byte payload');
+      assert.equal(framed[4 + 1] & 0x7f, 8, 'payload type 8 (PCMA)');
+      assert.deepEqual(framed.subarray(4 + 12), Buffer.alloc(160, 0x5a));
+    }
+
+    await session.close();
+  },
+);
+
+test('openVigiBackchannel.send rejects EncodedAudio for a codec other than pcma', async () => {
+  const socket = new FakeTalkSocket();
+  const session = await backchannel.openVigiBackchannelWithDependencies(
+    'camera.test',
+    '',
+    'secret',
+    {},
+    {
+      openVigiControl: async () => ({
+        stok: 'STOK1',
+        getStreamPort: async () => 1080,
+        getAudioCapability: async () => ({ speaker: true, microphone: false }),
+      }),
+      createVigiTalkSession: (talkOptions) =>
+        createVigiTalkSessionWithDependencies(talkOptions, { connect: () => socket }),
+    },
+  );
+
+  await assert.rejects(
+    session.send({
+      codec: 'aac',
+      clockRate: 8000,
+      frames: [{ payload: Buffer.alloc(4), samples: 1024 }],
+      byteLength: 4,
+      sampleCount: 1024,
+    }),
+    { message: 'encoded audio aac/8000 does not match pcma/8000' },
+  );
+  assert.equal(socket.rtpFrames.length, 0, 'a rejected send must not reach the talk layer');
+  await session.close();
 });

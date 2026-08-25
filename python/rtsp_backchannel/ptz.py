@@ -37,6 +37,7 @@ _DEFAULT_MOVE_TIMEOUT_MS = 1000.0
 # unbounded timeout would let a single continuous_move keep a camera moving
 # for as long as the caller likes, with no ceiling on how long the
 # device-side stop-on-close backstop takes to kick in.
+_MIN_MOVE_TIMEOUT_MS = 1
 _MAX_MOVE_TIMEOUT_MS = 60_000.0
 _PAN_TILT_RANGE = (-1.0, 1.0)
 # Every zoom quantity is -1..1 except an absolute zoom *position*, which is 0..1.
@@ -62,10 +63,17 @@ _AUTH_FAULT_PATTERNS = (
     ),
 )
 
-# Plain form, unlike capabilities.py's IncludeCapability=true: this session
-# only needs the XAddr list, and capabilities would inflate the response
-# against the shared 1MB body cap for data this module discards.
-_GET_SERVICES = f'<GetServices xmlns="{_DEVICE_NS}"/>'
+# IncludeCapability=false, unlike capabilities.py's true: this session only
+# needs the XAddr list, and capabilities would inflate the response against
+# the shared 1MB body cap for data this module discards. The element itself
+# is not optional -- it is minOccurs=1 in the Device WSDL, and a strict gSOAP
+# stack (TP-Link VIGI C540V, firmware 2.2.0 and 2.3.3) answers a bare
+# <GetServices/>
+# with HTTP 400 and a SOAP-ENV:Sender Fault.
+_GET_SERVICES = (
+    f'<GetServices xmlns="{_DEVICE_NS}">'
+    "<IncludeCapability>false</IncludeCapability></GetServices>"
+)
 _GET_NODES = f'<GetNodes xmlns="{_PTZ_NS}"/>'
 _MEDIA1_GET_PROFILES = f'<GetProfiles xmlns="{_MEDIA1_NS}"/>'
 _MEDIA2_GET_PROFILES = (
@@ -299,11 +307,28 @@ def format_ptz_number(value: float) -> str:
 
 
 def format_ptz_duration(milliseconds: float) -> str:
-    if not math.isfinite(milliseconds) or milliseconds <= 0:
-        raise ValueError("PTZ timeout must be finite and greater than 0")
+    # The lower bound is 1 ms, not 0: anything smaller renders as PT0.000S, a
+    # device-side stop deadline of zero. Timeout is what makes a crashed client
+    # safe, so emitting a guard of zero is worse than refusing the value.
+    if not math.isfinite(milliseconds) or milliseconds < _MIN_MOVE_TIMEOUT_MS:
+        raise ValueError("PTZ timeout must be finite and at least 1 ms")
     if milliseconds > _MAX_MOVE_TIMEOUT_MS:
         raise ValueError("PTZ timeout must not exceed 60000 ms")
-    return f"PT{milliseconds / 1000:.3f}S"
+    # Whole seconds are emitted without a fraction: "PT1S", not "PT1.000S". Both
+    # are valid xs:duration, but a strict gSOAP stack (TP-Link VIGI C540V, firmware
+    # 2.2.0 and 2.3.3) rejects any decimal point with ter:InvalidArgVal, and the
+    # default move
+    # timeout is a whole second. Sub-second timeouts keep the fractional form -- it
+    # is the only faithful representation, and such a camera rejects them either way.
+    #
+    # The test is on the *rendered* text, not on the raw quotient. Deciding on the
+    # quotient meant testing one value and printing another: 999.9999 ms has a
+    # non-integral quotient but renders as "1.000", so it went out as PT1.000S --
+    # the one spelling this rule exists to avoid, for a value PT1S expresses
+    # exactly. See docs/decisions/2026-08-25-ptz-duration-decide-on-rendered-text.md.
+    text = f"{milliseconds / 1000:.3f}"
+    whole, fraction = text.split(".")
+    return f"PT{whole}S" if fraction == "000" else f"PT{text}S"
 
 
 def _require_finite_in_range(value: float, value_range: tuple[float, float]) -> float:
@@ -689,10 +714,13 @@ class PtzSession:
 def open_ptz_session(options: PtzSessionOptions) -> PtzSession:
     """Open a PTZ control session.
 
-    Experimental: physical movement is unverified against real PTZ
-    hardware. Request construction, capability guarding, the device-side
-    move timeout, and stop-on-close are covered by tests; that a camera
-    actually moves as intended is not.
+    Experimental: physical movement is verified against one camera only --
+    a TP-Link VIGI C540V, firmware 2.2.0 and 2.3.3, on which every move method
+    moved
+    both pan/tilt and zoom in the requested direction and returned to its
+    starting coordinates. Request construction, capability guarding, the
+    device-side move timeout, and stop-on-close are covered by tests. No
+    optical-zoom or preset-tour camera has been exercised.
     """
 
     device = OnvifDevice(
