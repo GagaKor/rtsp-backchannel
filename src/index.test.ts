@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 
 import * as library from './index.ts';
@@ -25,6 +26,52 @@ import type {
   PtzVector,
   SendCodec,
 } from './index.ts';
+
+/**
+ * The repo root, derived from this file rather than from `process.cwd()`.
+ *
+ * The build and the CommonJS probe below both resolve paths relative to their
+ * working directory: `npm run build` picks the package to build from it, and
+ * `require('rtsp-backchannel')` resolves through Node's package
+ * self-reference, which keys off the *referrer's* package scope. Run
+ * `node --test` from anywhere but the repo root and the probe silently loads a
+ * different copy of the package -- a published one from a parent project's
+ * node_modules, say -- while still reporting green.
+ */
+const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
+
+/** Spawn budget for the two npm/node subprocesses, so a hang fails the run. */
+const SUBPROCESS_TIMEOUT_MS = 300_000;
+
+let buildResult: ReturnType<typeof spawnSync> | undefined;
+
+/**
+ * Builds `dist/` at most once per run. Two tests need it and node:test runs
+ * top-level tests in a file sequentially, so the second `npm run build` was a
+ * whole extra npm + tsc process producing output that was already fresh.
+ */
+function buildOnce(): void {
+  buildResult ??= spawnSync('npm', ['run', 'build'], {
+    encoding: 'utf8',
+    cwd: REPO_ROOT,
+    // Windows resolves `npm` to `npm.cmd` through PATHEXT, which spawnSync
+    // does not apply -- without a shell it fails with ENOENT.
+    shell: process.platform === 'win32',
+    timeout: SUBPROCESS_TIMEOUT_MS,
+  });
+  assert.equal(buildResult.status, 0, spawnFailure(buildResult));
+}
+
+/**
+ * A failure message that survives a spawn that never ran. `spawnSync` reports
+ * ENOENT and timeouts through `error` with `status: null` and no stderr, so
+ * asserting on stderr alone yields the message `null`.
+ */
+function spawnFailure(result: ReturnType<typeof spawnSync>): string {
+  return result.error
+    ? `${result.error.message} (signal ${String(result.signal)})`
+    : String(result.stderr || result.stdout);
+}
 
 test('exports the supported npm library surface from one entry point', () => {
   assert.equal(typeof library.playFile, 'function');
@@ -229,7 +276,24 @@ test('declares an installable npm package with ESM and CommonJS entry points', (
   // artifact is what makes the dual-package hazard impossible rather than
   // merely unlikely -- a process can only ever hold one module instance.
   assert.equal(manifest.exports['.'].require, './dist/index.js');
-  assert.equal(manifest.engines.node, '>=22.12.0');
+  // A resolver that offers neither condition -- a restricted --conditions set,
+  // or a bundler with its own conditionNames -- matched nothing and hit the
+  // same ERR_PACKAGE_PATH_NOT_EXPORTED the require condition was added to fix.
+  // `default` must stay last: conditions are matched in declaration order.
+  assert.equal(manifest.exports['.'].default, './dist/index.js');
+  assert.deepEqual(Object.keys(manifest.exports['.']), [
+    'types', 'import', 'require', 'default',
+  ]);
+  // Tooling that introspects installed packages (ESLint import resolvers,
+  // read-pkg-up-style helpers, several bundler plugins) resolves the manifest
+  // by subpath; without this it gets ERR_PACKAGE_PATH_NOT_EXPORTED.
+  assert.equal(manifest.exports['./package.json'], './package.json');
+  // `import` works on every Node 22, so engines allows all of them. The 22.12
+  // floor belongs to require(esm) alone and is documented, not enforced here:
+  // narrowing engines only warns the CommonJS user (npm's EBADENGINE is a
+  // warning by default) while hard-failing ESM-only installs under
+  // engine-strict. See docs/decisions/2026-08-25-cjs-support-boundaries.md.
+  assert.equal(manifest.engines.node, '>=22');
   // npm rewrites the lockfile's own engines block from the manifest on the next
   // install, so a stale value here is a guaranteed unrelated diff in someone
   // else's PR -- and RELEASING.md requires the two files to agree.
@@ -270,7 +334,22 @@ test('ships separate English and Korean TypeScript documentation', () => {
     assert.match(readme, /"type": "module"/);
     assert.match(readme, /MODULE_TYPELESS_PACKAGE_JSON/);
     assert.match(readme, /\.mjs/);
+    // The require(esm) floor, stated as a literal because it is a Node fact
+    // rather than a manifest one -- engines deliberately does not carry it.
     assert.match(readme, /22\.12/);
+    // ...and the engines range itself, derived so a future bump cannot leave
+    // the READMEs stale while the manifest assertion above still passes.
+    const minimum = JSON.parse(readFileSync('package.json', 'utf8'))
+      .engines.node.replace(/^>=/, '');
+    assert.ok(
+      readme.includes(`Node.js ${minimum} `) || readme.includes(`Node.js ${minimum}\n`),
+      `both READMEs must state the engines minimum (Node.js ${minimum})`,
+    );
+    // The two CommonJS caveats the single-artifact design imposes: TypeScript
+    // needs nodenext resolution, and require() hands back a sealed namespace.
+    assert.match(readme, /nodenext/);
+    assert.match(readme, /TS1479/);
+    assert.match(readme, /Cannot redefine property/);
     assert.match(readme, /cidrs/);
     assert.match(readme, /10\.0\.0\.0\/24/);
     assert.match(readme, /10\.128\.0\.10/);
@@ -338,8 +417,7 @@ test('documents exact Media2 discovery and warning guarantees in both languages'
 });
 
 test('ships clean public declarations without capability parser or injection seams', () => {
-  const build = spawnSync('npm', ['run', 'build'], { encoding: 'utf8' });
-  assert.equal(build.status, 0, build.stderr || build.stdout);
+  buildOnce();
 
   const discoveryDeclaration = readFileSync('dist/onvif/discovery.d.ts', 'utf8');
   assert.doesNotMatch(discoveryDeclaration, /DiscoveryDependencies/);
@@ -405,8 +483,7 @@ test('ships clean public declarations without capability parser or injection sea
 });
 
 test('loads from CommonJS with the same export surface as ESM', () => {
-  const build = spawnSync('npm', ['run', 'build'], { encoding: 'utf8' });
-  assert.equal(build.status, 0, build.stderr || build.stdout);
+  buildOnce();
 
   const probe = spawnSync(
     process.execPath,
@@ -423,7 +500,7 @@ test('loads from CommonJS with the same export surface as ESM', () => {
         "  keys: Object.keys(loaded).filter((key) => key !== 'default').sort(),\n" +
         '}));\n',
     ],
-    { encoding: 'utf8' },
+    { encoding: 'utf8', cwd: REPO_ROOT, timeout: SUBPROCESS_TIMEOUT_MS },
   );
 
   // package.json exposes one artifact under both the import and require
@@ -433,7 +510,7 @@ test('loads from CommonJS with the same export surface as ESM', () => {
   // keeps top-level await out of the published graph: adding one anywhere
   // reachable from index.ts breaks every require() consumer, and this test
   // is what says so before a release does.
-  assert.equal(probe.status, 0, probe.stderr);
+  assert.equal(probe.status, 0, spawnFailure(probe));
 
   const loaded = JSON.parse(probe.stdout);
   assert.equal(loaded.playFile, 'function');
