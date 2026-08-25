@@ -687,16 +687,28 @@ async function assertCanonicalAuthFailure(
 function capabilityReportWithProbes(
   probes: Pick<CameraCapabilityDependencies, 'probeOnvifBackchannel' | 'probeVigiTalk'>,
   options: Partial<CameraCapabilityOptions> = {},
+  device: { manufacturer?: string; model?: string } = VIGI_DEVICE,
 ): Promise<CameraCapabilityReport> {
   const calls: RecordedCapabilityCall[] = [];
   const dependencies: CameraCapabilityDependencies = {
-    ...fakeCapabilityDependencies(calls, async () => {
-      throw new Error('onvif call not stubbed for audioSend fixture');
-    }),
+    ...fakeCapabilityDependencies(
+      calls,
+      async () => { throw new Error('onvif call not stubbed for audioSend fixture'); },
+      { connect: async () => device },
+    ),
     ...probes,
   };
   return getCameraCapabilitiesWithDependencies({ host: 'camera', ...options }, dependencies);
 }
+
+/**
+ * The VIGI probe is gated on vendor evidence, so audioSend tests that want it
+ * to run must report hardware that names itself. Tests about the gate itself
+ * pass one of the other two explicitly.
+ */
+const VIGI_DEVICE = { manufacturer: 'TP-LINK', model: 'VIGI C540V' };
+const OTHER_VENDOR_DEVICE = { manufacturer: 'AXIS', model: 'P3245' };
+const ANONYMOUS_DEVICE = {};
 
 test('orchestrates exact authenticated bodies and routes advertised services deterministically', async () => {
   const calls: RecordedCapabilityCall[] = [];
@@ -1376,6 +1388,87 @@ test('an auth-classified VIGI probe failure also warns instead of aborting', asy
   assert.equal(report.audioSend.onvifBackchannel, false);
   assert.equal(report.audioSend.detected, null);
   assert.ok(report.warnings.some((w) => w.operation === 'AudioSendProbe'));
+});
+
+test('auto mode sends no doAuth to hardware that names another vendor', async () => {
+  // The VIGI probe is not a read-only question: it performs a credential-
+  // bearing doAuth against a port that counts failures toward a device-side
+  // lockout, using a password ONVIF never validated (the OpenAPI admin
+  // account is configured separately). Firing that at an Axis camera spends
+  // a lockout attempt on an API the device cannot even have.
+  let probed = false;
+  const report = await capabilityReportWithProbes(
+    {
+      probeOnvifBackchannel: async () => false,
+      probeVigiTalk: async () => { probed = true; return true; },
+    },
+    {},
+    OTHER_VENDOR_DEVICE,
+  );
+  assert.equal(probed, false);
+  // ONVIF was the only candidate transport for this camera and it answered
+  // no, so "no audio-send path" is established rather than merely unproven.
+  assert.deepEqual(report.audioSend, {
+    detected: false, transport: null, onvifBackchannel: false, vigiTalk: null,
+  });
+});
+
+test('auto mode probes hardware that names itself TP-Link VIGI', async () => {
+  const report = await capabilityReportWithProbes(
+    { probeOnvifBackchannel: async () => false, probeVigiTalk: async () => true },
+    {},
+    VIGI_DEVICE,
+  );
+  assert.deepEqual(report.audioSend, {
+    detected: true, transport: 'vigi', onvifBackchannel: false, vigiTalk: true,
+  });
+});
+
+test('auto mode leaves detected null when the device names no vendor at all', async () => {
+  // "We could not tell" must not collapse into "not VIGI": a camera that
+  // answered GetDeviceInformation sparsely would become a false negative.
+  let probed = false;
+  const report = await capabilityReportWithProbes(
+    {
+      probeOnvifBackchannel: async () => false,
+      probeVigiTalk: async () => { probed = true; return true; },
+    },
+    {},
+    ANONYMOUS_DEVICE,
+  );
+  assert.equal(probed, false);
+  assert.deepEqual(report.audioSend, {
+    detected: null, transport: null, onvifBackchannel: false, vigiTalk: null,
+  });
+});
+
+test("probeVigiTalk 'always' probes a device that names another vendor", async () => {
+  const report = await capabilityReportWithProbes(
+    { probeOnvifBackchannel: async () => false, probeVigiTalk: async () => true },
+    { probeVigiTalk: 'always' },
+    OTHER_VENDOR_DEVICE,
+  );
+  assert.deepEqual(report.audioSend, {
+    detected: true, transport: 'vigi', onvifBackchannel: false, vigiTalk: true,
+  });
+});
+
+test("probeVigiTalk 'never' leaves the OpenAPI port alone and detected unproven", async () => {
+  // Opting out is not evidence of absence: the caller declined to look, so
+  // detected stays null rather than becoming false.
+  let probed = false;
+  const report = await capabilityReportWithProbes(
+    {
+      probeOnvifBackchannel: async () => false,
+      probeVigiTalk: async () => { probed = true; return true; },
+    },
+    { probeVigiTalk: 'never' },
+    VIGI_DEVICE,
+  );
+  assert.equal(probed, false);
+  assert.deepEqual(report.audioSend, {
+    detected: null, transport: null, onvifBackchannel: false, vigiTalk: null,
+  });
 });
 
 test('probeAudioSend false leaves every audioSend fact null and runs no probe', async () => {

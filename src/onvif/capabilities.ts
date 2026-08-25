@@ -37,7 +37,28 @@ export interface CameraCapabilityOptions {
   timeoutMs?: number;
   /** Probe whether ONVIF backchannel or VIGI talk can send audio. Default true. */
   probeAudioSend?: boolean;
+  /**
+   * How to decide whether to ask the VIGI OpenAPI control channel about a
+   * speaker once ONVIF has reported no backchannel. Default `'auto'`.
+   *
+   * This probe is not the read-only question the ONVIF one is: it performs a
+   * credential-bearing `doAuth` against a port that counts failed attempts
+   * toward a device-side lockout, and on VIGI hardware the OpenAPI admin
+   * account is configured separately from the ONVIF account -- so a
+   * successful ONVIF exchange does not prove the password it would send.
+   *
+   * - `'auto'`   probe only when device information names TP-Link/VIGI
+   *              hardware, so cameras that cannot have the API are never
+   *              touched.
+   * - `'always'` probe regardless, for VIGI devices that report an
+   *              unexpected manufacturer.
+   * - `'never'`  leave the OpenAPI port alone entirely.
+   */
+  probeVigiTalk?: VigiTalkProbeMode;
 }
+
+/** @internal */
+export type VigiTalkProbeMode = 'auto' | 'always' | 'never';
 
 export interface CameraCapabilityService {
   namespace: string;
@@ -657,18 +678,46 @@ async function defaultProbeOnvifBackchannel(
 /** Asks the VIGI OpenAPI control channel whether the device reports a speaker. */
 async function defaultProbeVigiTalk(
   host: string,
-  user: string,
+  _user: string,
   pass: string,
   options: OnvifOptions,
 ): Promise<boolean> {
+  // The ONVIF username is deliberately not forwarded. VigiControlOptions
+  // documents `admin` as the only OpenAPI account, so passing an arbitrary
+  // ONVIF name (`--user viewer`) turns a probe that might have succeeded into
+  // a guaranteed failed auth attempt against the device's lockout counter.
+  // openVigiBackchannel keeps `user || 'admin'` because there the caller
+  // explicitly asked for VIGI and may legitimately name another account; this
+  // is an automatic probe nobody asked for.
   const control = await openVigiControl({
     host,
-    ...(user ? { user } : {}),
     pass,
     ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
   });
   const capability = await control.getAudioCapability();
   return capability.speaker;
+}
+
+/**
+ * TP-Link ships the VIGI line under both spellings of its own name and puts
+ * `VIGI` in the model string, so either field is enough to identify it.
+ */
+const VIGI_VENDOR_PATTERN = /tp[-\s]?link|vigi/i;
+
+/**
+ * Whether device information identifies TP-Link VIGI hardware: `true` when a
+ * vendor string names it, `false` when the device names some other vendor,
+ * and `null` when it reported neither a manufacturer nor a model.
+ *
+ * The `null` case is the point of returning three values rather than two.
+ * "We could not tell" must not collapse into "not VIGI", or a camera that
+ * simply answered GetDeviceInformation sparsely becomes a false negative --
+ * the failure mode the whole audioSend block exists to prevent.
+ */
+function vigiHardwareLikelihood(device: DeviceInfo): boolean | null {
+  const vendor = [device.manufacturer, device.model].filter(Boolean).join(' ');
+  if (vendor === '') return null;
+  return VIGI_VENDOR_PATTERN.test(vendor);
 }
 
 const defaultDependencies: CameraCapabilityDependencies = {
@@ -887,18 +936,25 @@ export async function getCameraCapabilitiesWithDependencies(
   )].sort(compareText);
 
   // Optional enrichment, run only after every ONVIF fact above has been
-  // collected: the device is already authenticated by this point, so the
-  // VIGI probe below issues its single doAuth attempt against a host we
-  // already know accepts these credentials, and never advances the
-  // device's failed-auth lockout counter with a bad password.
+  // collected. The ONVIF probe is free: it reuses credentials connect() has
+  // already proven and stops at the SDP without sending audio.
   //
-  // The VIGI probe is gated on onvifBackchannel === false — an affirmative
-  // "ONVIF answered and offered no sendonly track" — never on "not true".
-  // On VIGI hardware the ONVIF account and the OpenAPI admin account are
-  // configured separately, so even a successful ONVIF exchange does not
-  // prove the OpenAPI password; a probe that throws (401, timeout, no
-  // profiles) must leave vigiTalk null rather than trigger a doAuth with
-  // credentials ONVIF never proved.
+  // The VIGI probe is not. It issues a credential-bearing doAuth against a
+  // port that counts failed attempts toward a device-side lockout, and on
+  // VIGI hardware the OpenAPI admin account is configured separately from the
+  // ONVIF account -- so a successful ONVIF exchange does NOT prove the
+  // password this probe would send. Two gates follow from that:
+  //
+  //   1. onvifBackchannel === false, an affirmative "ONVIF answered and
+  //      offered no sendonly track", never merely "not true". A probe that
+  //      threw established nothing, so it must not trigger a doAuth.
+  //   2. `probeVigiTalk` (default 'auto'), which consults device information
+  //      so the great majority of cameras -- ones that cannot have the
+  //      OpenAPI at all -- are never touched.
+  //
+  // Whenever a gate stops the probe without ruling VIGI out, every audioSend
+  // field it would have set stays null. Reporting `detected: false` from an
+  // unproven state is the false negative this block exists to prevent.
   const audioSend: CameraCapabilityAudioSend = {
     detected: null, transport: null, onvifBackchannel: null, vigiTalk: null,
   };
@@ -914,21 +970,39 @@ export async function getCameraCapabilitiesWithDependencies(
       audioSend.detected = true;
       audioSend.transport = 'onvif';
     } else if (audioSend.onvifBackchannel === false) {
-      try {
-        audioSend.vigiTalk = await dependencies.probeVigiTalk(
-          options.host, user, pass, clientOptions,
-        );
-      } catch (error) {
-        warnOnly('AudioSendProbe', error);
-      }
-      if (audioSend.vigiTalk === true) {
-        audioSend.detected = true;
-        audioSend.transport = 'vigi';
-      } else if (audioSend.vigiTalk === false) {
-        // Both transports answered and neither offers a path: the only
-        // state in which "no audio send" is an established fact.
+      const mode = options.probeVigiTalk ?? 'auto';
+      // 'never' maps to null, not false: the caller declining to look is not
+      // evidence that the OpenAPI speaker is absent, so it must leave
+      // `detected` unproven exactly as an unknown vendor does.
+      const applicable: boolean | null = mode === 'always' ? true
+        : mode === 'never' ? null
+          : vigiHardwareLikelihood(device);
+      if (applicable === true) {
+        try {
+          audioSend.vigiTalk = await dependencies.probeVigiTalk(
+            options.host, user, pass, clientOptions,
+          );
+        } catch (error) {
+          warnOnly('AudioSendProbe', error);
+        }
+        if (audioSend.vigiTalk === true) {
+          audioSend.detected = true;
+          audioSend.transport = 'vigi';
+        } else if (audioSend.vigiTalk === false) {
+          // Both transports answered and neither offers a path: the only
+          // state in which "no audio send" is an established fact.
+          audioSend.detected = false;
+        }
+      } else if (applicable === false) {
+        // Device information names a vendor that is not TP-Link, so the VIGI
+        // OpenAPI cannot apply: ONVIF was the only candidate transport for
+        // this camera and it answered no. That settles the question without
+        // spending a doAuth attempt on an API the device cannot have.
         audioSend.detected = false;
       }
+      // else: applicable === null -- the vendor is unknown or the caller opted
+      // out. VIGI was not ruled out, only left unexamined, so detected stays
+      // null rather than claiming a fact nothing established.
       // else: vigiTalk === null (the probe threw) — ONVIF proved there is no
       // sendonly track, but nothing proved the absence of a VIGI speaker, so
       // detected stays null. Reporting false here would be the same false

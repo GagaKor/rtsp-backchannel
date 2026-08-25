@@ -47,6 +47,7 @@ test('documents the capabilities command in global and command help without expo
     assert.match(result.stdout, /--device-url <url>/);
     assert.match(result.stdout, /--timeout-ms <ms>/);
     assert.match(result.stdout, /--probe-audio-send/);
+    assert.match(result.stdout, /--probe-vigi-talk/);
     assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /help-only-secret/);
   }
 });
@@ -929,6 +930,37 @@ test('threads --probe-audio-send through to getCameraCapabilities and rejects ot
   );
 });
 
+test('threads --probe-vigi-talk through to getCameraCapabilities and rejects other values', async () => {
+  const logs: string[] = [];
+  const dependencies = commandDependencies(logs);
+  const calls: unknown[] = [];
+  dependencies.getCameraCapabilities = async (options) => {
+    calls.push(options);
+    return {};
+  };
+
+  for (const value of ['auto', 'always', 'never']) {
+    await commandMain()(
+      ['capabilities', '--host', 'camera.local', '--probe-vigi-talk', value],
+      dependencies,
+    );
+  }
+
+  assert.deepEqual(calls, [
+    { host: 'camera.local', user: '', pass: '', probeVigiTalk: 'auto' },
+    { host: 'camera.local', user: '', pass: '', probeVigiTalk: 'always' },
+    { host: 'camera.local', user: '', pass: '', probeVigiTalk: 'never' },
+  ]);
+
+  await assert.rejects(
+    commandMain()(
+      ['capabilities', '--host', 'camera.local', '--probe-vigi-talk', 'true'],
+      dependencies,
+    ),
+    /probe-vigi-talk must be one of: auto, always, never/,
+  );
+});
+
 test('applies capability credential defaults and omits absent optional client settings', async () => {
   const previous = process.env.ONVIF_PASSWORD;
   const logs: string[] = [];
@@ -1072,6 +1104,10 @@ test('rejects missing or flag-shaped values for every capability option', async 
     {
       option: 'timeout-ms',
       argv: ['capabilities', '--host', 'camera.local', '--timeout-ms', '-h'],
+    },
+    {
+      option: 'probe-vigi-talk',
+      argv: ['capabilities', '--host', 'camera.local', '--probe-vigi-talk'],
     },
     {
       option: 'probe-audio-send',

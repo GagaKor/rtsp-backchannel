@@ -16,7 +16,7 @@ import {
 } from './backchannel.ts';
 import { fileToG711, fileToRtpAudio } from './audio/transcode.ts';
 import { pathToFileURL } from 'node:url';
-import { getCameraCapabilities } from './onvif/capabilities.ts';
+import { getCameraCapabilities, type VigiTalkProbeMode } from './onvif/capabilities.ts';
 import { discoverDevices } from './onvif/discovery.ts';
 import { getStreamUris } from './onvif/streams.ts';
 import type { CodecPreference } from './rtsp/sdp.ts';
@@ -49,6 +49,8 @@ Capability options:
   --device-url <url>      ONVIF Device Service URL (repeatable)
   --timeout-ms <ms>       finite positive per-request timeout (maximum: 86,400,000 ms)
   --probe-audio-send <b>  true|false, probe ONVIF/VIGI audio-send support (default: true)
+  --probe-vigi-talk <m>   auto|always|never, when to ask the VIGI OpenAPI
+                          control channel about a speaker (default: auto)
 
 Playback profile: SDP codec negotiation, TCP interleaved RTP, real-time pacing.
 `;
@@ -134,11 +136,15 @@ const CAPABILITY_OPTION_NAMES = [
   'device-url',
   'timeout-ms',
   'probe-audio-send',
+  'probe-vigi-talk',
 ] as const;
 type CapabilityOptionName = typeof CAPABILITY_OPTION_NAMES[number];
 const PROBE_AUDIO_SEND_VALUES = ['true', 'false'] as const;
 const PROBE_AUDIO_SEND_RANGE_ERROR =
   `probe-audio-send must be one of: ${PROBE_AUDIO_SEND_VALUES.join(', ')}`;
+const PROBE_VIGI_TALK_VALUES = ['auto', 'always', 'never'] as const;
+const PROBE_VIGI_TALK_RANGE_ERROR =
+  `probe-vigi-talk must be one of: ${PROBE_VIGI_TALK_VALUES.join(', ')}`;
 
 function exactCapabilityOptionName(value: string): CapabilityOptionName | undefined {
   return CAPABILITY_OPTION_NAMES.find((name) => value === `--${name}`);
@@ -172,6 +178,7 @@ interface ParsedCapabilityArguments {
   'device-url': string[];
   'timeout-ms': string[];
   'probe-audio-send': string[];
+  'probe-vigi-talk': string[];
 }
 
 function parseCapabilityArguments(argv: string[]): ParsedCapabilityArguments {
@@ -189,6 +196,7 @@ function parseCapabilityArguments(argv: string[]): ParsedCapabilityArguments {
     'device-url': [],
     'timeout-ms': [],
     'probe-audio-send': [],
+    'probe-vigi-talk': [],
   };
   for (let index = 0; index < argv.length; index++) {
     const attached = attachedCapabilityOption(argv[index]);
@@ -381,6 +389,7 @@ export async function main(
     const deviceUrls = parsed['device-url'];
     const timeoutValues = parsed['timeout-ms'];
     const probeAudioSendValues = parsed['probe-audio-send'];
+    const probeVigiTalkValues = parsed['probe-vigi-talk'];
     if (hosts.length === 0) throw new Error('missing --host');
     const timeoutMs = timeoutValues.length > 0 ? Number(timeoutValues[0]) : undefined;
     if (timeoutMs !== undefined && (!Number.isFinite(timeoutMs) || timeoutMs <= 0)) {
@@ -397,6 +406,14 @@ export async function main(
       }
       probeAudioSend = value === 'true';
     }
+    let probeVigiTalk: VigiTalkProbeMode | undefined;
+    if (probeVigiTalkValues.length > 0) {
+      const value = probeVigiTalkValues[0].toLowerCase();
+      if (!PROBE_VIGI_TALK_VALUES.includes(value as VigiTalkProbeMode)) {
+        throw new RangeError(PROBE_VIGI_TALK_RANGE_ERROR);
+      }
+      probeVigiTalk = value as VigiTalkProbeMode;
+    }
     const report = await dependencies.getCameraCapabilities({
       host: hosts[0],
       user: users[0] ?? '',
@@ -404,6 +421,7 @@ export async function main(
       ...(deviceUrls.length > 0 ? { deviceUrls } : {}),
       ...(timeoutMs !== undefined ? { timeoutMs } : {}),
       ...(probeAudioSend !== undefined ? { probeAudioSend } : {}),
+      ...(probeVigiTalk !== undefined ? { probeVigiTalk } : {}),
     });
     dependencies.log(JSON.stringify(report));
     return;
