@@ -16,7 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   falls back only when the camera offers no sendonly audio track, so a
   network or authentication fault is never reported as a missing vendor API.
   The Python and Rust packages are unchanged and do not implement this
-  transport.
+  transport. Verified end to end on a TP-Link VIGI C540V, firmware 2.3.3
+  Build 260713: with `transport` left at its default, `playFile` fell back
+  from the absent ONVIF backchannel to VIGI, opened a `pcma/8000 pt=8 ch=0`
+  session, and played an audible tone through the camera's speaker.
 - `getCameraCapabilities` gains an `audioSend` block naming the transport
   (`'onvif'`, `'vigi'`, or neither) that can reach a given camera. **This
   probe runs by default and adds real cost to every call**: it opens a
