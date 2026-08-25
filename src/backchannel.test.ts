@@ -7,7 +7,7 @@ import {
   selectBackchannelTransport,
 } from './backchannel.ts';
 import { RtpPacketizer } from './rtp/sender.ts';
-import { createVigiTalkSession, type VigiTalkSocket } from './vigi/talk.ts';
+import { createVigiTalkSessionWithDependencies, type VigiTalkSocket } from './vigi/talk.ts';
 
 interface TestClock {
   now(): number;
@@ -110,9 +110,10 @@ function trackUriResolver(): ResolveTrackUri {
 }
 
 /**
- * Minimal VigiTalkSocket double for driving the real createVigiTalkSession
- * (not a fake talk session) through openVigiBackchannelWithDependencies's
- * injected `createVigiTalkSession`. Answers the first MULTITRANS write with
+ * Minimal VigiTalkSocket double for driving the real
+ * createVigiTalkSessionWithDependencies (not a fake talk session) through
+ * openVigiBackchannelWithDependencies's injected `createVigiTalkSession`.
+ * Answers the first MULTITRANS write with
  * an unchallenged 200 OK — the digest handshake itself is already covered by
  * src/vigi/talk.test.ts, so this fixture only needs it to succeed — and
  * records every interleaved RTP frame written afterward.
@@ -139,11 +140,35 @@ class FakeTalkSocket implements VigiTalkSocket {
     this.handlers.set(event, list);
     return this;
   }
+  once(event: string, handler: (arg?: unknown) => void): unknown {
+    const wrapped: { (arg?: unknown): void; listener?: typeof handler } = (arg?: unknown) => {
+      this.off(event, wrapped);
+      handler(arg);
+    };
+    // Mirrors node:events so off(event, originalHandler) below can find and
+    // remove a once() listener registered with the wrapper, not the handler
+    // itself — see the identical comment in vigi/talk.test.ts.
+    wrapped.listener = handler;
+    return this.on(event, wrapped);
+  }
+  off(event: string, handler: (arg?: unknown) => void): unknown {
+    const list = this.handlers.get(event);
+    if (list) {
+      this.handlers.set(
+        event,
+        list.filter((candidate) => {
+          const wrapped = candidate as { listener?: typeof handler };
+          return candidate !== handler && wrapped.listener !== handler;
+        }),
+      );
+    }
+    return this;
+  }
   end(): void { this.ended = true; }
   destroy(): void {}
   setTimeout(): unknown { return this; }
   emit(event: string, arg?: unknown): void {
-    for (const handler of this.handlers.get(event) ?? []) handler(arg);
+    for (const handler of [...(this.handlers.get(event) ?? [])]) handler(arg);
   }
   /** Every interleaved ($-framed) RTP packet written after the handshake. */
   get rtpFrames(): Buffer[] {
@@ -782,7 +807,7 @@ test('openVigiBackchannel opens a PCMA session backed by the real talk layer', a
         };
       },
       createVigiTalkSession: (talkOptions) =>
-        createVigiTalkSession(talkOptions, { connect: () => socket }),
+        createVigiTalkSessionWithDependencies(talkOptions, { connect: () => socket }),
     },
   );
 
@@ -825,7 +850,7 @@ test(
           getAudioCapability: async () => ({ speaker: true, microphone: false }),
         }),
         createVigiTalkSession: (talkOptions) =>
-          createVigiTalkSession(talkOptions, { connect: () => socket }),
+          createVigiTalkSessionWithDependencies(talkOptions, { connect: () => socket }),
       },
     );
 
@@ -870,7 +895,7 @@ test('openVigiBackchannel.send rejects EncodedAudio for a codec other than pcma'
         getAudioCapability: async () => ({ speaker: true, microphone: false }),
       }),
       createVigiTalkSession: (talkOptions) =>
-        createVigiTalkSession(talkOptions, { connect: () => socket }),
+        createVigiTalkSessionWithDependencies(talkOptions, { connect: () => socket }),
     },
   );
 

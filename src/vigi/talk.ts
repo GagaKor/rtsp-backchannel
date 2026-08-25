@@ -28,17 +28,20 @@ const DEFAULT_TIMEOUT_MS = 8000;
 
 export type VigiTalkMode = 'half_duplex' | 'aec';
 
-/** The slice of net.Socket this module uses, so tests can supply a double. */
+/** @internal The slice of net.Socket this module uses, so tests can supply a double. */
 export interface VigiTalkSocket {
   write(chunk: Buffer | string): boolean;
   // `unknown`, not a specific event-payload type: this one method covers
   // 'data' (Buffer), 'error' (Error) and 'close' (no argument) alike.
   on(event: string, handler: (arg?: unknown) => void): unknown;
+  once(event: string, handler: (arg?: unknown) => void): unknown;
+  off(event: string, handler: (arg?: unknown) => void): unknown;
   end(): void;
   destroy(): void;
   setTimeout(ms: number, handler?: () => void): unknown;
 }
 
+/** @internal Exported for tests; the socket transport is injected. */
 export interface VigiTalkDependencies {
   connect(port: number, host: string): VigiTalkSocket;
 }
@@ -112,9 +115,78 @@ const defaultDependencies: VigiTalkDependencies = {
   connect: (port, host) => net.connect(port, host) as unknown as VigiTalkSocket,
 };
 
-export function createVigiTalkSession(
+/**
+ * Write one interleaved RTP frame and report the outcome truthfully — awaits
+ * drain, error, and close exactly as `RtspClient.sendInterleaved` does for
+ * the ONVIF backchannel, so the two transports behind `BackchannelSession`
+ * cannot disagree about whether a packet actually reached the camera. A
+ * fire-and-forget `connection.write()` here would let a mid-stream
+ * `ECONNRESET` go unnoticed and `send()` would resolve with a packet count
+ * for audio the camera never received.
+ */
+function writeInterleaved(
+  connection: VigiTalkSocket,
+  frame: Buffer,
+  timeoutMs: number,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const cleanup = () => {
+      if (timer !== undefined) clearTimeout(timer);
+      connection.off('drain', onDrain);
+      connection.off('error', onError);
+      connection.off('close', onClose);
+    };
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (error) reject(error);
+      else resolve();
+    };
+    const onDrain = () => finish();
+    const onError = (arg?: unknown) => {
+      const cause = arg instanceof Error ? arg : new Error(String(arg));
+      finish(new Error(`VIGI talk write failed: ${cause.message}`, { cause }));
+    };
+    const onClose = () => finish(new Error('VIGI talk connection closed during send'));
+
+    connection.once('drain', onDrain);
+    connection.once('error', onError);
+    connection.once('close', onClose);
+    try {
+      if (connection.write(frame)) {
+        finish();
+        return;
+      }
+    } catch (error) {
+      onError(error);
+      return;
+    }
+    if (settled) return;
+    timer = setTimeout(() => {
+      finish(new Error(`VIGI talk write timeout after ${timeoutMs} ms`));
+      connection.destroy();
+    }, timeoutMs);
+  });
+}
+
+export function createVigiTalkSession(options: VigiTalkOptions): VigiTalkSession {
+  return createVigiTalkSessionWithDependencies(options, defaultDependencies);
+}
+
+/**
+ * @internal Exported for tests; the socket transport is injected. Split out
+ * of `createVigiTalkSession` (rather than a defaulted second parameter, as
+ * before) so that `VigiTalkSocket` and `VigiTalkDependencies` — injection
+ * seams with no reason to be part of the published API — can be marked
+ * `@internal` and stripped from the built `.d.ts` without leaving a dangling
+ * reference in `createVigiTalkSession`'s own public signature.
+ */
+export function createVigiTalkSessionWithDependencies(
   options: VigiTalkOptions,
-  dependencies: VigiTalkDependencies = defaultDependencies,
+  dependencies: VigiTalkDependencies,
 ): VigiTalkSession {
   const user = options.user ?? 'admin';
   const channel = options.channel ?? VIGI_TALK_CHANNEL;
@@ -261,9 +333,11 @@ export function createVigiTalkSession(
       return sendPacedFrames(
         frames(),
         SAMPLE_RATE,
-        (payload) => {
-          connection.write(interleave(channel, rtp.build(payload, payload.length)));
-        },
+        (payload) => writeInterleaved(
+          connection,
+          interleave(channel, rtp.build(payload, payload.length)),
+          timeoutMs,
+        ),
         options.clock,
       );
     },
@@ -275,7 +349,12 @@ export function createVigiTalkSession(
       // after close is rejected") instead of letting it resolve to a
       // connection nothing will ever use again.
       abortOpening?.(new Error('VIGI talk session is closed'));
-      socket?.end();
+      // Destroy rather than half-close (end()): VIGI documents no keep-alive
+      // for a talk session and no reply to a FIN, so end() would leave the
+      // handle referenced — and a CLI run hanging after playback — until the
+      // camera closes its side, which it may never do. Matches
+      // RtspClient.close() on the ONVIF path.
+      socket?.destroy();
       socket = undefined;
     },
   };

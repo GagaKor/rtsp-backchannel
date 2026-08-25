@@ -8,7 +8,7 @@ import {
   VIGI_TALK_PAYLOAD_TYPE,
   VIGI_TALK_SAMPLES_PER_PACKET,
   buildMultitransRequest,
-  createVigiTalkSession,
+  createVigiTalkSessionWithDependencies,
   type VigiTalkDependencies,
   type VigiTalkSocket,
 } from './talk.ts';
@@ -31,12 +31,41 @@ class FakeSocket implements VigiTalkSocket {
     this.handlers.set(event, list);
     return this;
   }
+  once(event: string, handler: (arg?: unknown) => void): this {
+    const wrapped: { (arg?: unknown): void; listener?: typeof handler } = (arg?: unknown) => {
+      this.off(event, wrapped);
+      handler(arg);
+    };
+    // Mirrors node:events: EventEmitter.removeListener() unwraps a once()
+    // listener via this property so callers can pass the original handler
+    // to off(), not the internal wrapper. Without it, the writeInterleaved
+    // cleanup()'s off() calls below would silently fail to match and every
+    // once() listener would leak for the life of the fake.
+    wrapped.listener = handler;
+    return this.on(event, wrapped);
+  }
+  off(event: string, handler: (arg?: unknown) => void): this {
+    const list = this.handlers.get(event);
+    if (list) {
+      this.handlers.set(
+        event,
+        list.filter((candidate) => {
+          const wrapped = candidate as { listener?: typeof handler };
+          return candidate !== handler && wrapped.listener !== handler;
+        }),
+      );
+    }
+    return this;
+  }
   end(): void { this.ended = true; }
   destroy(): void { this.destroyed = true; }
   setTimeout(): void {}
 
   emit(event: string, arg?: unknown): void {
-    for (const handler of this.handlers.get(event) ?? []) handler(arg);
+    // Snapshot: a fired 'once' handler mutates the list via off() as part of
+    // its own invocation, so iterating the live array would skip whichever
+    // handler follows the one that just removed itself.
+    for (const handler of [...(this.handlers.get(event) ?? [])]) handler(arg);
   }
   /** Text of every non-binary chunk, for asserting on requests. */
   get requests(): string[] {
@@ -119,7 +148,7 @@ test('includes an Authorization header when one is supplied', () => {
 test('opens no socket until the first send', () => {
   let connects = 0;
   const socket = new FakeSocket();
-  createVigiTalkSession(OPTIONS, {
+  createVigiTalkSessionWithDependencies(OPTIONS, {
     connect: () => { connects += 1; return socket; },
   });
   assert.equal(connects, 0);
@@ -128,7 +157,7 @@ test('opens no socket until the first send', () => {
 test('sends the talk request with the documented mode and authenticates with the vigi style', async () => {
   const { socket, dependencies } = harness();
   autoRespond(socket);
-  const session = createVigiTalkSession(
+  const session = createVigiTalkSessionWithDependencies(
     { ...OPTIONS, clock: instantClock },
     dependencies,
   );
@@ -158,7 +187,7 @@ test('sends the talk request with the documented mode and authenticates with the
 test('honours an explicit aec mode', async () => {
   const { socket, dependencies } = harness();
   autoRespond(socket);
-  const session = createVigiTalkSession(
+  const session = createVigiTalkSessionWithDependencies(
     { ...OPTIONS, mode: 'aec', clock: instantClock },
     dependencies,
   );
@@ -169,7 +198,7 @@ test('honours an explicit aec mode', async () => {
 test('frames audio as interleaved RTP with payload type 8 on channel 0', async () => {
   const { socket, dependencies } = harness();
   autoRespond(socket);
-  const session = createVigiTalkSession(
+  const session = createVigiTalkSessionWithDependencies(
     { ...OPTIONS, clock: instantClock },
     dependencies,
   );
@@ -197,7 +226,7 @@ test('frames audio as interleaved RTP with payload type 8 on channel 0', async (
 test('a short trailing frame is still sent', async () => {
   const { socket, dependencies } = harness();
   autoRespond(socket);
-  const session = createVigiTalkSession(
+  const session = createVigiTalkSessionWithDependencies(
     { ...OPTIONS, clock: instantClock },
     dependencies,
   );
@@ -209,7 +238,7 @@ test('a short trailing frame is still sent', async () => {
 test('reuses one talk session across successive sends', async () => {
   const { socket, dependencies } = harness();
   autoRespond(socket);
-  const session = createVigiTalkSession(
+  const session = createVigiTalkSessionWithDependencies(
     { ...OPTIONS, clock: instantClock },
     dependencies,
   );
@@ -235,7 +264,7 @@ test('surfaces a device error_code from the talk reply', async () => {
     }
     return result;
   };
-  const session = createVigiTalkSession(
+  const session = createVigiTalkSessionWithDependencies(
     { ...OPTIONS, clock: instantClock },
     { connect: () => socket },
   );
@@ -260,7 +289,7 @@ test('surfaces a non-200 MULTITRANS status', async () => {
     }
     return result;
   };
-  const session = createVigiTalkSession(
+  const session = createVigiTalkSessionWithDependencies(
     { ...OPTIONS, clock: instantClock },
     { connect: () => socket },
   );
@@ -270,25 +299,90 @@ test('surfaces a non-200 MULTITRANS status', async () => {
   );
 });
 
-test('close ends an opened socket and is safe before any send', async () => {
+test('close destroys an opened socket and is safe before any send', async () => {
   const { socket, dependencies } = harness();
   autoRespond(socket);
-  const unopened = createVigiTalkSession(OPTIONS, { connect: () => new FakeSocket() });
+  const unopened = createVigiTalkSessionWithDependencies(OPTIONS, { connect: () => new FakeSocket() });
   await unopened.close();
 
-  const session = createVigiTalkSession(
+  const session = createVigiTalkSessionWithDependencies(
     { ...OPTIONS, clock: instantClock },
     dependencies,
   );
   await session.send(Buffer.alloc(VIGI_TALK_SAMPLES_PER_PACKET, 0xd5));
   await session.close();
-  assert.equal(socket.ended, true);
+  // Destroy, not end(): VIGI documents no keep-alive and no guaranteed FIN
+  // reply, so a half-close (end()) would leave the handle referenced and
+  // could hang a CLI run after playback. Matches RtspClient.close() on the
+  // ONVIF path.
+  assert.equal(socket.destroyed, true);
+  assert.equal(socket.ended, false);
+});
+
+test('a write error partway through a send rejects instead of resolving with a packet count', async () => {
+  const { socket, dependencies } = harness();
+  autoRespond(socket);
+  const session = createVigiTalkSessionWithDependencies(
+    { ...OPTIONS, clock: instantClock },
+    dependencies,
+  );
+
+  // Open the session with one successful frame first, exactly like the
+  // regression this guards: the failure lands mid-stream, after the
+  // MULTITRANS handshake has already settled and the old permanent 'error'
+  // listener had gone dead and would have swallowed it.
+  await session.send(Buffer.alloc(VIGI_TALK_SAMPLES_PER_PACKET, 0xd5));
+
+  // Simulate a mid-stream ECONNRESET on the very next RTP write. The error
+  // is emitted synchronously from inside write(), which fires after
+  // writeInterleaved's once('error', ...) listener is already attached (it
+  // is attached before write() is called), so this is deterministic — no
+  // dependence on microtask ordering.
+  const original = socket.write.bind(socket);
+  socket.write = (chunk: Buffer | string): boolean => {
+    if (Buffer.isBuffer(chunk) && chunk[0] === 0x24) {
+      socket.emit('error', new Error('ECONNRESET'));
+      return true;
+    }
+    return original(chunk);
+  };
+
+  await assert.rejects(
+    session.send(Buffer.alloc(VIGI_TALK_SAMPLES_PER_PACKET, 0xd5)),
+    /VIGI talk write failed: ECONNRESET/,
+  );
+});
+
+test('a socket close partway through a send rejects rather than reporting success', async () => {
+  const { socket, dependencies } = harness();
+  autoRespond(socket);
+  const session = createVigiTalkSessionWithDependencies(
+    { ...OPTIONS, clock: instantClock },
+    dependencies,
+  );
+  await session.send(Buffer.alloc(VIGI_TALK_SAMPLES_PER_PACKET, 0xd5));
+
+  // Mirrors the write-error test above, but for a camera that drops the TCP
+  // connection outright instead of erroring first.
+  const original = socket.write.bind(socket);
+  socket.write = (chunk: Buffer | string): boolean => {
+    if (Buffer.isBuffer(chunk) && chunk[0] === 0x24) {
+      socket.emit('close');
+      return false;
+    }
+    return original(chunk);
+  };
+
+  await assert.rejects(
+    session.send(Buffer.alloc(VIGI_TALK_SAMPLES_PER_PACKET, 0xd5)),
+    /VIGI talk connection closed during send/,
+  );
 });
 
 test('send after close is rejected', async () => {
   const { socket, dependencies } = harness();
   autoRespond(socket);
-  const session = createVigiTalkSession(
+  const session = createVigiTalkSessionWithDependencies(
     { ...OPTIONS, clock: instantClock },
     dependencies,
   );
@@ -315,7 +409,7 @@ test('a single data event carrying the 200 OK plus trailing bytes still opens', 
     }
     return result;
   };
-  const session = createVigiTalkSession(
+  const session = createVigiTalkSessionWithDependencies(
     { ...OPTIONS, clock: instantClock },
     { connect: () => socket },
   );
@@ -328,7 +422,7 @@ test('a single data event carrying the 200 OK plus trailing bytes still opens', 
 test('bytes arriving after the handshake settles are ignored, not reprocessed', async () => {
   const { socket, dependencies } = harness();
   autoRespond(socket);
-  const session = createVigiTalkSession(
+  const session = createVigiTalkSessionWithDependencies(
     { ...OPTIONS, clock: instantClock },
     dependencies,
   );
@@ -353,7 +447,7 @@ test('bytes arriving after the handshake settles are ignored, not reprocessed', 
 test('close during an in-flight open aborts the handshake and destroys the connection', async () => {
   const { socket, dependencies } = harness();
   autoRespond(socket);
-  const session = createVigiTalkSession(
+  const session = createVigiTalkSessionWithDependencies(
     { ...OPTIONS, clock: instantClock },
     dependencies,
   );
