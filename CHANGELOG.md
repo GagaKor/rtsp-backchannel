@@ -69,6 +69,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A failed VIGI OpenAPI `doAuth` challenge is reported by its error code
   rather than as a malformed reply, so an account locked by the device's retry
   limit says so instead of surfacing as `invalid VIGI doAuth challenge`.
+- Downlink audio no longer breaks the VIGI talk handshake. With
+  `mode: 'aec'` the camera may push `$`-framed RTP on the same connection
+  before the MULTITRANS reply arrives; those bytes were fed to the text parser,
+  which found a `CRLFCRLF` inside the audio and failed the open with raw device
+  bytes in the error message.
 
 ### Changed
 
@@ -89,6 +94,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   importing this package from a CommonJS file raises `TS1479`; and `require()`
   returns Node's sealed module namespace, so the exports cannot be replaced by
   `jest.spyOn` or `sinon.stub`.
+- Internal structure only, no API change: both backchannel transports now share
+  one interleaved-write implementation instead of two copies of the same
+  state machine, frame pacing moved to its own module so reaching the VIGI
+  transport no longer needs a runtime `import()` to dodge a load-time cycle,
+  and the ONVIF backchannel probe gained an injection seam and its first tests.
+  `dist/index.d.ts` is unchanged.
 
 ## [0.3.1] - 2026-08-13
 
