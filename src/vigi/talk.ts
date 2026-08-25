@@ -8,7 +8,7 @@
  * keep-alive is defined for a talk session.
  */
 import net from 'node:net';
-import { SAMPLE_RATE, sendPacedFrames, type PacingClock } from '../backchannel.ts';
+import { SAMPLE_RATE, sendPacedFrames, type PacingClock } from '../audio/pacing.ts';
 import { RtpPacketizer, interleave } from '../rtp/sender.ts';
 import { vigiAuthority } from './control.ts';
 import {

@@ -101,3 +101,59 @@ plus a statement about the artifact that is not true.
   `require(esm)` behave close enough to CJS to document simply.
 - Revisiting the `.d.cts` route only makes sense together with a build-tool
   change; it should not be bolted on as a single hand-written file.
+
+## Additional Decisions
+
+*(Recorded here rather than as their own file: the session's decision-log budget
+was spent, and this one shares the concern above — what the published artifact
+can be statically analysed to contain.)*
+
+### Pacing moves to its own module instead of keeping the dynamic-import workaround
+
+**Context.** `backchannel.ts` reached its VIGI transport through
+`await import('./vigi/talk.ts')`. That was not a style choice: `talk.ts`
+computed a top-level constant from `backchannel.ts`'s `SAMPLE_RATE`, so a
+static import formed a load-time cycle. Reproduced by converting it — a process
+that starts with `backchannel.ts` throws
+`Cannot access 'SAMPLE_RATE' before initialization`, and `backchannel.test.ts`
+fails outright.
+
+**Decision.** Extract `SAMPLE_RATE`, `PACKET_MS`, `PacingClock`,
+`sendPacedFrames`, `sendPacedG711` and the internal clock into
+`src/audio/pacing.ts`, have both transports take them from there, and make the
+import static. `backchannel.ts` re-exports the public names, so the emitted
+`dist/index.d.ts` is byte-identical.
+
+**Alternatives.** Keeping the dynamic import leaves the cycle in place for
+whoever adds the next such import, and puts an unanalysable runtime `import()`
+on the VIGI open path — a hazard for bundlers and for the `require` entry point
+this document is about. Moving only `SAMPLE_RATE` would have split the pacing
+primitives across two modules for no gain, since `sendPacedFrames` and
+`sendPacedG711` are what `talk.ts` is actually there for.
+
+**Trade-offs.** One more module in `src/audio/`, and `backchannel.ts` now
+re-exports rather than defines four public names — an indirection a reader has
+to follow. Accepted because the alternative is a cycle that only stays harmless
+while nobody touches it.
+
+### The ONVIF backchannel probe gets its own seam rather than routing through `createDevice`
+
+**Context.** `defaultProbeOnvifBackchannel` constructed `OnvifDevice` and
+`RtspClient` directly, so the module's `createDevice` injection point did not
+apply to it. Its behaviour — profile selection, DESCRIBE handling, socket
+cleanup — had no test coverage at all, and `capabilities.test.ts` had to stub
+the whole probe out to keep the network out of unrelated tests.
+
+**Decision.** Give the probe its own narrow dependencies rather than widening
+`createDevice`.
+
+**Reasoning.** `CameraCapabilityDevice` exposes only `connect`,
+`connectedMediaUrl` and `serviceCall`; the probe needs `getProfiles` and
+`getStreamUri`. Routing it through `createDevice` would mean adding both to an
+interface the main path never calls them on, so every existing test double
+would have to grow two methods to satisfy a caller it does not exercise. A
+separate seam keeps each interface to what its own caller uses.
+
+**Trade-offs.** Two device-construction seams in one module instead of one, and
+a reader has to notice that `createDevice` deliberately does not cover the
+probe. Mitigated by a comment at the probe saying so and why.

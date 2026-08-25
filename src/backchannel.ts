@@ -21,88 +21,31 @@ import {
   type VigiControlOptions,
   type VigiControlSession,
 } from './vigi/control.ts';
-import type { VigiTalkOptions, VigiTalkSession } from './vigi/talk.ts';
+import {
+  createVigiTalkSession,
+  type VigiTalkOptions,
+  type VigiTalkSession,
+} from './vigi/talk.ts';
+import {
+  PACKET_MS,
+  SAMPLE_RATE,
+  sendPacedFrames,
+  sendPacedG711,
+  systemClock,
+  type PacingClock,
+} from './audio/pacing.ts';
 
-export const SAMPLE_RATE = 8000;
-export const PACKET_MS = 40;
-const SAMPLES_PER_PACKET = (SAMPLE_RATE * PACKET_MS) / 1000; // 320
-
-const sleep = (ms: number): Promise<void> =>
-  new Promise<void>((resolve) => setTimeout(resolve, Math.max(0, ms)));
-
-export interface PacingClock {
-  now(): number;
-  sleep(milliseconds: number): Promise<void>;
-}
-
-const systemClock: PacingClock = {
-  now: () => performance.now(),
-  sleep,
-};
-
-async function waitUntil(deadline: number, clock: PacingClock): Promise<number> {
-  let now = clock.now();
-  while (now < deadline) {
-    await clock.sleep(deadline - now);
-    now = clock.now();
-  }
-  return now;
-}
-
-/** Send timestamped frames without bursty catch-up after scheduler stalls. */
-export async function sendPacedFrames(
-  frames: Iterable<EncodedAudioFrame>,
-  clockRate: number,
-  sendPacket: (payload: Buffer, samples: number) => void | Promise<void>,
-  clock: PacingClock = systemClock,
-  beforePacket?: () => Promise<void>,
-): Promise<number> {
-  if (!Number.isFinite(clockRate) || clockRate <= 0) {
-    throw new RangeError('RTP clock rate must be finite and greater than 0');
-  }
-  let sent = 0;
-  let deadline = clock.now();
-  for (const frame of frames) {
-    if (!Number.isInteger(frame.samples) || frame.samples <= 0) {
-      throw new RangeError('audio frame samples must be a positive integer');
-    }
-    const durationMs = (frame.samples * 1000) / clockRate;
-    let actual = await waitUntil(deadline, clock);
-    if (beforePacket) {
-      await beforePacket();
-      actual = clock.now();
-    }
-    if (sent > 0 && actual - deadline >= durationMs) deadline = actual;
-
-    await sendPacket(frame.payload, frame.samples);
-    sent++;
-    deadline += durationMs;
-  }
-  if (sent > 0) await waitUntil(deadline, clock);
-  return sent;
-}
-
-/** Send G.711 as 40 ms packets without bursty catch-up after scheduler stalls. */
-export function sendPacedG711(
-  g711: Buffer,
-  sendPacket: (payload: Buffer) => void | Promise<void>,
-  clock: PacingClock = systemClock,
-  beforePacket?: () => Promise<void>,
-): Promise<number> {
-  function* frames(): Generator<EncodedAudioFrame> {
-    for (let offset = 0; offset < g711.length; offset += SAMPLES_PER_PACKET) {
-      const payload = g711.subarray(offset, offset + SAMPLES_PER_PACKET);
-      yield { payload, samples: payload.length };
-    }
-  }
-  return sendPacedFrames(
-    frames(),
-    SAMPLE_RATE,
-    (payload) => sendPacket(payload),
-    clock,
-    beforePacket,
-  );
-}
+// Pacing lives in ./audio/pacing.ts so that vigi/talk.ts can take
+// SAMPLE_RATE from there instead of from here. Importing it from this module
+// made backchannel.ts -> vigi/talk.ts -> backchannel.ts a load-time cycle.
+// Re-exported so this module's published surface is unchanged.
+export {
+  PACKET_MS,
+  SAMPLE_RATE,
+  sendPacedFrames,
+  sendPacedG711,
+  type PacingClock,
+} from './audio/pacing.ts';
 
 export interface BackchannelSession {
   /** Complete SDP codec selected for this RTP sender. */
@@ -556,13 +499,6 @@ export async function openVigiBackchannel(
   pass = '',
   options: BackchannelOptions = {},
 ): Promise<BackchannelSession> {
-  // Imported dynamically, not statically: src/vigi/talk.ts computes a
-  // top-level constant from this module's SAMPLE_RATE, so a static import
-  // here would form a load-time cycle in which that constant is read before
-  // SAMPLE_RATE is initialized (whenever backchannel.ts is the module that
-  // starts evaluating first, as it is from backchannel.test.ts). Deferring
-  // to runtime avoids that without touching the already-landed talk.ts.
-  const { createVigiTalkSession } = await import('./vigi/talk.ts');
   return openVigiBackchannelWithDependencies(host, user, pass, options, {
     openVigiControl,
     createVigiTalkSession,
