@@ -714,7 +714,8 @@ const VIGI_VENDOR_PATTERN = /tp[-\s]?link|vigi/i;
  * simply answered GetDeviceInformation sparsely becomes a false negative --
  * the failure mode the whole audioSend block exists to prevent.
  */
-function vigiHardwareLikelihood(device: DeviceInfo): boolean | null {
+/** @internal Exported for src/audiocheck.ts, which needs the same gate. */
+export function vigiHardwareLikelihood(device: DeviceInfo): boolean | null {
   const vendor = [device.manufacturer, device.model].filter(Boolean).join(' ');
   if (vendor === '') return null;
   return VIGI_VENDOR_PATTERN.test(vendor);

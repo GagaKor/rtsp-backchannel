@@ -60,6 +60,34 @@ function describeErrorCode(code: number, operation: string): string {
   return `VIGI OpenAPI ${operation} failed`;
 }
 
+/**
+ * @internal Reduces `host` to a bare authority, dropping any port it already
+ * carries. Shared with src/vigi/talk.ts, which connects a socket and builds an
+ * RTSP URI from the same string.
+ *
+ * `VigiControlOptions.host` is documented as a hostname and the OpenAPI
+ * control port has its own option, but every route into this function accepts
+ * a `host:port` string for a *different* service: `openBackchannel('cam:2020')`
+ * and `getCameraCapabilities({ host: 'cam:2020' })` both forward it verbatim,
+ * and an ONVIF service on a non-default port is exactly how VIGI hardware
+ * ships. Concatenating produced `https://cam:2020:20443` and threw
+ * `Invalid URL`, which the audioSend probe swallowed as "no VIGI speaker" --
+ * observed on a VIGI C540V whose OpenAPI reports speaker=true.
+ *
+ * `URL.hostname` keeps IPv6 literals bracketed, so `[2001:db8::1]:2020`
+ * survives as `[2001:db8::1]`.
+ */
+export function vigiAuthority(host: string): string {
+  let hostname: string;
+  try {
+    ({ hostname } = new URL(`http://${host}`));
+  } catch {
+    throw new Error(`invalid VIGI host: ${host}`);
+  }
+  if (hostname === '') throw new Error(`invalid VIGI host: ${host}`);
+  return hostname;
+}
+
 function requireSuccess(reply: unknown, operation: string): Record<string, unknown> {
   if (typeof reply !== 'object' || reply === null) {
     throw new Error(`invalid VIGI ${operation} response`);
@@ -167,7 +195,7 @@ export async function openVigiControlWithDependencies(
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
     throw new RangeError('timeoutMs must be finite and greater than 0');
   }
-  const base = `https://${options.host}:${port}`;
+  const base = `https://${vigiAuthority(options.host)}:${port}`;
 
   const challengeReply = await dependencies.postJson(
     base,

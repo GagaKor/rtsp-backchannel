@@ -10,6 +10,7 @@
 import net from 'node:net';
 import { SAMPLE_RATE, sendPacedFrames, type PacingClock } from '../backchannel.ts';
 import { RtpPacketizer, interleave } from '../rtp/sender.ts';
+import { vigiAuthority } from './control.ts';
 import {
   digestAuthorization,
   generateCnonce,
@@ -191,7 +192,13 @@ export function createVigiTalkSessionWithDependencies(
   const user = options.user ?? 'admin';
   const channel = options.channel ?? VIGI_TALK_CHANNEL;
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const uri = `rtsp://${options.host}/multitrans`;
+  // The same `host:port` string that reaches openVigiControl reaches here, and
+  // the port in it belongs to some other service (ONVIF on 2020, say) -- the
+  // talk stream is on `streamPort`. Left in, it made net.connect resolve a
+  // hostname with a colon in it and advertised the wrong port in the RTSP URI
+  // that the digest response is computed over.
+  const authority = vigiAuthority(options.host);
+  const uri = `rtsp://${authority}/multitrans`;
   const talkJson = JSON.stringify({
     type: 'request',
     seq: '1',
@@ -209,7 +216,7 @@ export function createVigiTalkSessionWithDependencies(
   function open(): Promise<VigiTalkSocket> {
     if (opening) return opening;
     opening = new Promise<VigiTalkSocket>((resolve, reject) => {
-      const connection = dependencies.connect(options.streamPort, options.host);
+      const connection = dependencies.connect(options.streamPort, authority);
       // Track the connection as soon as it exists, not only once the
       // handshake succeeds, so close() can always reach it.
       socket = connection;

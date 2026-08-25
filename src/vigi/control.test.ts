@@ -83,6 +83,35 @@ test('honours a non-default control port', async () => {
   assert.equal(posts[0].url, 'https://cam:21443');
 });
 
+test('strips a port already carried by host instead of building an invalid URL', async () => {
+  // `host` is documented as a hostname and the control port has its own
+  // option, but callers reach this through APIs that accept `host:port` --
+  // `openBackchannel('cam:2020', ...)` and `getCameraCapabilities({host})`
+  // both forward it verbatim. Concatenating produced `https://cam:2020:20443`,
+  // which throws `Invalid URL`; reproduced on a real VIGI C540V whose ONVIF
+  // service listens on 2020, where it silently turned a working OpenAPI
+  // speaker into "no audio-send path".
+  const posts: RecordedPost[] = [];
+  await openVigiControlWithDependencies({ ...OPTIONS, host: 'cam:2020' }, fakeControl(posts));
+  assert.equal(posts[0].url, 'https://cam:20443');
+});
+
+test('keeps a bracketed IPv6 literal intact', async () => {
+  const posts: RecordedPost[] = [];
+  await openVigiControlWithDependencies(
+    { ...OPTIONS, host: '[2001:db8::1]:2020' },
+    fakeControl(posts),
+  );
+  assert.equal(posts[0].url, 'https://[2001:db8::1]:20443');
+});
+
+test('rejects a host that is not a usable authority', async () => {
+  await assert.rejects(
+    openVigiControlWithDependencies({ ...OPTIONS, host: 'not a host' }, fakeControl([])),
+    /invalid VIGI host/,
+  );
+});
+
 test('sends later calls to the stok path', async () => {
   const posts: RecordedPost[] = [];
   const session = await openVigiControlWithDependencies(OPTIONS, fakeControl(posts));
