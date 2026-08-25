@@ -294,6 +294,30 @@ test('declares an installable npm package with ESM and CommonJS entry points', (
   // warning by default) while hard-failing ESM-only installs under
   // engine-strict. See docs/decisions/2026-08-25-cjs-support-boundaries.md.
   assert.equal(manifest.engines.node, '>=22');
+  // #36's "raised the minimum Node.js version from 22 to 22.12.0" entry
+  // outlived the change it described, because nothing tied the CHANGELOG to
+  // the manifest -- 289 tests passed with the two contradicting each other.
+  // Any engines range quoted in the unreleased section must be the real one,
+  // and the real one must appear, so a future bump cannot land silently.
+  const changelog = readFileSync('CHANGELOG.md', 'utf8');
+  const unreleasedStart = changelog.indexOf('## [Unreleased]');
+  assert.notEqual(unreleasedStart, -1, 'CHANGELOG must keep an [Unreleased] section');
+  const nextRelease = changelog.indexOf('\n## [', unreleasedStart + 1);
+  const unreleased = changelog.slice(
+    unreleasedStart,
+    nextRelease === -1 ? undefined : nextRelease,
+  );
+  for (const [, quoted] of unreleased.matchAll(/`(>=[\d.]+)`/g)) {
+    assert.equal(
+      quoted,
+      manifest.engines.node,
+      `CHANGELOG quotes engines ${quoted}, manifest says ${manifest.engines.node}`,
+    );
+  }
+  assert.ok(
+    unreleased.includes(`\`${manifest.engines.node}\``),
+    `the unreleased CHANGELOG must state the current engines range (${manifest.engines.node})`,
+  );
   // npm rewrites the lockfile's own engines block from the manifest on the next
   // install, so a stale value here is a guaranteed unrelated diff in someone
   // else's PR -- and RELEASING.md requires the two files to agree.
