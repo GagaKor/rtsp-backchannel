@@ -230,6 +230,10 @@ test('declares an installable npm package with ESM and CommonJS entry points', (
   // merely unlikely -- a process can only ever hold one module instance.
   assert.equal(manifest.exports['.'].require, './dist/index.js');
   assert.equal(manifest.engines.node, '>=22.12.0');
+  // npm rewrites the lockfile's own engines block from the manifest on the next
+  // install, so a stale value here is a guaranteed unrelated diff in someone
+  // else's PR -- and RELEASING.md requires the two files to agree.
+  assert.equal(lockfile.packages[''].engines.node, manifest.engines.node);
   assert.equal(manifest.bin['rtsp-backchannel'], 'dist/bin.js');
   assert.equal(
     manifest.repository.url,
