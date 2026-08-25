@@ -652,18 +652,72 @@ class OnvifHttpError extends Error {
  * socket is always closed before returning, whether the probe succeeds or
  * throws, so a failed probe cannot leak a socket.
  */
-async function defaultProbeOnvifBackchannel(
+/** @internal The media calls the backchannel probe makes on a device. */
+export interface BackchannelProbeDevice {
+  connect(): Promise<unknown>;
+  getProfiles(): Promise<{ token: string }[]>;
+  getStreamUri(profileToken: string): Promise<string>;
+}
+
+/** @internal The RTSP calls the backchannel probe makes. */
+export interface BackchannelProbeRtsp {
+  connect(): Promise<void>;
+  describe(
+    uri: string,
+    opts: { backchannel?: boolean },
+  ): Promise<{ status: number; statusLine: string; body: string }>;
+  close(): void;
+}
+
+/**
+ * @internal Exported for tests; the probe's two transports are injected.
+ *
+ * Deliberately separate from `CameraCapabilityDependencies.createDevice`.
+ * `CameraCapabilityDevice` exposes only `connect`, `connectedMediaUrl` and
+ * `serviceCall`, while this probe needs `getProfiles` and `getStreamUri` —
+ * routing it through that factory would mean adding both to an interface the
+ * main path never calls them on, so every existing test double would grow two
+ * methods to satisfy a caller it does not exercise. Each seam stays narrowed
+ * to what its own caller uses.
+ */
+export interface BackchannelProbeDependencies {
+  createDevice(
+    host: string,
+    user: string,
+    pass: string,
+    options: OnvifOptions,
+  ): BackchannelProbeDevice;
+  createRtsp(
+    host: string,
+    port: number,
+    user: string,
+    pass: string,
+    timeoutMs: number | undefined,
+  ): BackchannelProbeRtsp;
+}
+
+const defaultProbeTransports: BackchannelProbeDependencies = {
+  createDevice: (host, user, pass, options) => new OnvifDevice(host, user, pass, options),
+  createRtsp: (host, port, user, pass, timeoutMs) =>
+    new RtspClient(host, port, user, pass, timeoutMs),
+};
+
+/** @internal */
+export async function probeOnvifBackchannelWithDependencies(
   host: string,
   user: string,
   pass: string,
   options: OnvifOptions,
+  dependencies: BackchannelProbeDependencies,
 ): Promise<boolean> {
-  const device = new OnvifDevice(host, user, pass, options);
+  const device = dependencies.createDevice(host, user, pass, options);
   await device.connect();
   const profiles = await device.getProfiles();
   if (profiles.length === 0) throw new Error('no media profiles');
   const endpoint = parseRtspTarget(await device.getStreamUri(profiles[0].token), user, pass);
-  const rtsp = new RtspClient(endpoint.host, endpoint.port, endpoint.user, endpoint.pass, options.timeoutMs);
+  const rtsp = dependencies.createRtsp(
+    endpoint.host, endpoint.port, endpoint.user, endpoint.pass, options.timeoutMs,
+  );
   try {
     await rtsp.connect();
     const desc = await rtsp.describe(endpoint.uri, { backchannel: true });
@@ -673,6 +727,17 @@ async function defaultProbeOnvifBackchannel(
   } finally {
     rtsp.close();
   }
+}
+
+function defaultProbeOnvifBackchannel(
+  host: string,
+  user: string,
+  pass: string,
+  options: OnvifOptions,
+): Promise<boolean> {
+  return probeOnvifBackchannelWithDependencies(
+    host, user, pass, options, defaultProbeTransports,
+  );
 }
 
 /** Asks the VIGI OpenAPI control channel whether the device reports a speaker. */
