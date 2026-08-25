@@ -21,7 +21,8 @@ FFmpeg가 필요하며 GStreamer는 사용하지 않습니다.
 
 ## 요구 사항
 
-- Node.js 22.12 이상
+- 패키지를 `import`하려면 Node.js 22 이상, `require()`하려면 22.12 이상
+  ([모듈 형식](#모듈-형식) 참고)
 - 파일 재생 시 `PATH`에서 실행할 수 있는 `ffmpeg`
 - ONVIF `sendonly` 오디오 백채널을 제공하는 카메라
 
@@ -74,8 +75,44 @@ const { playFile } = require('rtsp-backchannel');
 ```
 
 `require()`가 동작하는 이유는 Node 22.12.0부터 CommonJS에서 ES 모듈을 동기적으로 불러올 수
-있기 때문이며, 이것이 최소 버전인 이유이기도 합니다. 두 진입점이 같은 파일을 가리키므로 한
-프로세스가 라이브러리와 그 상태를 두 벌 들고 있는 일은 발생하지 않습니다.
+있기 때문입니다. 두 진입점이 같은 파일을 가리키므로 한 프로세스가 라이브러리와 그 상태를
+두 벌 들고 있는 일은 발생하지 않습니다.
+
+`engines`는 Node 22 이상을 허용합니다. `import`는 그 전체 범위에서 동작하기 때문입니다.
+22.12 하한은 `require()`에만 적용되며, 그 이전 22.x에서 이 패키지를 `require()`하면
+`ERR_REQUIRE_ESM`으로 실패합니다.
+
+### TypeScript와 CommonJS
+
+CommonJS TypeScript 프로젝트는 `moduleResolution`을 `nodenext`(또는 `bundler`)로
+설정해야 합니다.
+
+```jsonc
+{ "compilerOptions": { "module": "nodenext", "moduleResolution": "nodenext" } }
+```
+
+`moduleResolution: node16`에서는 CommonJS 파일에서 이 패키지를 import하면 `TS1479`가
+발생합니다("the referenced file is an ECMAScript module and cannot be imported with
+'require'"). `node16`에는 Node의 `require(esm)`에 대한 모델이 없고, 이 패키지는 CommonJS
+선언 트리를 따로 배포하지 않고 ES 모듈 하나만 배포하므로 그 설정으로는 타입 검사를 통과할
+수 없습니다. 런타임 동작에는 영향이 없고 컴파일 단계만 해당합니다.
+
+### `require()`는 frozen 네임스페이스를 반환합니다
+
+ES 모듈을 `require()`하면 Node의 module namespace 객체가 반환되는데, 이 객체는 sealed
+상태입니다. export를 읽는 것은 문제없지만 교체는 되지 않습니다.
+
+```javascript
+const lib = require('rtsp-backchannel');
+
+lib.playFile;                    // 정상
+lib.playFile = fake;             // strict 모드에서 TypeError, sloppy 모드에서는 조용히 무시됨
+jest.spyOn(lib, 'playFile');     // TypeError: Cannot redefine property: playFile
+```
+
+`sinon.stub(lib, 'playFile')`도 같은 방식으로 실패합니다. 테스트에서 동작을 바꿔야 한다면
+라이브러리의 export가 아니라 라이브러리가 호출하는 경계(`ffmpeg`, 소켓)를 stub하거나,
+`esmock` 같은 ESM 로더 mock을 사용하세요.
 
 ### MODULE_TYPELESS_PACKAGE_JSON 경고 없애기
 

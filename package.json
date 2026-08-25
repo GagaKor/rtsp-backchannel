@@ -18,8 +18,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
-      "require": "./dist/index.js"
-    }
+      "require": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
   },
   "bin": {
     "rtsp-backchannel": "dist/bin.js"
@@ -42,7 +44,7 @@
     "THIRD_PARTY_NOTICES.md"
   ],
   "engines": {
-    "node": ">=22.12.0"
+    "node": ">=22"
   },
   "repository": {
     "type": "git",

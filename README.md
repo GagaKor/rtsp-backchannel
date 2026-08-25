@@ -22,7 +22,8 @@ are implemented in TypeScript. FFmpeg is not bundled or installed by this packag
 
 ## Requirements
 
-- Node.js 22.12 or later
+- Node.js 22 or later to `import` the package; 22.12 or later to `require()` it
+  (see [Module Formats](#module-formats))
 - `ffmpeg` on `PATH` for file playback
 - A camera that exposes an ONVIF `sendonly` audio backchannel
 
@@ -77,9 +78,45 @@ const { playFile } = require('rtsp-backchannel');
 ```
 
 `require()` works because Node loads an ES module synchronously from CommonJS
-from 22.12.0 onward, which is why that is the minimum version. Both entry
-points resolve to the same file, so a process never holds two copies of the
-library and its state.
+from 22.12.0 onward. Both entry points resolve to the same file, so a process
+never holds two copies of the library and its state.
+
+`engines` allows Node 22 and later, because `import` works on all of those. The
+22.12 floor applies only to `require()`: on an earlier 22.x, `require()` of this
+package fails with `ERR_REQUIRE_ESM`.
+
+### TypeScript and CommonJS
+
+A CommonJS TypeScript project needs `moduleResolution` set to `nodenext` (or
+`bundler`):
+
+```jsonc
+{ "compilerOptions": { "module": "nodenext", "moduleResolution": "nodenext" } }
+```
+
+Under `moduleResolution: node16`, importing this package from a CommonJS file
+raises `TS1479` ("the referenced file is an ECMAScript module and cannot be
+imported with 'require'"). `node16` has no model for Node's `require(esm)`, and
+the package ships one ES module rather than a second CommonJS declaration tree,
+so that setting cannot type-check against it. Runtime behaviour is unaffected —
+only the compile step.
+
+### `require()` returns a frozen namespace
+
+`require()` of an ES module yields Node's module namespace object, which is
+sealed. Reading exports works exactly as expected, but replacing one does not:
+
+```javascript
+const lib = require('rtsp-backchannel');
+
+lib.playFile;                    // fine
+lib.playFile = fake;             // TypeError in strict mode; silently ignored in sloppy mode
+jest.spyOn(lib, 'playFile');     // TypeError: Cannot redefine property: playFile
+```
+
+`sinon.stub(lib, 'playFile')` fails the same way. To substitute behaviour in
+tests, stub the boundary the library calls (`ffmpeg`, the socket) rather than
+the library's own exports, or use an ESM loader mock such as `esmock`.
 
 ### Silencing MODULE_TYPELESS_PACKAGE_JSON
 

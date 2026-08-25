@@ -42,6 +42,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   CommonJS entry points, and explaining that the `MODULE_TYPELESS_PACKAGE_JSON`
   warning comes from the consumer's own `package.json` missing a `"type"`
   field rather than from this package.
+- `exports` gains a `default` condition and a `./package.json` subpath. A
+  resolver that requests neither `import` nor `require` — a restricted
+  `--conditions` set, or a bundler with its own `conditionNames` — and tooling
+  that resolves the manifest by subpath both hit the same
+  `ERR_PACKAGE_PATH_NOT_EXPORTED` that the `require` condition was added to
+  fix; neither does now.
 
 ### Fixed
 
@@ -71,9 +77,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for both
   pan/tilt and zoom. The feature stays experimental: only that one model has
   been exercised.
-- Raised the npm package's minimum Node.js version from 22 to 22.12.0, the
-  release that enabled loading an ES module from `require()` by default. Every
-  Node.js 22 LTS release meets this.
+- The npm package's minimum Node.js version stays at `>=22`. `import` works on
+  every Node.js 22, and the 22.12.0 floor applies only to `require()`, which is
+  documented in both TypeScript READMEs rather than enforced for every
+  consumer: narrowing `engines` would fail installs for ESM-only consumers on
+  22.0–22.11 under `engine-strict=true` while only *warning* the CommonJS
+  callers it targeted, since npm treats `EBADENGINE` as a warning by default.
+- Both TypeScript READMEs now state the two limits the single-artifact design
+  imposes on CommonJS callers: a CommonJS TypeScript project needs
+  `moduleResolution: nodenext` (or `bundler`), because under `node16`
+  importing this package from a CommonJS file raises `TS1479`; and `require()`
+  returns Node's sealed module namespace, so the exports cannot be replaced by
+  `jest.spyOn` or `sinon.stub`.
 
 ## [0.3.1] - 2026-08-13
 
