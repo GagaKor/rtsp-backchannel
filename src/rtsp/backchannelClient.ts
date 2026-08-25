@@ -13,6 +13,10 @@ import {
   parseDigestParameters,
   type DigestChallenge,
 } from './digest.ts';
+import {
+  writeInterleavedFrame,
+  type InterleavedWriteLabels,
+} from './interleavedWrite.ts';
 
 export const BACKCHANNEL_REQUIRE = 'www.onvif.org/ver20/backchannel';
 const MAX_RTSP_HEADER_BYTES = 64 * 1024;
@@ -31,6 +35,12 @@ interface RtspResponseWaiter {
   wake(): void;
   fail(error: Error): void;
 }
+
+const RTSP_INTERLEAVED_WRITE_LABELS: InterleavedWriteLabels = {
+  failed: 'RTSP interleaved write failed',
+  closed: 'RTSP socket closed during interleaved write',
+  timedOut: 'RTSP interleaved write timeout after',
+};
 
 export class RtspClient {
   private socket?: net.Socket;
@@ -261,47 +271,13 @@ export class RtspClient {
 
   /** Send an already-framed buffer (interleaved RTP) on the live socket. */
   sendInterleaved(frame: Buffer): Promise<void> {
-    const socket = this.rawSocket;
-    return new Promise((resolve, reject) => {
-      let settled = false;
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      const cleanup = () => {
-        if (timer !== undefined) clearTimeout(timer);
-        socket.off('drain', onDrain);
-        socket.off('error', onError);
-        socket.off('close', onClose);
-      };
-      const finish = (error?: Error) => {
-        if (settled) return;
-        settled = true;
-        cleanup();
-        if (error) reject(error);
-        else resolve();
-      };
-      const onDrain = () => finish();
-      const onError = (error: Error) => {
-        finish(new Error(`RTSP interleaved write failed: ${error.message}`, { cause: error }));
-      };
-      const onClose = () => finish(new Error('RTSP socket closed during interleaved write'));
-
-      socket.once('drain', onDrain);
-      socket.once('error', onError);
-      socket.once('close', onClose);
-      try {
-        if (socket.write(frame)) {
-          finish();
-          return;
-        }
-      } catch (error) {
-        onError(error instanceof Error ? error : new Error(String(error)));
-        return;
-      }
-      if (settled) return;
-      timer = setTimeout(() => {
-        finish(new Error(`RTSP interleaved write timeout after ${this.timeoutMs} ms`));
-        this.close();
-      }, this.timeoutMs);
-    });
+    return writeInterleavedFrame(
+      this.rawSocket,
+      frame,
+      this.timeoutMs,
+      RTSP_INTERLEAVED_WRITE_LABELS,
+      () => this.close(),
+    );
   }
 
   /** Drop complete RTP/RTCP frames arriving on an interleaved RTSP socket. */

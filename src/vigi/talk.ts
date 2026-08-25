@@ -12,6 +12,10 @@ import { SAMPLE_RATE, sendPacedFrames, type PacingClock } from '../backchannel.t
 import { RtpPacketizer, interleave } from '../rtp/sender.ts';
 import { vigiAuthority } from './control.ts';
 import {
+  writeInterleavedFrame,
+  type InterleavedWriteLabels,
+} from '../rtsp/interleavedWrite.ts';
+import {
   digestAuthorization,
   generateCnonce,
   parseDigestChallenge,
@@ -116,61 +120,33 @@ const defaultDependencies: VigiTalkDependencies = {
   connect: (port, host) => net.connect(port, host) as unknown as VigiTalkSocket,
 };
 
+const VIGI_TALK_WRITE_LABELS: InterleavedWriteLabels = {
+  failed: 'VIGI talk write failed',
+  closed: 'VIGI talk connection closed during send',
+  timedOut: 'VIGI talk write timeout after',
+};
+
 /**
  * Write one interleaved RTP frame and report the outcome truthfully — awaits
  * drain, error, and close exactly as `RtspClient.sendInterleaved` does for
- * the ONVIF backchannel, so the two transports behind `BackchannelSession`
- * cannot disagree about whether a packet actually reached the camera. A
- * fire-and-forget `connection.write()` here would let a mid-stream
- * `ECONNRESET` go unnoticed and `send()` would resolve with a packet count
- * for audio the camera never received.
+ * the ONVIF backchannel, because both call the same helper, so the two
+ * transports behind `BackchannelSession` cannot disagree about whether a
+ * packet actually reached the camera. A fire-and-forget `connection.write()`
+ * here would let a mid-stream `ECONNRESET` go unnoticed and `send()` would
+ * resolve with a packet count for audio the camera never received.
  */
 function writeInterleaved(
   connection: VigiTalkSocket,
   frame: Buffer,
   timeoutMs: number,
 ): Promise<void> {
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const cleanup = () => {
-      if (timer !== undefined) clearTimeout(timer);
-      connection.off('drain', onDrain);
-      connection.off('error', onError);
-      connection.off('close', onClose);
-    };
-    const finish = (error?: Error) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      if (error) reject(error);
-      else resolve();
-    };
-    const onDrain = () => finish();
-    const onError = (arg?: unknown) => {
-      const cause = arg instanceof Error ? arg : new Error(String(arg));
-      finish(new Error(`VIGI talk write failed: ${cause.message}`, { cause }));
-    };
-    const onClose = () => finish(new Error('VIGI talk connection closed during send'));
-
-    connection.once('drain', onDrain);
-    connection.once('error', onError);
-    connection.once('close', onClose);
-    try {
-      if (connection.write(frame)) {
-        finish();
-        return;
-      }
-    } catch (error) {
-      onError(error);
-      return;
-    }
-    if (settled) return;
-    timer = setTimeout(() => {
-      finish(new Error(`VIGI talk write timeout after ${timeoutMs} ms`));
-      connection.destroy();
-    }, timeoutMs);
-  });
+  return writeInterleavedFrame(
+    connection,
+    frame,
+    timeoutMs,
+    VIGI_TALK_WRITE_LABELS,
+    () => connection.destroy(),
+  );
 }
 
 export function createVigiTalkSession(options: VigiTalkOptions): VigiTalkSession {
