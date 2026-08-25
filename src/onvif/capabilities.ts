@@ -878,6 +878,14 @@ export async function getCameraCapabilitiesWithDependencies(
   // VIGI probe below issues its single doAuth attempt against a host we
   // already know accepts these credentials, and never advances the
   // device's failed-auth lockout counter with a bad password.
+  //
+  // The VIGI probe is gated on onvifBackchannel === false — an affirmative
+  // "ONVIF answered and offered no sendonly track" — never on "not true".
+  // On VIGI hardware the ONVIF account and the OpenAPI admin account are
+  // configured separately, so even a successful ONVIF exchange does not
+  // prove the OpenAPI password; a probe that throws (401, timeout, no
+  // profiles) must leave vigiTalk null rather than trigger a doAuth with
+  // credentials ONVIF never proved.
   const audioSend: CameraCapabilityAudioSend = {
     detected: null, transport: null, onvifBackchannel: null, vigiTalk: null,
   };
@@ -892,7 +900,7 @@ export async function getCameraCapabilitiesWithDependencies(
     if (audioSend.onvifBackchannel === true) {
       audioSend.detected = true;
       audioSend.transport = 'onvif';
-    } else {
+    } else if (audioSend.onvifBackchannel === false) {
       try {
         audioSend.vigiTalk = await dependencies.probeVigiTalk(
           options.host, user, pass, clientOptions,
@@ -903,10 +911,13 @@ export async function getCameraCapabilitiesWithDependencies(
       if (audioSend.vigiTalk === true) {
         audioSend.detected = true;
         audioSend.transport = 'vigi';
-      } else if (audioSend.onvifBackchannel !== null || audioSend.vigiTalk !== null) {
+      } else {
         audioSend.detected = false;
       }
     }
+    // else: onvifBackchannel === null (the probe threw) — the ONVIF fact
+    // itself could not be established, so VIGI must not be attempted and
+    // every audioSend field beyond onvifBackchannel stays null.
   }
 
   return {

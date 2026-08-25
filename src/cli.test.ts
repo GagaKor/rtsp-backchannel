@@ -46,6 +46,7 @@ test('documents the capabilities command in global and command help without expo
     assert.match(result.stdout, /--pass <password>/);
     assert.match(result.stdout, /--device-url <url>/);
     assert.match(result.stdout, /--timeout-ms <ms>/);
+    assert.match(result.stdout, /--probe-audio-send/);
     assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /help-only-secret/);
   }
 });
@@ -898,6 +899,36 @@ test('invokes capabilities exactly once and logs the native report as one JSON l
   assert.doesNotMatch(logs[0] ?? '', /command-only-secret/);
 });
 
+test('threads --probe-audio-send through to getCameraCapabilities and rejects other values', async () => {
+  const logs: string[] = [];
+  const dependencies = commandDependencies(logs);
+  const calls: unknown[] = [];
+  dependencies.getCameraCapabilities = async (options) => {
+    calls.push(options);
+    return {};
+  };
+
+  for (const value of ['true', 'false']) {
+    await commandMain()(
+      ['capabilities', '--host', 'camera.local', '--probe-audio-send', value],
+      dependencies,
+    );
+  }
+
+  assert.deepEqual(calls, [
+    { host: 'camera.local', user: '', pass: '', probeAudioSend: true },
+    { host: 'camera.local', user: '', pass: '', probeAudioSend: false },
+  ]);
+
+  await assert.rejects(
+    commandMain()(
+      ['capabilities', '--host', 'camera.local', '--probe-audio-send', 'yes'],
+      dependencies,
+    ),
+    /probe-audio-send must be one of: true, false/,
+  );
+});
+
 test('applies capability credential defaults and omits absent optional client settings', async () => {
   const previous = process.env.ONVIF_PASSWORD;
   const logs: string[] = [];
@@ -1041,6 +1072,24 @@ test('rejects missing or flag-shaped values for every capability option', async 
     {
       option: 'timeout-ms',
       argv: ['capabilities', '--host', 'camera.local', '--timeout-ms', '-h'],
+    },
+    {
+      option: 'probe-audio-send',
+      argv: ['capabilities', '--host', 'camera.local', '--probe-audio-send'],
+    },
+    {
+      option: 'probe-audio-send',
+      argv: ['capabilities', '--host', 'camera.local', '--probe-audio-send', ''],
+    },
+    {
+      option: 'probe-audio-send',
+      argv: [
+        'capabilities', '--host', 'camera.local', '--probe-audio-send', '--user', 'operator',
+      ],
+    },
+    {
+      option: 'probe-audio-send',
+      argv: ['capabilities', '--host', 'camera.local', '--probe-audio-send', '-h'],
     },
   ];
 

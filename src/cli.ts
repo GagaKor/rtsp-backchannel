@@ -46,8 +46,9 @@ Discovery options:
   --timeout-ms <ms>   discovery timeout (default: 3000)
 
 Capability options:
-  --device-url <url>  ONVIF Device Service URL (repeatable)
-  --timeout-ms <ms>   finite positive per-request timeout (maximum: 86,400,000 ms)
+  --device-url <url>      ONVIF Device Service URL (repeatable)
+  --timeout-ms <ms>       finite positive per-request timeout (maximum: 86,400,000 ms)
+  --probe-audio-send <b>  true|false, probe ONVIF/VIGI audio-send support (default: true)
 
 Playback profile: SDP codec negotiation, TCP interleaved RTP, real-time pacing.
 `;
@@ -132,8 +133,12 @@ const CAPABILITY_OPTION_NAMES = [
   'pass',
   'device-url',
   'timeout-ms',
+  'probe-audio-send',
 ] as const;
 type CapabilityOptionName = typeof CAPABILITY_OPTION_NAMES[number];
+const PROBE_AUDIO_SEND_VALUES = ['true', 'false'] as const;
+const PROBE_AUDIO_SEND_RANGE_ERROR =
+  `probe-audio-send must be one of: ${PROBE_AUDIO_SEND_VALUES.join(', ')}`;
 
 function exactCapabilityOptionName(value: string): CapabilityOptionName | undefined {
   return CAPABILITY_OPTION_NAMES.find((name) => value === `--${name}`);
@@ -166,6 +171,7 @@ interface ParsedCapabilityArguments {
   pass: string[];
   'device-url': string[];
   'timeout-ms': string[];
+  'probe-audio-send': string[];
 }
 
 function parseCapabilityArguments(argv: string[]): ParsedCapabilityArguments {
@@ -182,6 +188,7 @@ function parseCapabilityArguments(argv: string[]): ParsedCapabilityArguments {
     pass: [],
     'device-url': [],
     'timeout-ms': [],
+    'probe-audio-send': [],
   };
   for (let index = 0; index < argv.length; index++) {
     const attached = attachedCapabilityOption(argv[index]);
@@ -373,6 +380,7 @@ export async function main(
     const passwords = parsed.pass;
     const deviceUrls = parsed['device-url'];
     const timeoutValues = parsed['timeout-ms'];
+    const probeAudioSendValues = parsed['probe-audio-send'];
     if (hosts.length === 0) throw new Error('missing --host');
     const timeoutMs = timeoutValues.length > 0 ? Number(timeoutValues[0]) : undefined;
     if (timeoutMs !== undefined && (!Number.isFinite(timeoutMs) || timeoutMs <= 0)) {
@@ -381,12 +389,21 @@ export async function main(
     if (timeoutMs !== undefined && timeoutMs > MAX_CAPABILITY_TIMEOUT_MS) {
       throw new RangeError(CAPABILITY_TIMEOUT_RANGE_ERROR);
     }
+    let probeAudioSend: boolean | undefined;
+    if (probeAudioSendValues.length > 0) {
+      const value = probeAudioSendValues[0].toLowerCase();
+      if (!PROBE_AUDIO_SEND_VALUES.includes(value as typeof PROBE_AUDIO_SEND_VALUES[number])) {
+        throw new RangeError(PROBE_AUDIO_SEND_RANGE_ERROR);
+      }
+      probeAudioSend = value === 'true';
+    }
     const report = await dependencies.getCameraCapabilities({
       host: hosts[0],
       user: users[0] ?? '',
       pass: passwords.length > 0 ? passwords[0] : process.env.ONVIF_PASSWORD ?? '',
       ...(deviceUrls.length > 0 ? { deviceUrls } : {}),
       ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+      ...(probeAudioSend !== undefined ? { probeAudioSend } : {}),
     });
     dependencies.log(JSON.stringify(report));
     return;

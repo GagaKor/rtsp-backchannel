@@ -1313,13 +1313,20 @@ test('reports no audio-send path when neither transport answers', async () => {
   });
 });
 
-test('a failed probe warns and leaves the fact null instead of failing the report', async () => {
+test('a failed ONVIF probe warns, skips VIGI entirely, and leaves every fact null', async () => {
+  // A probe that throws has not proven anything — not even that ONVIF lacks
+  // a backchannel. Falling through to VIGI here would fire a credential-
+  // bearing doAuth against a password ONVIF never validated (VIGI hardware
+  // configures the OpenAPI admin account separately from the ONVIF
+  // account), advancing the device's lockout counter. See capabilities.ts.
   const report = await capabilityReportWithProbes({
     probeOnvifBackchannel: async () => { throw new Error('describe blew up'); },
-    probeVigiTalk: async () => false,
+    probeVigiTalk: async () => { throw new Error('must not be probed'); },
   });
   assert.equal(report.audioSend.onvifBackchannel, null);
-  assert.equal(report.audioSend.detected, false);
+  assert.equal(report.audioSend.vigiTalk, null);
+  assert.equal(report.audioSend.detected, null);
+  assert.equal(report.audioSend.transport, null);
   assert.ok(report.warnings.some((w) => w.operation === 'AudioSendProbe'));
 });
 
