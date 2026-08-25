@@ -37,6 +37,7 @@ _DEFAULT_MOVE_TIMEOUT_MS = 1000.0
 # unbounded timeout would let a single continuous_move keep a camera moving
 # for as long as the caller likes, with no ceiling on how long the
 # device-side stop-on-close backstop takes to kick in.
+_MIN_MOVE_TIMEOUT_MS = 1
 _MAX_MOVE_TIMEOUT_MS = 60_000.0
 _PAN_TILT_RANGE = (-1.0, 1.0)
 # Every zoom quantity is -1..1 except an absolute zoom *position*, which is 0..1.
@@ -306,8 +307,11 @@ def format_ptz_number(value: float) -> str:
 
 
 def format_ptz_duration(milliseconds: float) -> str:
-    if not math.isfinite(milliseconds) or milliseconds <= 0:
-        raise ValueError("PTZ timeout must be finite and greater than 0")
+    # The lower bound is 1 ms, not 0: anything smaller renders as PT0.000S, a
+    # device-side stop deadline of zero. Timeout is what makes a crashed client
+    # safe, so emitting a guard of zero is worse than refusing the value.
+    if not math.isfinite(milliseconds) or milliseconds < _MIN_MOVE_TIMEOUT_MS:
+        raise ValueError("PTZ timeout must be finite and at least 1 ms")
     if milliseconds > _MAX_MOVE_TIMEOUT_MS:
         raise ValueError("PTZ timeout must not exceed 60000 ms")
     # Whole seconds are emitted without a fraction: "PT1S", not "PT1.000S". Both
@@ -316,10 +320,15 @@ def format_ptz_duration(milliseconds: float) -> str:
     # default move
     # timeout is a whole second. Sub-second timeouts keep the fractional form -- it
     # is the only faithful representation, and such a camera rejects them either way.
-    seconds = milliseconds / 1000
-    if seconds == int(seconds):
-        return f"PT{int(seconds)}S"
-    return f"PT{seconds:.3f}S"
+    #
+    # The test is on the *rendered* text, not on the raw quotient. Deciding on the
+    # quotient meant testing one value and printing another: 999.9999 ms has a
+    # non-integral quotient but renders as "1.000", so it went out as PT1.000S --
+    # the one spelling this rule exists to avoid, for a value PT1S expresses
+    # exactly. See docs/decisions/2026-08-25-ptz-duration-decide-on-rendered-text.md.
+    text = f"{milliseconds / 1000:.3f}"
+    whole, fraction = text.split(".")
+    return f"PT{whole}S" if fraction == "000" else f"PT{text}S"
 
 
 def _require_finite_in_range(value: float, value_range: tuple[float, float]) -> float:

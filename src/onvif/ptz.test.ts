@@ -44,17 +44,35 @@ test('formats whole-second PTZ durations without a fraction and the rest to thre
   assert.equal(formatPtzDuration(2000), 'PT2S');
   assert.equal(formatPtzDuration(1500), 'PT1.500S');
   assert.equal(formatPtzDuration(250), 'PT0.250S');
+  // The whole-second test must be applied to the rendered three-decimal text,
+  // not to the raw quotient: 999.9999 ms renders as "1.000", so deciding on
+  // the quotient emitted PT1.000S -- the one spelling the strict gSOAP stack
+  // rejects, for a value PT1S expresses exactly.
+  assert.equal(formatPtzDuration(999.9999), 'PT1S');
+  assert.equal(formatPtzDuration(1000.0001), 'PT1S');
+  assert.equal(formatPtzDuration(1), 'PT0.001S');
+  // A timeout that cannot render as a non-zero guard is rejected rather than
+  // emitted: PT0.000S is a camera-side stop deadline of zero, so a crashed
+  // client would leave the camera moving indefinitely.
+  assert.throws(
+    () => formatPtzDuration(0.4),
+    /PTZ timeout must be finite and at least 1 ms/,
+  );
+  assert.throws(
+    () => formatPtzDuration(0.9999),
+    /PTZ timeout must be finite and at least 1 ms/,
+  );
   assert.throws(
     () => formatPtzDuration(0),
-    { message: 'PTZ timeout must be finite and greater than 0' },
+    { message: 'PTZ timeout must be finite and at least 1 ms' },
   );
   assert.throws(
     () => formatPtzDuration(-1),
-    { message: 'PTZ timeout must be finite and greater than 0' },
+    { message: 'PTZ timeout must be finite and at least 1 ms' },
   );
   assert.throws(
     () => formatPtzDuration(Number.NaN),
-    { message: 'PTZ timeout must be finite and greater than 0' },
+    { message: 'PTZ timeout must be finite and at least 1 ms' },
   );
 });
 

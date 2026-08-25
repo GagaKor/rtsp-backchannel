@@ -41,6 +41,7 @@ const DEFAULT_MOVE_TIMEOUT_MS = 1000;
 // unbounded timeout would let a single continuousMove keep a camera moving
 // for as long as the caller likes, with no ceiling on how long the
 // device-side stop-on-close backstop takes to kick in.
+const MIN_MOVE_TIMEOUT_MS = 1;
 const MAX_MOVE_TIMEOUT_MS = 60_000;
 const PAN_TILT_RANGE: readonly [number, number] = [-1, 1];
 /** Every zoom quantity is -1..1 except an absolute zoom *position*, which is 0..1. */
@@ -268,8 +269,11 @@ export function formatPtzNumber(value: number): string {
 
 /** @internal */
 export function formatPtzDuration(milliseconds: number): string {
-  if (!Number.isFinite(milliseconds) || milliseconds <= 0) {
-    throw new RangeError('PTZ timeout must be finite and greater than 0');
+  // The lower bound is 1 ms, not 0: anything smaller renders as PT0.000S, a
+  // device-side stop deadline of zero. `Timeout` is what makes a crashed
+  // client safe, so emitting a guard of zero is worse than refusing the value.
+  if (!Number.isFinite(milliseconds) || milliseconds < MIN_MOVE_TIMEOUT_MS) {
+    throw new RangeError('PTZ timeout must be finite and at least 1 ms');
   }
   if (milliseconds > MAX_MOVE_TIMEOUT_MS) {
     throw new RangeError('PTZ timeout must not exceed 60000 ms');
@@ -279,8 +283,15 @@ export function formatPtzDuration(milliseconds: number): string {
   // rejects any decimal point with ter:InvalidArgVal, and the default move timeout is
   // a whole second. Sub-second timeouts keep the fractional form — it is the only
   // faithful representation, and such a camera rejects them either way.
-  const seconds = milliseconds / 1000;
-  return Number.isInteger(seconds) ? `PT${seconds}S` : `PT${seconds.toFixed(3)}S`;
+  //
+  // The test is on the *rendered* text, not on the raw quotient. Deciding on the
+  // quotient meant testing one value and printing another: 999.9999 ms has a
+  // non-integral quotient but renders as `1.000`, so it went out as PT1.000S —
+  // the one spelling this rule exists to avoid, for a value PT1S expresses
+  // exactly. See docs/decisions/2026-08-25-ptz-duration-decide-on-rendered-text.md.
+  const text = (milliseconds / 1000).toFixed(3);
+  const [whole, fraction] = text.split('.');
+  return fraction === '000' ? `PT${whole}S` : `PT${text}S`;
 }
 
 function vectorXml(tag: string, panTilt?: PtzVector, zoom?: number): string {

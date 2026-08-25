@@ -89,6 +89,25 @@ export function vigiAuthority(host: string): string {
   return hostname;
 }
 
+/**
+ * Classifies a doAuth reply that carried no usable `authenticate` block.
+ *
+ * The challenge leg cannot go through `requireSuccess`: a *successful*
+ * challenge reports `errCode: -10020` ("authentication failed") alongside the
+ * nonce, because that is precisely what a challenge says. So the error code is
+ * read only here, on the branch where there is no challenge to act on -- a
+ * device that has locked the OpenAPI account answers `-10022` with no block at
+ * all, and `describeErrorCode` has always had the right sentence for it.
+ */
+function challengeFailure(reply: unknown): Error {
+  const code = typeof reply === 'object' && reply !== null
+    && typeof (reply as { errCode?: unknown }).errCode === 'number'
+    ? (reply as { errCode: number }).errCode
+    : 0;
+  if (code !== 0) return new VigiControlError(code, describeErrorCode(code, 'doAuth'));
+  return new Error('invalid VIGI doAuth challenge');
+}
+
 function requireSuccess(reply: unknown, operation: string): Record<string, unknown> {
   if (typeof reply !== 'object' || reply === null) {
     throw new Error(`invalid VIGI ${operation} response`);
@@ -206,7 +225,7 @@ export async function openVigiControlWithDependencies(
   const authenticate = (challengeReply as { authenticate?: unknown } | null)
     ?.authenticate;
   if (typeof authenticate !== 'object' || authenticate === null) {
-    throw new Error('invalid VIGI doAuth challenge');
+    throw challengeFailure(challengeReply);
   }
   const challenge = authenticate as Record<string, unknown>;
   const realm = challenge.realm;

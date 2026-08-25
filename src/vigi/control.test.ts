@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 import https from 'node:https';
 import { test } from 'node:test';
 import {
@@ -81,6 +82,55 @@ test('honours a non-default control port', async () => {
   const posts: RecordedPost[] = [];
   await openVigiControlWithDependencies({ ...OPTIONS, port: 21443 }, fakeControl(posts));
   assert.equal(posts[0].url, 'https://cam:21443');
+});
+
+test('reports a locked account from the challenge leg by name', async () => {
+  // A device that has already locked the OpenAPI account answers the challenge
+  // with an error code and no challenge block at all. Reporting that as
+  // "invalid challenge" hides the one diagnostic that matters most here --
+  // describeErrorCode has had the right sentence all along, the challenge path
+  // just could not reach it.
+  await assert.rejects(
+    openVigiControlWithDependencies(
+      OPTIONS,
+      fakeControl([], { challenge: { method: 'doAuth', errCode: -10022 } }),
+    ),
+    (error: unknown) => {
+      assert.ok(error instanceof VigiControlError);
+      assert.equal(error.code, -10022);
+      assert.match(error.message, /account is locked by retry limit/);
+      return true;
+    },
+  );
+});
+
+test('reports an unauthorized challenge leg by name', async () => {
+  await assert.rejects(
+    openVigiControlWithDependencies(
+      OPTIONS,
+      fakeControl([], { challenge: { method: 'doAuth', errCode: -10002 } }),
+    ),
+    /VIGI OpenAPI request was unauthorized/,
+  );
+});
+
+test('keeps the generic message when a challenge-less reply carries no error code', async () => {
+  await assert.rejects(
+    openVigiControlWithDependencies(
+      OPTIONS,
+      fakeControl([], { challenge: { method: 'doAuth', errCode: 0 } }),
+    ),
+    /invalid VIGI doAuth challenge/,
+  );
+});
+
+test('still accepts the good-path challenge, which carries errCode -10020', async () => {
+  // The challenge leg legitimately reports "authentication failed" alongside
+  // the nonce -- that is what a challenge is. Routing this reply through
+  // requireSuccess would reject every successful handshake.
+  const posts: RecordedPost[] = [];
+  const session = await openVigiControlWithDependencies(OPTIONS, fakeControl(posts));
+  assert.equal(session.stok, 'STOK1');
 });
 
 test('strips a port already carried by host instead of building an invalid URL', async () => {
@@ -198,12 +248,16 @@ test('raises an unsupported-directive error for -10030', async () => {
 });
 
 test('rejects a challenge missing the authenticate object', async () => {
+  // No challenge block plus errCode -10020 is the device saying the
+  // credentials are wrong, so it is reported as that rather than as a
+  // malformed reply. The bare "invalid challenge" wording is reserved for a
+  // reply that offers no error code either -- see the test above.
   await assert.rejects(
     openVigiControlWithDependencies(
       OPTIONS,
       fakeControl([], { challenge: { method: 'doAuth', errCode: -10020 } }),
     ),
-    { message: 'invalid VIGI doAuth challenge' },
+    { message: 'VIGI OpenAPI authentication failed' },
   );
 });
 
@@ -332,6 +386,8 @@ test('never lets the pooled keep-alive agent hand a call a stale socket', async 
         listener(fakeResponse);
         // A challenge with no `authenticate` field is enough to make
         // openVigiControl reject right away, with exactly one HTTP call.
+        // Which message it rejects with is another test's business; this one
+        // only cares that exactly one request went out, with agent: false.
         const body = Buffer.from(
           JSON.stringify({ method: 'doAuth', errCode: -10020 }),
           'utf8',
@@ -347,7 +403,7 @@ test('never lets the pooled keep-alive agent hand a call a stale socket', async 
   try {
     await assert.rejects(
       openVigiControl({ host: 'cam', pass: 'secret' }),
-      { message: 'invalid VIGI doAuth challenge' },
+      { message: 'VIGI OpenAPI authentication failed' },
     );
   } finally {
     https.request = originalRequest;
@@ -355,4 +411,41 @@ test('never lets the pooled keep-alive agent hand a call a stale socket', async 
 
   assert.equal(capturedOptions.length, 1);
   assert.equal(capturedOptions[0].agent, false);
+});
+
+test('matches the cross-language doAuth parity fixture', async () => {
+  // `doAuthChallenge`, `doAuthResponse` and `controlPort` had no reader in any
+  // language: control.ts could change the doAuth body shape and the fixture
+  // that exists to catch exactly that would stay green, leaving the Python and
+  // Rust ports to implement against stale data.
+  const fixture = JSON.parse(
+    await readFile(
+      new URL('../../rust/tests/fixtures/vigi-request-parity.json', import.meta.url),
+      'utf8',
+    ),
+  );
+  const posts: RecordedPost[] = [];
+  await openVigiControlWithDependencies(
+    { host: fixture.host, user: fixture.user, pass: fixture.pass },
+    fakeControl(posts, {
+      challenge: {
+        method: 'doAuth',
+        authenticate: {
+          realm: fixture.challenge.realm,
+          nonce: fixture.challenge.nonce,
+          algorithm: fixture.challenge.algorithm,
+          uri: fixture.challenge.uri,
+          method: fixture.challenge.method,
+        },
+        errCode: -10020,
+      },
+    }),
+  );
+
+  assert.equal(posts.length, 2);
+  assert.equal(JSON.stringify(posts[0].body), fixture.requests.doAuthChallenge);
+  assert.equal(JSON.stringify(posts[1].body), fixture.requests.doAuthResponse);
+  // The default control port is part of the wire contract the sibling ports
+  // reproduce, so pin it here rather than to a bare literal.
+  assert.equal(posts[0].url, `https://${fixture.host}:${fixture.controlPort}`);
 });

@@ -5,6 +5,7 @@ import { test } from 'node:test';
 import { digestAuthorization } from '../rtsp/digest.ts';
 import {
   VIGI_TALK_CHANNEL,
+  VIGI_TALK_PACKET_MS,
   VIGI_TALK_PAYLOAD_TYPE,
   VIGI_TALK_SAMPLES_PER_PACKET,
   buildMultitransRequest,
@@ -493,5 +494,56 @@ test('matches the cross-language request parity fixture', async () => {
       style: 'vigi',
     }),
     fixture.requests.authorizationHeader,
+  );
+
+  // Above, `talkBody` is only fed in as an *input*, so the body this module
+  // actually produces was never compared to it -- talk.ts could change shape
+  // and the fixture meant to catch that would stay green. Drive a real
+  // handshake and compare the bytes that went out.
+  const { socket, dependencies } = harness();
+  autoRespond(socket);
+  const session = createVigiTalkSessionWithDependencies(
+    {
+      host: fixture.host,
+      user: fixture.user,
+      pass: fixture.pass,
+      streamPort: fixture.streamPort,
+      clock: instantClock,
+    },
+    dependencies,
+  );
+  await session.send(Buffer.alloc(VIGI_TALK_SAMPLES_PER_PACKET * 2, 0xd5));
+  assert.equal(socket.requests[0], fixture.requests.multitransUnauthenticated);
+  // The retry's Authorization cannot be compared byte for byte: the session
+  // generates a fresh random cnonce, and the fixture's header is pinned by the
+  // direct digestAuthorization() call above. Assert the parts the fixture does
+  // fix -- realm, nonce, qop and the first nonce count -- and that the retry
+  // resends the same body rather than a rebuilt one.
+  assert.match(socket.requests[1], /^MULTITRANS rtsp:\/\/cam\/multitrans RTSP\/1\.0\r\n/);
+  assert.ok(socket.requests[1].includes(`realm="${fixture.challenge.realm}"`));
+  assert.ok(socket.requests[1].includes(`nonce="${fixture.challenge.nonce}"`));
+  assert.ok(socket.requests[1].includes(`qop="${fixture.challenge.qop}"`));
+  assert.ok(socket.requests[1].includes('nc="00000001"'));
+  assert.ok(socket.requests[1].endsWith(fixture.requests.talkBody));
+
+  // The rtp block had no reader in any language. These are the wire constants
+  // the Python and Rust ports must reproduce byte for byte.
+  assert.equal(VIGI_TALK_PAYLOAD_TYPE, fixture.rtp.payloadType);
+  assert.equal(VIGI_TALK_CHANNEL, fixture.rtp.channel);
+  assert.equal(VIGI_TALK_PACKET_MS, fixture.rtp.packetMs);
+  assert.equal(VIGI_TALK_SAMPLES_PER_PACKET, fixture.rtp.samplesPerPacket);
+
+  // ...and that those constants reach the wire: `$`, channel, 16-bit length,
+  // then the RTP header whose second byte carries the marker bit and PT.
+  const frames = socket.rtpFrames;
+  assert.equal(frames.length, 2);
+  assert.equal(frames[0][0], 0x24);
+  assert.equal(frames[0][1], fixture.rtp.channel);
+  assert.equal(frames[0][5] & 0x7f, fixture.rtp.payloadType);
+  assert.equal((frames[0][5] & 0x80) !== 0, fixture.rtp.markerOnFirstPacket);
+  assert.equal(
+    (frames[1][5] & 0x80) !== 0,
+    false,
+    'the marker marks the start of talk, so only the first packet carries it',
   );
 });

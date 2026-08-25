@@ -207,12 +207,26 @@ class FormatterTests(unittest.TestCase):
         self.assertEqual(format_ptz_duration(2000), "PT2S")
         self.assertEqual(format_ptz_duration(1500), "PT1.500S")
         self.assertEqual(format_ptz_duration(250), "PT0.250S")
+        # Decided on the rendered text, not the raw quotient: 999.9999 ms
+        # renders as "1.000", so the old test emitted PT1.000S -- the spelling
+        # a strict gSOAP stack rejects, for a value PT1S expresses exactly.
+        self.assertEqual(format_ptz_duration(999.9999), "PT1S")
+        self.assertEqual(format_ptz_duration(1000.0001), "PT1S")
+        self.assertEqual(format_ptz_duration(1), "PT0.001S")
+        # PT0.000S is a device-side stop deadline of zero, so anything that
+        # cannot render as a non-zero guard is rejected instead.
+        for bad in (0.4, 0.9999):
+            with self.subTest(bad=bad):
+                with self.assertRaisesRegex(
+                    ValueError, "at least 1 ms"
+                ):
+                    format_ptz_duration(bad)
 
     def test_rejects_non_positive_or_non_finite_ptz_durations(self):
         for bad in (0, -1, math.nan, math.inf):
             with self.subTest(value=bad):
                 with self.assertRaisesRegex(
-                    ValueError, "^PTZ timeout must be finite and greater than 0$"
+                    ValueError, "^PTZ timeout must be finite and at least 1 ms$"
                 ):
                     format_ptz_duration(bad)
 
