@@ -462,6 +462,91 @@ test('close during an in-flight open aborts the handshake and destroys the conne
   assert.equal(socket.requests.length, 1, 'closed before the challenge reply was ever handled');
 });
 
+test('ignores interleaved audio arriving before the MULTITRANS reply', async () => {
+  // In aec mode the camera may push downlink audio on the same connection.
+  // Those `$`-framed binary frames were concatenated straight into the text
+  // parse buffer, so parseReply scanned for the first \r\n\r\n anywhere in
+  // the binary and produced a garbage statusLine -- failing the open and
+  // putting raw device bytes into the error message.
+  const { socket, dependencies } = harness();
+  const session = createVigiTalkSessionWithDependencies(
+    { ...OPTIONS, mode: 'aec', clock: instantClock },
+    dependencies,
+  );
+  const opening = session.send(Buffer.alloc(VIGI_TALK_SAMPLES_PER_PACKET, 0xd5));
+
+  // One RTP-over-TCP frame whose payload happens to contain a CRLFCRLF, which
+  // is all parseReply needs to mistake it for the end of a header block.
+  const payload = Buffer.concat([
+    Buffer.from([0x80, 0x08, 0x00, 0x01]),
+    Buffer.from('\r\n\r\n', 'binary'),
+    Buffer.from([0xd5, 0xd5, 0xd5, 0xd5]),
+  ]);
+  const header = Buffer.alloc(4);
+  header[0] = 0x24;
+  header[1] = 0x00;
+  header.writeUInt16BE(payload.length, 2);
+  await Promise.resolve();
+  socket.emit('data', Buffer.concat([header, payload]));
+  // The real reply follows; the handshake must still complete on it.
+  socket.emit('data', Buffer.from(CHALLENGE, 'binary'));
+  await Promise.resolve();
+  socket.emit('data', Buffer.from(OK, 'binary'));
+
+  assert.equal(await opening, 1);
+});
+
+test('waits for the rest of an interleaved frame split across chunks', async () => {
+  // TCP splits wherever it likes. If the buffer ends mid-frame, the bytes
+  // present may already contain a CRLFCRLF, so the parse has to be deferred
+  // until the frame's declared length has actually arrived -- not merely
+  // skipped over whatever is on hand.
+  const { socket, dependencies } = harness();
+  const session = createVigiTalkSessionWithDependencies(
+    { ...OPTIONS, mode: 'aec', clock: instantClock },
+    dependencies,
+  );
+  const opening = session.send(Buffer.alloc(VIGI_TALK_SAMPLES_PER_PACKET, 0xd5));
+
+  const payload = Buffer.concat([
+    Buffer.from('\r\n\r\nRTSP/1.0 500 Bogus\r\n\r\n', 'binary'),
+    Buffer.alloc(8, 0xd5),
+  ]);
+  const header = Buffer.alloc(4);
+  header[0] = 0x24;
+  header.writeUInt16BE(payload.length, 2);
+  const frame = Buffer.concat([header, payload]);
+
+  await Promise.resolve();
+  // Split so the first chunk stops two bytes short of the declared length.
+  socket.emit('data', frame.subarray(0, frame.length - 2));
+  socket.emit('data', frame.subarray(frame.length - 2));
+  socket.emit('data', Buffer.from(CHALLENGE, 'binary'));
+  await Promise.resolve();
+  socket.emit('data', Buffer.from(OK, 'binary'));
+
+  assert.equal(await opening, 1);
+});
+
+test('waits for an interleaved header split across chunks', async () => {
+  const { socket, dependencies } = harness();
+  const session = createVigiTalkSessionWithDependencies(
+    { ...OPTIONS, mode: 'aec', clock: instantClock },
+    dependencies,
+  );
+  const opening = session.send(Buffer.alloc(VIGI_TALK_SAMPLES_PER_PACKET, 0xd5));
+
+  await Promise.resolve();
+  // Two bytes of a four-byte header: the length is not yet knowable.
+  socket.emit('data', Buffer.from([0x24, 0x00]));
+  socket.emit('data', Buffer.concat([Buffer.from([0x00, 0x04]), Buffer.alloc(4, 0xd5)]));
+  socket.emit('data', Buffer.from(CHALLENGE, 'binary'));
+  await Promise.resolve();
+  socket.emit('data', Buffer.from(OK, 'binary'));
+
+  assert.equal(await opening, 1);
+});
+
 test('matches the cross-language request parity fixture', async () => {
   const fixture = JSON.parse(
     await readFile(

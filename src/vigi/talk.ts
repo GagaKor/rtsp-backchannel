@@ -96,6 +96,36 @@ interface RtspReply {
   consumed: number;
 }
 
+/**
+ * Splits off any complete `$`-framed interleaved frames at the front of the
+ * handshake buffer, and reports whether what remains is safe to parse as text.
+ *
+ * In `aec` mode the camera may push downlink audio on this same connection
+ * before the MULTITRANS reply arrives. Those frames are binary RTP, and
+ * feeding them to `parseReply` let it find a `\r\n\r\n` *inside the audio*
+ * and treat the bytes around it as a status line — failing the open and
+ * putting raw device bytes into the error message.
+ *
+ * `complete: false` means the buffer ends mid-frame, so nothing after it can
+ * be a reply yet and the caller must wait for more data rather than parse a
+ * truncated payload. RtspClient has the same logic over a Buffer
+ * (`discardInterleavedFrames`); this one works on the latin1 string this
+ * handshake accumulates, where one char is exactly one byte.
+ */
+function stripInterleavedFrames(raw: string): { rest: string; complete: boolean } {
+  let offset = 0;
+  while (offset < raw.length && raw.charCodeAt(offset) === 0x24) {
+    // 4-byte header: '$', channel, then a 16-bit big-endian payload length.
+    if (raw.length - offset < 4) return { rest: raw.slice(offset), complete: false };
+    const length = (raw.charCodeAt(offset + 2) << 8) | raw.charCodeAt(offset + 3);
+    if (raw.length - offset < 4 + length) {
+      return { rest: raw.slice(offset), complete: false };
+    }
+    offset += 4 + length;
+  }
+  return { rest: raw.slice(offset), complete: true };
+}
+
 function parseReply(raw: string): RtspReply | undefined {
   const split = raw.indexOf('\r\n\r\n');
   if (split < 0) return undefined;
@@ -232,6 +262,11 @@ export function createVigiTalkSessionWithDependencies(
         // binary audio, which would never match and would buffer unbounded.
         if (settled) return;
         buffer += chunk.toString('binary');
+        // Interleaved audio can precede the reply in aec mode; drop whole
+        // frames and hold off entirely while the buffer ends mid-frame.
+        const stripped = stripInterleavedFrames(buffer);
+        buffer = stripped.rest;
+        if (!stripped.complete) return;
         const reply = parseReply(buffer);
         if (!reply) return;
         buffer = buffer.slice(reply.consumed);
