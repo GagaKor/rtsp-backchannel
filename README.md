@@ -22,7 +22,7 @@ are implemented in TypeScript. FFmpeg is not bundled or installed by this packag
 
 ## Requirements
 
-- Node.js 22 or later
+- Node.js 22.12 or later
 - `ffmpeg` on `PATH` for file playback
 - A camera that exposes an ONVIF `sendonly` audio backchannel
 
@@ -60,6 +60,44 @@ sudo apt-get install ffmpeg
 On Windows, install a build from the
 [FFmpeg download page](https://ffmpeg.org/download.html) and add the directory
 containing `ffmpeg.exe` to `PATH`.
+
+## Module Formats
+
+The package ships a single ES module build and is reachable from both module
+systems.
+
+```typescript
+// ES modules
+import { playFile } from 'rtsp-backchannel';
+```
+
+```javascript
+// CommonJS
+const { playFile } = require('rtsp-backchannel');
+```
+
+`require()` works because Node loads an ES module synchronously from CommonJS
+from 22.12.0 onward, which is why that is the minimum version. Both entry
+points resolve to the same file, so a process never holds two copies of the
+library and its state.
+
+### Silencing MODULE_TYPELESS_PACKAGE_JSON
+
+Running an `import` statement from a `.js` file produces this warning:
+
+```
+[MODULE_TYPELESS_PACKAGE_JSON] Warning: Module type of file:///.../use.js is not
+specified and it doesn't parse as CommonJS. Reparsing as ES module because module
+syntax was detected. This incurs a performance overhead.
+```
+
+The warning is about the file being run, not about this package: Node found no
+`"type"` field in the nearest `package.json`, guessed CommonJS, failed, and
+reparsed. Any one of these resolves it:
+
+- add `"type": "module"` to your own `package.json`
+- rename the file to `.mjs`
+- use `require()` instead
 
 ## Quick Playback
 

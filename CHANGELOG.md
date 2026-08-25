@@ -21,15 +21,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from the absent ONVIF backchannel to VIGI, opened a `pcma/8000 pt=8 ch=0`
   session, and played an audible tone through the camera's speaker.
 - `getCameraCapabilities` gains an `audioSend` block naming the transport
-  (`'onvif'`, `'vigi'`, or neither) that can reach a given camera. **This
-  probe runs by default and adds real cost to every call**: it opens a
-  second, fully authenticated ONVIF session to issue a real backchannel
-  `DESCRIBE` — several extra SOAP round trips plus one full ONVIF
-  re-authentication and re-discovery — and, when that finds no sendonly
-  track, one additional VIGI OpenAPI `doAuth` attempt. Pass
-  `probeAudioSend: false` to skip it. This addition is TypeScript-only; the
-  Python and Rust capability reports are unaffected and perform no such
-  probe.
+  (`'onvif'`, `'vigi'`, or neither) that can reach a given camera. **The ONVIF
+  half of this probe runs by default and adds real cost to every call**: it
+  opens a second, fully authenticated ONVIF session to issue a real
+  backchannel `DESCRIBE` — several extra SOAP round trips plus one full ONVIF
+  re-authentication and re-discovery. Pass `probeAudioSend: false` to skip it.
+  The VIGI half sends a credential-bearing `doAuth` to a port that counts
+  failed attempts toward a device lockout, so it runs only when device
+  information identifies TP-Link/VIGI hardware; `probeVigiTalk`
+  (`'auto' | 'always' | 'never'`, `--probe-vigi-talk`) overrides that. Any
+  fact a probe could not establish stays `null` rather than becoming `false`.
+  This addition is TypeScript-only; the Python and Rust capability reports are
+  unaffected and perform no such probe.
+- CommonJS support for the npm package. `exports` now declares a `require`
+  condition alongside `import`, so `require('rtsp-backchannel')` works instead
+  of failing with `ERR_PACKAGE_PATH_NOT_EXPORTED`. Both conditions resolve to
+  the same ES module build, which Node loads synchronously from CommonJS, so
+  there is no second copy of the library or its state in a process.
+- A Module Formats section in both TypeScript READMEs covering the ESM and
+  CommonJS entry points, and explaining that the `MODULE_TYPELESS_PACKAGE_JSON`
+  warning comes from the consumer's own `package.json` missing a `"type"`
+  field rather than from this package.
 
 ### Fixed
 
@@ -41,8 +53,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Whole-second PTZ move timeouts are sent as `PT1S` rather than `PT1.000S`.
   Both spell the same `xs:duration`, but a strict stack rejects the decimal
   point with `ter:InvalidArgVal`, which made `continuousMove` fail at every
-  timeout value — including the 1000 ms default. Sub-second timeouts keep the
+  timeout value — including the 1000 ms default. The whole-second test is
+  applied to the rendered three-decimal text rather than to the raw quotient,
+  so a timeout such as 999.9999 ms — which renders as `1.000` — is also sent
+  as `PT1S` instead of the rejected spelling. Sub-second timeouts keep the
   fractional form, so a caller's requested duration is never silently changed.
+  The minimum timeout is now 1 ms: anything smaller rendered as `PT0.000S`,
+  a device-side runaway guard of zero. All three packages.
+- A failed VIGI OpenAPI `doAuth` challenge is reported by its error code
+  rather than as a malformed reply, so an account locked by the device's retry
+  limit says so instead of surfacing as `invalid VIGI doAuth challenge`.
 
 ### Changed
 
@@ -51,6 +71,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for both
   pan/tilt and zoom. The feature stays experimental: only that one model has
   been exercised.
+- Raised the npm package's minimum Node.js version from 22 to 22.12.0, the
+  release that enabled loading an ES module from `require()` by default. Every
+  Node.js 22 LTS release meets this.
 
 ## [0.3.1] - 2026-08-13
 
