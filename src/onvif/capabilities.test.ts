@@ -16,6 +16,9 @@ import {
   parseServicesResponse,
   selectService,
   OnvifResponseError,
+  probeOnvifBackchannelWithDependencies,
+  type BackchannelProbeDependencies,
+  type BackchannelProbeRtsp,
   type CameraCapabilityDependencies,
   type CameraCapabilityOptions,
   type CameraCapabilityReport,
@@ -1484,4 +1487,153 @@ test('probeAudioSend false leaves every audioSend fact null and runs no probe', 
   assert.deepEqual(report.audioSend, {
     detected: null, transport: null, onvifBackchannel: null, vigiTalk: null,
   });
+});
+
+/**
+ * The ONVIF backchannel probe had no coverage at all: it constructed
+ * OnvifDevice and RtspClient directly, so every test had to stub the whole
+ * probe out and its profile selection, DESCRIBE handling and socket cleanup
+ * went unexercised.
+ */
+interface ProbeCalls {
+  devices: Array<{ host: string; user: string; pass: string }>;
+  rtsp: Array<{ host: string; port: number; user: string; pass: string; timeoutMs?: number }>;
+  /** Profile tokens the probe asked for a stream URI, in order. */
+  streamUriTokens: string[];
+  described: string[];
+  closes: number;
+}
+
+function sdp(direction: 'sendonly' | 'recvonly' | undefined): string {
+  const attrs = direction ? `a=${direction}\r\n` : '';
+  return 'v=0\r\no=- 0 0 IN IP4 cam\r\ns=-\r\n'
+    + 'm=video 0 RTP/AVP 96\r\na=control:track1\r\n'
+    + `m=audio 0 RTP/AVP 8\r\na=control:track2\r\n${attrs}`;
+}
+
+function probeHarness(
+  calls: ProbeCalls,
+  overrides: {
+    profiles?: () => Promise<{ token: string }[]>;
+    streamUri?: string;
+    describe?: BackchannelProbeRtsp['describe'];
+    rtspConnect?: () => Promise<void>;
+  } = {},
+): BackchannelProbeDependencies {
+  return {
+    createDevice: (host, user, pass) => {
+      calls.devices.push({ host, user, pass });
+      return {
+        connect: async () => ({}),
+        getProfiles: overrides.profiles ?? (async () => [{ token: 'p1' }, { token: 'p2' }]),
+        getStreamUri: async (token) => {
+          calls.streamUriTokens.push(token);
+          return overrides.streamUri ?? 'rtsp://cam:554/stream1';
+        },
+      };
+    },
+    createRtsp: (host, port, user, pass, timeoutMs) => {
+      calls.rtsp.push({ host, port, user, pass, ...(timeoutMs !== undefined ? { timeoutMs } : {}) });
+      return {
+        connect: overrides.rtspConnect ?? (async () => {}),
+        describe: overrides.describe
+          ?? (async (uri) => {
+            calls.described.push(uri);
+            return { status: 200, statusLine: 'RTSP/1.0 200 OK', body: sdp('sendonly') };
+          }),
+        close: () => { calls.closes += 1; },
+      };
+    },
+  };
+}
+
+function emptyCalls(): ProbeCalls {
+  return { devices: [], rtsp: [], streamUriTokens: [], described: [], closes: 0 };
+}
+
+test('the backchannel probe reports a sendonly audio track as usable', async () => {
+  const calls = emptyCalls();
+  const found = await probeOnvifBackchannelWithDependencies(
+    'cam', 'admin', 'secret', { timeoutMs: 4000 }, probeHarness(calls),
+  );
+  assert.equal(found, true);
+  assert.deepEqual(calls.devices, [{ host: 'cam', user: 'admin', pass: 'secret' }]);
+  // The first profile is the one used -- not the last, and not a search across
+  // all of them, which would multiply the probe's cost by the profile count.
+  assert.deepEqual(calls.streamUriTokens, ['p1']);
+  assert.deepEqual(calls.rtsp, [
+    { host: 'cam', port: 554, user: 'admin', pass: 'secret', timeoutMs: 4000 },
+  ]);
+  assert.deepEqual(calls.described, ['rtsp://cam:554/stream1']);
+  assert.equal(calls.closes, 1);
+});
+
+test('the backchannel probe reports a recvonly-only camera as unusable', async () => {
+  const calls = emptyCalls();
+  const found = await probeOnvifBackchannelWithDependencies(
+    'cam', 'admin', 'secret', {},
+    probeHarness(calls, {
+      describe: async () => ({
+        status: 200, statusLine: 'RTSP/1.0 200 OK', body: sdp('recvonly'),
+      }),
+    }),
+  );
+  // An answer, not a failure: this is the fact the VIGI fall-through needs.
+  assert.equal(found, false);
+  assert.equal(calls.closes, 1);
+});
+
+test('the backchannel probe rejects a camera with no media profiles', async () => {
+  const calls = emptyCalls();
+  await assert.rejects(
+    probeOnvifBackchannelWithDependencies(
+      'cam', 'admin', 'secret', {}, probeHarness(calls, { profiles: async () => [] }),
+    ),
+    /no media profiles/,
+  );
+  // No RTSP socket is opened, so there is nothing to leak.
+  assert.deepEqual(calls.rtsp, []);
+  assert.equal(calls.closes, 0);
+});
+
+test('the backchannel probe surfaces a non-200 DESCRIBE and still closes', async () => {
+  const calls = emptyCalls();
+  await assert.rejects(
+    probeOnvifBackchannelWithDependencies(
+      'cam', 'admin', 'secret', {},
+      probeHarness(calls, {
+        describe: async () => ({
+          status: 401, statusLine: 'RTSP/1.0 401 Unauthorized', body: '',
+        }),
+      }),
+    ),
+    /backchannel DESCRIBE RTSP\/1\.0 401 Unauthorized/,
+  );
+  assert.equal(calls.closes, 1, 'the socket is closed on the failure path too');
+});
+
+test('the backchannel probe closes the socket when connect itself throws', async () => {
+  // The finally block is the only thing standing between a probe that runs on
+  // every getCameraCapabilities call and a leaked socket per failure.
+  const calls = emptyCalls();
+  await assert.rejects(
+    probeOnvifBackchannelWithDependencies(
+      'cam', 'admin', 'secret', {},
+      probeHarness(calls, { rtspConnect: async () => { throw new Error('ECONNREFUSED'); } }),
+    ),
+    /ECONNREFUSED/,
+  );
+  assert.equal(calls.closes, 1);
+});
+
+test('the backchannel probe takes credentials from the stream URI when it carries them', async () => {
+  const calls = emptyCalls();
+  await probeOnvifBackchannelWithDependencies(
+    'cam', 'admin', 'secret', {},
+    probeHarness(calls, { streamUri: 'rtsp://other:9554/stream9' }),
+  );
+  assert.deepEqual(calls.rtsp, [
+    { host: 'other', port: 9554, user: 'admin', pass: 'secret' },
+  ]);
+  assert.deepEqual(calls.described, ['rtsp://other:9554/stream9']);
 });
