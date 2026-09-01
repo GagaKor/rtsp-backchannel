@@ -1,8 +1,9 @@
 """Tests for tools/bump_version.py."""
 
+import pathlib
 import unittest
 
-from tools.bump_version import BumpError, Version, level_from_commits
+from tools.bump_version import BumpError, Changelog, Version, level_from_commits
 
 
 class VersionArithmetic(unittest.TestCase):
@@ -71,6 +72,83 @@ class CommitLevelInference(unittest.TestCase):
 
     def test_scope_with_punctuation_is_parsed(self):
         self.assertEqual(level_from_commits(["feat(vigi,ptz): add both"], major=0), "minor")
+
+
+CHANGELOG_FIXTURE = """\
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Added
+
+- A second audio-send transport.
+
+## [0.3.1] - 2026-08-13
+
+### Changed
+
+- Corrected the stated Node minimum.
+
+## [0.3.0] - 2026-08-11
+
+### Added
+
+- PTZ movement control.
+
+[Unreleased]: https://github.com/GagaKor/rtsp-backchannel/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/GagaKor/rtsp-backchannel/releases/tag/v0.3.1
+[0.3.0]: https://github.com/GagaKor/rtsp-backchannel/releases/tag/v0.3.0
+"""
+
+
+class ChangelogRoundTrip(unittest.TestCase):
+    def test_round_trips_the_fixture_byte_for_byte(self):
+        self.assertEqual(Changelog.parse(CHANGELOG_FIXTURE).render(), CHANGELOG_FIXTURE)
+
+    def test_round_trips_the_real_changelog_byte_for_byte(self):
+        text = pathlib.Path("CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertEqual(Changelog.parse(text).render(), text)
+
+    def test_separates_head_sections_and_links(self):
+        changelog = Changelog.parse(CHANGELOG_FIXTURE)
+
+        self.assertEqual(changelog.head[0], "# Changelog")
+        self.assertEqual(
+            [section.version for section in changelog.sections],
+            ["Unreleased", "0.3.1", "0.3.0"],
+        )
+        self.assertEqual(changelog.sections[1].date, "2026-08-13")
+        self.assertIsNone(changelog.sections[0].date)
+        self.assertEqual(len(changelog.links), 3)
+        self.assertTrue(changelog.links[0].startswith("[Unreleased]: "))
+
+    def test_body_excludes_surrounding_blank_lines(self):
+        changelog = Changelog.parse(CHANGELOG_FIXTURE)
+
+        self.assertEqual(
+            changelog.sections[0].body,
+            ("### Added", "", "- A second audio-send transport."),
+        )
+
+    def test_empty_unreleased_round_trips(self):
+        text = CHANGELOG_FIXTURE.replace(
+            "## [Unreleased]\n\n### Added\n\n- A second audio-send transport.\n\n",
+            "## [Unreleased]\n\n",
+        )
+
+        parsed = Changelog.parse(text)
+
+        self.assertEqual(parsed.sections[0].body, ())
+        self.assertEqual(parsed.render(), text)
+
+    def test_rejects_a_changelog_with_no_sections(self):
+        with self.assertRaises(BumpError):
+            Changelog.parse("# Changelog\n\nNothing here.\n")
 
 
 if __name__ == "__main__":

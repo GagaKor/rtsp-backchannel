@@ -89,3 +89,84 @@ def level_from_commits(messages: Sequence[str], *, major: int) -> str:
     if any(_is_feature(message) for message in messages):
         return "minor"
     return "patch"
+
+
+_SECTION_RE = re.compile(r"\A## \[(?P<version>[^\]]+)\](?: - (?P<date>\d{4}-\d{2}-\d{2}))?\s*\Z")
+_LINK_RE = re.compile(r"\A\[[^\]]+\]: \S+\s*\Z")
+
+
+def _trimmed(lines: Sequence[str]) -> tuple[str, ...]:
+    """Drop leading and trailing blank lines."""
+    start, end = 0, len(lines)
+    while start < end and not lines[start].strip():
+        start += 1
+    while end > start and not lines[end - 1].strip():
+        end -= 1
+    return tuple(lines[start:end])
+
+
+@dataclass(frozen=True)
+class Section:
+    version: str
+    date: str | None
+    body: tuple[str, ...]
+
+    @property
+    def heading(self) -> str:
+        if self.date is None:
+            return f"## [{self.version}]"
+        return f"## [{self.version}] - {self.date}"
+
+
+@dataclass(frozen=True)
+class Changelog:
+    head: tuple[str, ...]
+    sections: tuple[Section, ...]
+    links: tuple[str, ...]
+
+    @classmethod
+    def parse(cls, text: str) -> "Changelog":
+        lines = text.split("\n")
+        if lines and lines[-1] == "":
+            lines = lines[:-1]
+
+        starts = [i for i, line in enumerate(lines) if _SECTION_RE.match(line)]
+        if not starts:
+            raise BumpError("CHANGELOG.md has no '## [version]' sections")
+
+        head = _trimmed(lines[: starts[0]])
+
+        sections: list[Section] = []
+        for index, start in enumerate(starts):
+            end = starts[index + 1] if index + 1 < len(starts) else len(lines)
+            match = _SECTION_RE.match(lines[start])
+            assert match is not None  # starts was built from the same predicate
+            sections.append(
+                Section(
+                    version=match["version"],
+                    date=match["date"],
+                    body=_trimmed(lines[start + 1 : end]),
+                )
+            )
+
+        # The link reference block is the trailing run of "[name]: url" lines in
+        # the final section's body.
+        last = sections[-1]
+        body = list(last.body)
+        links: list[str] = []
+        while body and _LINK_RE.match(body[-1]):
+            links.insert(0, body.pop())
+        sections[-1] = Section(last.version, last.date, _trimmed(body))
+
+        return cls(head=head, sections=tuple(sections), links=tuple(links))
+
+    def render(self) -> str:
+        out: list[str] = [*self.head, ""]
+        for section in self.sections:
+            out.append(section.heading)
+            out.append("")
+            if section.body:
+                out.extend(section.body)
+                out.append("")
+        out.extend(self.links)
+        return "\n".join(out) + "\n"
