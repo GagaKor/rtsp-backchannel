@@ -47,6 +47,7 @@ on:
 guarded to run only when all of the following hold:
 
 - `github.repository == 'GagaKor/rtsp-backchannel'`
+- `github.event.pull_request.head.repo.full_name == github.repository`
 - `github.base_ref == 'master'`
 - `github.head_ref == 'dev'`
 
@@ -65,8 +66,13 @@ The flow:
 5. `master` receives a commit whose manifest version differs from every
    registry, so `release.yml` runs its normal `push` trigger and publishes.
 
-`dev` and `master` cannot drift apart, because the bump happens on `dev` and
-reaches `master` through the merge — never the other way around.
+The *version* cannot regress, because the bump happens on `dev` and reaches
+`master` through the merge — never the other way around. The branches
+themselves do drift: `master` accumulates its own commits (dependency bumps
+merged directly, for instance), and the release tag lands on the `dev` →
+`master` merge commit, which a later `dev` never has as an ancestor. That is
+why the last release is resolved by tag existence rather than by reachability
+from `dev`.
 
 ### Why no infinite loop
 
@@ -132,9 +138,12 @@ In order:
 
 1. `v<version in package.json>`, if that tag exists. This is the normal case:
    the manifest holds the last released version and `release.yml` tagged it.
-2. Otherwise the most recent `v*` tag reachable from `HEAD`. This covers a
-   branch that already carries a bump commit, where the manifest version is
-   ahead of every tag.
+2. Otherwise the greatest existing `v*` tag below the manifest version,
+   resolved by tag existence and never by reachability. This covers a branch
+   that already carries a bump commit, where the manifest version is ahead of
+   every tag — and reachability is the wrong test here regardless, because
+   `release.yml` tags the `dev` → `master` merge commit, which is never an
+   ancestor of `dev`.
 3. Otherwise the full history.
 
 ## Re-running on an updated PR

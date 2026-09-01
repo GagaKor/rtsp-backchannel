@@ -406,23 +406,25 @@ def _tag_exists(root: Path, tag: str) -> bool:
 def last_released(root: Path, manifest: Version) -> Version | None:
     """The version the last release actually shipped.
 
-    Normally the manifest holds it and release.yml tagged it. On a branch that
-    already carries a bump commit the manifest is ahead of every tag, so fall
-    back to the most recent tag reachable from HEAD. A repository with no tags
-    at all yields None and the caller scans the whole history.
+    Resolved by tag existence, never by reachability. release.yml tags the
+    dev -> master merge commit, and a merge commit is never an ancestor of the
+    branch that was merged, so a release tag is never reachable from dev.
+    `git describe` would therefore either fail outright or, worse, silently
+    return an older tag that is reachable and compute the next version from a
+    base two releases stale.
     """
     if _tag_exists(root, f"v{manifest}"):
         return manifest
-    result = subprocess.run(
-        ["git", "describe", "--tags", "--abbrev=0", "--match", "v*"],
-        cwd=root,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0 or not result.stdout.strip():
-        return None
-    return Version.parse(result.stdout.strip().removeprefix("v"))
+
+    earlier = []
+    for line in _git(root, "tag", "--list", "v*").splitlines():
+        try:
+            version = Version.parse(line.strip().removeprefix("v"))
+        except BumpError:
+            continue
+        if version < manifest:
+            earlier.append(version)
+    return max(earlier) if earlier else None
 
 
 def commit_messages(root: Path, since: Version | None) -> list[str]:

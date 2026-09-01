@@ -35,5 +35,5 @@ of the release now depend on it:
   `dev` → `master` merge publishes nothing, which is the correct outcome for
   work that should not ship on its own.
 
-Merging `dev` into `master` then bumps the version and publishes automatically.
-See `RELEASING.md`.
+Opening the `dev` → `master` pull request bumps the version; merging it then
+publishes automatically. See `RELEASING.md`.

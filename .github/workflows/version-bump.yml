@@ -40,21 +40,21 @@ jobs:
           ref: ${{ github.head_ref }}
           fetch-depth: 0
 
-      # last_released() resolves the previous release with `git describe`, which
-      # is reachability-based: a tag that exists but is not an ancestor of this
-      # branch leaves it returning None, and the bump would then compute the
-      # level from the entire history. Test it the same way it does.
-      # The bare assignment is deliberate -- a failing command substitution
-      # inside a larger argument (echo "...: $(git describe)") does not trip
-      # `set -e`, which would leave this step green while the check failed.
-      - name: Require reachable tag history
+      # last_released() resolves the previous release by tag existence, not by
+      # reachability -- release.yml tags the dev -> master merge commit, which
+      # is never an ancestor of dev. So the check here is that this checkout
+      # actually fetched the tags, not that any of them is reachable.
+      # The bare assignment is deliberate: a failing command substitution
+      # inside a larger argument does not trip `set -e`.
+      - name: Require tag history
         run: |
           set -euo pipefail
-          if ! tag=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null); then
-            echo 'No v* tag is reachable from this branch; the bump cannot resolve the last release.' >&2
+          tags=$(git tag --list 'v*')
+          if [ -z "$tags" ]; then
+            echo 'No v* tags in this checkout; the bump cannot resolve the last release.' >&2
             exit 1
           fi
-          echo "Last release tag reachable from HEAD: $tag"
+          echo "Release tags present: $(printf '%s' "$tags" | tr '\n' ' ')"
 
       - uses: actions/setup-python@v7
         with:

@@ -595,6 +595,55 @@ def commit(root: pathlib.Path, subject: str, body: str = "") -> None:
     git(root, "commit", "-q", "-m", message)
 
 
+def init_dev_master_merge_topology(root: pathlib.Path) -> None:
+    """Build the topology this repository actually has, not a linear branch.
+
+    Two releases, each landing as a dev -> master merge commit tagged by
+    release.yml. Only the first is ever merged forward into dev afterwards --
+    master then drifts on its own, exactly as a dependency-bump PR merged
+    straight into master does in the real repository. So v0.3.0 ends up
+    reachable from dev, but v0.3.1 -- the more recent release -- does not.
+    HEAD ends up on dev.
+    """
+    git(root, "init", "-q", "-b", "master")
+    git(root, "config", "user.email", "test@example.com")
+    git(root, "config", "user.name", "Test")
+    write_fixture_repo(root, version="0.2.0")
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "chore: bootstrap")
+
+    git(root, "checkout", "-q", "-b", "dev")
+    write_fixture_repo(root, version="0.3.0")
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "chore(release): bump version to 0.3.0")
+
+    git(root, "checkout", "-q", "master")
+    git(root, "merge", "-q", "--no-ff", "-m", "Merge pull request #1 from dev", "dev")
+    git(root, "tag", "v0.3.0")
+
+    # The one merge-forward: master (now carrying v0.3.0) is merged back into
+    # dev, so the tag becomes reachable from dev too.
+    git(root, "checkout", "-q", "dev")
+    git(root, "merge", "-q", "-m", "Merge master back into dev", "master")
+
+    commit(root, "feat(cli): add --transport")
+    write_fixture_repo(root, version="0.3.1")
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "chore(release): bump version to 0.3.1")
+
+    git(root, "checkout", "-q", "master")
+    git(root, "merge", "-q", "--no-ff", "-m", "Merge pull request #2 from dev", "dev")
+    git(root, "tag", "v0.3.1")
+
+    # master drifts on its own after this release -- e.g. a dependency bump PR
+    # merged straight into master -- and is never merged forward into dev.
+    (root / "MASTER_ONLY.txt").write_text("drift\n", encoding="utf-8")
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "chore(deps): bump something directly on master")
+
+    git(root, "checkout", "-q", "dev")
+
+
 class GitIntegration(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -628,6 +677,19 @@ class GitIntegration(unittest.TestCase):
 
         self.assertEqual(len(messages), 2)
         self.assertIn("BREAKING CHANGE: it moved.", messages[0] + messages[1])
+
+    def test_last_released_finds_the_merge_commit_tag_from_dev_even_when_unreachable(self):
+        """release.yml tags the dev -> master merge commit, which is never an
+        ancestor of dev. From dev, `git describe --tags --abbrev=0` cannot see
+        v0.3.1 at all -- and because an older tag (v0.3.0, merged forward once)
+        is reachable, `git describe` returns that stale tag instead of failing
+        outright. Resolution has to be by tag existence, never reachability.
+        """
+        init_dev_master_merge_topology(self.root)
+
+        self.assertEqual(
+            last_released(self.root, Version.parse("0.3.2")), Version.parse("0.3.1")
+        )
 
 
 class ApplyBump(unittest.TestCase):
@@ -746,6 +808,50 @@ class ApplyBump(unittest.TestCase):
         self.assertIn("- A flag.", text)
         self.assertIn("rtsp-backchannel@^0.4", (self.root / "README.md").read_text())
         verify(self.root, Version.parse("0.4.0"))
+
+    def test_apply_bump_uses_the_newest_release_not_an_older_reachable_one(self):
+        """Regression for the dev/master merge topology: v0.3.1's tag lives on
+        a merge commit that is never an ancestor of dev, while the older
+        v0.3.0 happens to be reachable (merged forward once, then master
+        drifted on its own). A reachability-based fallback picks v0.3.0 and
+        pulls the feat that justified the 0.3.0 -> 0.3.1 release back into
+        range, computing "minor" from a base two releases stale and landing on
+        0.4.0. Existence-based resolution finds v0.3.1 and a patch-only range,
+        landing on 0.3.2.
+        """
+        init_dev_master_merge_topology(self.root)
+
+        # A patch-only commit closes out the first release cycle on dev.
+        path = self.root / "CHANGELOG.md"
+        path.write_text(
+            path.read_text(encoding="utf-8").replace(
+                "## [Unreleased]\n\n", "## [Unreleased]\n\n### Fixed\n\n- A late fix.\n\n", 1
+            ),
+            encoding="utf-8",
+        )
+        commit(self.root, "fix(vigi): a late fix")
+
+        apply_bump(self.root, today="2026-09-01")
+        git(self.root, "add", "-A")
+        git(self.root, "commit", "-q", "-m", "chore(release): bump version to 0.3.2")
+
+        # The PR re-triggers with one more patch-only commit -- the rerun that
+        # exercises last_released's fallback, since the manifest (0.3.2) is
+        # not yet tagged.
+        path.write_text(
+            path.read_text(encoding="utf-8").replace(
+                "## [Unreleased]\n\n", "## [Unreleased]\n\n### Fixed\n\n- Another late fix.\n\n", 1
+            ),
+            encoding="utf-8",
+        )
+        commit(self.root, "fix(cli): another late fix")
+
+        result = apply_bump(self.root, today="2026-09-02")
+
+        self.assertEqual(result["previous"], "0.3.1")
+        self.assertEqual(result["level"], "patch")
+        self.assertEqual(result["version"], "0.3.2")
+        verify(self.root, Version.parse("0.3.2"))
 
 
 class CommandLine(unittest.TestCase):

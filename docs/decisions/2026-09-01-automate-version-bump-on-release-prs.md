@@ -28,9 +28,14 @@ one commit to `dev`. The pull request carries the bump; merging it publishes.
 ### Bump on the pull request (chosen)
 
 The bump lands on `dev` before the merge, so `master` never exists in a state
-that needs a follow-up bump, and `dev` and `master` cannot drift apart. A human
-reviews the version and the dated changelog section in the same diff as the
-work. `release.yml` is not modified.
+that needs a follow-up bump, and the *version* cannot regress — it only moves
+forward as the bump reaches `master` through the merge, never the other way
+around. The branches themselves still drift apart (`master` gains its own
+commits, and the release tag lands on the merge commit, which is never an
+ancestor of a later `dev`), which is why the last release is resolved by tag
+existence rather than by reachability from `dev`. A human reviews the version
+and the dated changelog section in the same diff as the work. `release.yml`
+is not modified.
 
 The cost is that the bump happens when the PR opens rather than when it merges,
 so work added afterwards triggers a recompute — handled by recomputing the whole

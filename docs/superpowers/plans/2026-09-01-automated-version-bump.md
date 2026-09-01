@@ -1526,8 +1526,12 @@ def last_released(root: Path, manifest: Version) -> Version | None:
 
     Normally the manifest holds it and release.yml tagged it. On a branch that
     already carries a bump commit the manifest is ahead of every tag, so fall
-    back to the most recent tag reachable from HEAD. A repository with no tags
-    at all yields None and the caller scans the whole history.
+    back to the greatest existing tag below the manifest version. (A later
+    whole-branch review replaced an earlier reachability-based fallback --
+    the most recent tag reachable from HEAD -- with this existence check,
+    since release.yml tags the dev -> master merge commit, which is never an
+    ancestor of dev.) A repository with no tags at all yields None and the
+    caller scans the whole history.
     """
     if _tag_exists(root, f"v{manifest}"):
         return manifest
@@ -1649,8 +1653,11 @@ docs-only changes permanently ambiguous in a repository that ships its READMEs
 inside all three packages.
 
 last_released prefers the tag matching the manifest, which is the normal case,
-and falls back to the newest reachable tag on a branch that already carries a
-bump commit. The commit scan uses NUL record separators so a BREAKING CHANGE
+and otherwise falls back to the newest existing tag below it, on a branch that
+already carries a bump commit. (A later whole-branch review replaced an
+earlier reachability-based fallback with this existence check, since
+release.yml tags the dev -> master merge commit, which is never an ancestor
+of dev.) The commit scan uses NUL record separators so a BREAKING CHANGE
 footer is not split across records, and --no-merges because merge commits are
 the only non-conventional subjects in this history.
 
