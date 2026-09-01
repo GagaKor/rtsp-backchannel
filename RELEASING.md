@@ -41,13 +41,21 @@ is involved.
 
 To ship a release:
 
-1. Do step 1 below ("Prepare the release") to bump the versions and update
-   the version references that live outside the manifests.
-2. Merge that change to `master`.
-3. The workflow runs automatically, pins the tag and provenance draft, then
-   publishes whichever packages changed version and completes the GitHub
-   Release. Watch the run in the Actions tab; each registry's publish job is
-   skipped (not failed) for a package whose version didn't change.
+1. Write what changed under `## [Unreleased]` in `CHANGELOG.md`, as part of the
+   work itself. This is what declares a release: an empty `[Unreleased]` means
+   the merge publishes nothing.
+2. Open a pull request from `dev` to `master`.
+3. `.github/workflows/version-bump.yml` computes the next version from the
+   conventional-commit types since the last tag, rewrites every versioned file,
+   verifies the result against the same gate `release.yml` applies, and pushes
+   one `chore(release): bump version to X.Y.Z` commit to `dev`.
+4. Review that commit — the version and the newly dated changelog section — and
+   merge.
+5. `release.yml` runs on the merge, pins the tag and provenance draft, publishes
+   whichever packages changed version, and completes the GitHub Release.
+
+Nothing in step 1 requires editing a version by hand. The manual process in
+"1. Prepare the release" below is the fallback for when the workflow cannot run.
 
 You can also trigger a run manually from the Actions tab
 (`workflow_dispatch`) if you need to retry a publish without pushing a new
@@ -71,12 +79,13 @@ for this repository) and for authenticating locally.
    `npm version <new> --no-git-tag-version` covers the first two, and
    `cargo update --manifest-path rust/Cargo.toml --package rtsp-backchannel
    --precise <new>` refreshes the Cargo lock after the manifest edit.
-2. Update the version references that live outside the manifests, or the test
-   suite will fail: the install pins in all six READMEs
-   (`rtsp-backchannel@^X.Y` for npm, `'rtsp-backchannel>=X.Y,<X.Z'` for pip,
-   `rtsp-backchannel = "X.Y"` for Cargo) and the asserted version in
-   `python/test_library_api.py::test_declares_installable_wheel_metadata`.
-   `git grep` for the outgoing version to catch any others.
+2. Update the version references that live outside the manifests. Only one of
+   them is enforced by the test suite — the asserted version in
+   `python/test_library_api.py::test_declares_installable_wheel_metadata`. The
+   install pins in all six READMEs (`rtsp-backchannel@^X.Y` for npm,
+   `'rtsp-backchannel>=X.Y,<X.Z'` for pip, `rtsp-backchannel = "X.Y"` for Cargo)
+   are checked by `tools/bump_version.py` but by no test, so a hand-edited
+   release can ship a stale pin.
 
    The version now appears exactly once per README, inside the install
    command. It used to also appear in the surrounding prose, which is how
