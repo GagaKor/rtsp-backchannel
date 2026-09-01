@@ -36,7 +36,7 @@ Add the released crate to `Cargo.toml`. The example application also uses
 ```toml
 [dependencies]
 anyhow = "1"
-rtsp-backchannel = "0.3"
+rtsp-backchannel = "0.4"
 ```
 
 To use the current `master` source instead of a registry release:

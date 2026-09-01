@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-01
+
 ### Added
 
 - A second audio-send transport in the TypeScript package: TP-Link's VIGI
@@ -161,6 +163,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - External FFmpeg decoding for common input audio formats.
 - MIT OR Apache-2.0 dual licensing.
 
-[Unreleased]: https://github.com/GagaKor/rtsp-backchannel/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/GagaKor/rtsp-backchannel/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/GagaKor/rtsp-backchannel/releases/tag/v0.4.0
 [0.3.1]: https://github.com/GagaKor/rtsp-backchannel/releases/tag/v0.3.1
 [0.3.0]: https://github.com/GagaKor/rtsp-backchannel/releases/tag/v0.3.0

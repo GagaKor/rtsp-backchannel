@@ -37,7 +37,7 @@ npm install rtsp-backchannel
 현재 릴리스 계열에 고정하려면 다음 명령을 사용합니다.
 
 ```bash
-npm install rtsp-backchannel@^0.3
+npm install rtsp-backchannel@^0.4
 ```
 
 Registry 릴리스 대신 현재 `master` 소스를 설치하려면 다음 명령을 사용합니다.
