@@ -1,0 +1,105 @@
+name: Version bump
+
+# Raises the version on a dev -> master pull request so that merging it
+# publishes a release. release.yml only publishes when a manifest version
+# differs from what is live on npm, PyPI and crates.io; nothing else computes
+# that difference, so without this a merge is a silent no-op.
+#
+# The bump lands on dev, not on master after the merge. Bumping on master
+# strands dev at the old version, so the next cycle either conflicts across all
+# five manifests or presents a diff that lowers the version.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: version-bump-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  bump:
+    name: Bump version for release
+    if: >-
+      github.repository == 'GagaKor/rtsp-backchannel' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.base_ref == 'master' &&
+      github.head_ref == 'dev'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      # The head branch itself, not the merge commit: the bump is pushed back to
+      # dev. Full depth because the bump reads every commit since the last tag.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+
+      # last_released() resolves the previous release with `git describe`, which
+      # is reachability-based: a tag that exists but is not an ancestor of this
+      # branch leaves it returning None, and the bump would then compute the
+      # level from the entire history. Test it the same way it does.
+      # The bare assignment is deliberate -- a failing command substitution
+      # inside a larger argument (echo "...: $(git describe)") does not trip
+      # `set -e`, which would leave this step green while the check failed.
+      - name: Require reachable tag history
+        run: |
+          set -euo pipefail
+          if ! tag=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null); then
+            echo 'No v* tag is reachable from this branch; the bump cannot resolve the last release.' >&2
+            exit 1
+          fi
+          echo "Last release tag reachable from HEAD: $tag"
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+
+      - name: Compute and apply the version bump
+        id: bump
+        run: |
+          set -euo pipefail
+          summary=$(python tools/bump_version.py --root .)
+          echo "$summary"
+          echo "bumped=$(printf '%s' "$summary" | jq -r '.bumped')" >> "$GITHUB_OUTPUT"
+          echo "version=$(printf '%s' "$summary" | jq -r '.version')" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$summary" >> "$GITHUB_STEP_SUMMARY"
+
+      # A GITHUB_TOKEN push starts no workflow run, so the pull request's own
+      # checks will not re-run against the bump commit. This is the only place
+      # the rewritten version assertion is exercised before master.
+      - name: Verify the bumped tree
+        if: steps.bump.outputs.bumped == 'true'
+        run: PYTHONPATH=python:. python -m unittest test_library_api
+
+      - name: Commit and push the bump
+        if: steps.bump.outputs.bumped == 'true'
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add \
+            package.json \
+            package-lock.json \
+            python/pyproject.toml \
+            python/test_library_api.py \
+            rust/Cargo.toml \
+            rust/Cargo.lock \
+            CHANGELOG.md \
+            README.md \
+            README.ko.md \
+            python/README.md \
+            python/README.ko.md \
+            rust/README.md \
+            rust/README.ko.md
+          if git diff --cached --quiet; then
+            echo 'Version already at ${{ steps.bump.outputs.version }}; nothing to commit.'
+            exit 0
+          fi
+          git commit -m 'chore(release): bump version to ${{ steps.bump.outputs.version }}'
+          git push origin "HEAD:${{ github.head_ref }}"
