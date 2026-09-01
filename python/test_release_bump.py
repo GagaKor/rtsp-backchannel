@@ -1,9 +1,21 @@
 """Tests for tools/bump_version.py."""
 
 import pathlib
+import tempfile
 import unittest
 
-from tools.bump_version import BumpError, Changelog, Version, level_from_commits
+from tools.bump_version import (
+    BumpError,
+    Changelog,
+    GITHUB_REPO_URL,
+    Version,
+    level_from_commits,
+    read_manifest_version,
+    rewrite_manifests,
+    rewrite_readme_pins,
+    rewrite_version_assertion,
+    verify,
+)
 
 
 class VersionArithmetic(unittest.TestCase):
@@ -292,6 +304,266 @@ class ChangelogPromotion(unittest.TestCase):
         text = CHANGELOG_FIXTURE.replace("## [Unreleased]\n\n### Added\n\n- A second audio-send transport.\n\n", "")
         with self.assertRaises(BumpError):
             Changelog.parse(text).pending()
+
+
+def write_fixture_repo(root: pathlib.Path, *, version: str = "0.3.1", unreleased: str = "") -> None:
+    """Write the eleven versioned files in the shapes the real repository uses."""
+    line = ".".join(version.split(".")[:2])
+    next_minor = f"{line.split('.')[0]}.{int(line.split('.')[1]) + 1}"
+
+    (root / "package.json").write_text(
+        '{\n  "name": "rtsp-backchannel",\n'
+        f'  "version": "{version}",\n'
+        '  "type": "module"\n}\n',
+        encoding="utf-8",
+    )
+    (root / "package-lock.json").write_text(
+        '{\n  "name": "rtsp-backchannel",\n'
+        f'  "version": "{version}",\n'
+        '  "lockfileVersion": 3,\n  "requires": true,\n'
+        '  "packages": {\n    "": {\n      "name": "rtsp-backchannel",\n'
+        f'      "version": "{version}",\n'
+        '      "license": "MIT OR Apache-2.0"\n    },\n'
+        '    "node_modules/@types/node": {\n      "version": "26.2.0"\n    }\n  }\n}\n',
+        encoding="utf-8",
+    )
+    (root / "python").mkdir(exist_ok=True)
+    (root / "rust").mkdir(exist_ok=True)
+    (root / "python" / "pyproject.toml").write_text(
+        '[project]\nname = "rtsp-backchannel"\n'
+        f'version = "{version}"\nrequires-python = ">=3.11"\n',
+        encoding="utf-8",
+    )
+    (root / "rust" / "Cargo.toml").write_text(
+        '[package]\nname = "rtsp-backchannel"\n'
+        f'version = "{version}"\nedition = "2024"\nrust-version = "1.86"\n\n'
+        '[dependencies]\nclap = { version = "4.5", features = ["derive"] }\n',
+        encoding="utf-8",
+    )
+    (root / "rust" / "Cargo.lock").write_text(
+        'version = 4\n\n[[package]]\nname = "anyhow"\nversion = "1.0.100"\n\n'
+        '[[package]]\nname = "rtsp-backchannel"\n'
+        f'version = "{version}"\ndependencies = [\n "anyhow",\n]\n',
+        encoding="utf-8",
+    )
+    (root / "README.md").write_text(
+        f"# rtsp-backchannel\n\n```bash\nnpm install rtsp-backchannel@^{line}\n```\n",
+        encoding="utf-8",
+    )
+    (root / "README.ko.md").write_text(
+        f"# rtsp-backchannel\n\n```bash\nnpm install rtsp-backchannel@^{line}\n```\n",
+        encoding="utf-8",
+    )
+    for name in ["README.md", "README.ko.md"]:
+        (root / "python" / name).write_text(
+            f"# rtsp-backchannel\n\n```bash\npython3 -m pip install "
+            f"'rtsp-backchannel>={line},<{next_minor}'\n```\n",
+            encoding="utf-8",
+        )
+        (root / "rust" / name).write_text(
+            f'# rtsp-backchannel\n\n```toml\n[dependencies]\n'
+            f'rtsp-backchannel = "{line}"\n```\n',
+            encoding="utf-8",
+        )
+    (root / "python" / "test_library_api.py").write_text(
+        "import unittest\n\n\nclass T(unittest.TestCase):\n"
+        "    def test_declares_installable_wheel_metadata(self):\n"
+        f'        self.assertEqual(metadata["project"]["version"], "{version}")\n',
+        encoding="utf-8",
+    )
+    body = f"\n{unreleased}\n" if unreleased else "\n"
+    (root / "CHANGELOG.md").write_text(
+        "# Changelog\n\nAll notable changes.\n\n"
+        f"## [Unreleased]\n{body}\n"
+        f"## [{version}] - 2026-08-13\n\n### Changed\n\n- Something.\n\n"
+        f"[Unreleased]: {GITHUB_REPO_URL}/compare/v{version}...HEAD\n"
+        f"[{version}]: {GITHUB_REPO_URL}/releases/tag/v{version}\n",
+        encoding="utf-8",
+    )
+
+
+class FixtureRepoShape(unittest.TestCase):
+    def test_fixture_writes_every_versioned_file(self):
+        """Guards the helper: a site added to the module needs one here too.
+
+        This proves the fixture is complete, NOT that the rewriters match the
+        real repository. Task 4 Step 5 is what proves that.
+        """
+        with tempfile.TemporaryDirectory() as name:
+            root = pathlib.Path(name)
+            write_fixture_repo(root)
+
+            for relative in [
+                "package.json",
+                "package-lock.json",
+                "python/pyproject.toml",
+                "rust/Cargo.toml",
+                "rust/Cargo.lock",
+                "README.md",
+                "README.ko.md",
+                "python/README.md",
+                "python/README.ko.md",
+                "rust/README.md",
+                "rust/README.ko.md",
+                "python/test_library_api.py",
+                "CHANGELOG.md",
+            ]:
+                self.assertTrue((root / relative).is_file(), relative)
+
+
+class ManifestRewriting(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = pathlib.Path(self._tmp.name)
+        write_fixture_repo(self.root)
+
+    def test_reads_the_manifest_version(self):
+        self.assertEqual(read_manifest_version(self.root), Version.parse("0.3.1"))
+
+    def test_rewrites_all_five_manifest_values(self):
+        rewrite_manifests(self.root, Version.parse("0.3.1"), Version.parse("0.4.0"))
+
+        self.assertIn('"version": "0.4.0"', (self.root / "package.json").read_text())
+        lock = (self.root / "package-lock.json").read_text()
+        self.assertEqual(lock.count('"version": "0.4.0"'), 2)
+        self.assertIn('"version": "26.2.0"', lock)
+        self.assertIn('version = "0.4.0"', (self.root / "python" / "pyproject.toml").read_text())
+        self.assertIn('version = "0.4.0"', (self.root / "rust" / "Cargo.toml").read_text())
+        self.assertIn(
+            'name = "rtsp-backchannel"\nversion = "0.4.0"',
+            (self.root / "rust" / "Cargo.lock").read_text(),
+        )
+
+    def test_leaves_dependency_versions_alone(self):
+        rewrite_manifests(self.root, Version.parse("0.3.1"), Version.parse("0.4.0"))
+
+        self.assertIn('version = "4.5"', (self.root / "rust" / "Cargo.toml").read_text())
+        self.assertIn('rust-version = "1.86"', (self.root / "rust" / "Cargo.toml").read_text())
+        self.assertIn(
+            'name = "anyhow"\nversion = "1.0.100"',
+            (self.root / "rust" / "Cargo.lock").read_text(),
+        )
+
+    def test_a_manifest_out_of_sync_is_an_error(self):
+        (self.root / "rust" / "Cargo.toml").write_text(
+            '[package]\nname = "rtsp-backchannel"\nversion = "0.2.9"\n', encoding="utf-8"
+        )
+
+        with self.assertRaises(BumpError) as caught:
+            rewrite_manifests(self.root, Version.parse("0.3.1"), Version.parse("0.4.0"))
+
+        self.assertIn("Cargo.toml", str(caught.exception))
+
+    def test_minor_bump_rewrites_all_six_readme_pins(self):
+        rewrite_readme_pins(self.root, Version.parse("0.3.1"), Version.parse("0.4.0"))
+
+        self.assertIn("rtsp-backchannel@^0.4", (self.root / "README.md").read_text())
+        self.assertIn("rtsp-backchannel@^0.4", (self.root / "README.ko.md").read_text())
+        self.assertIn("'rtsp-backchannel>=0.4,<0.5'", (self.root / "python" / "README.md").read_text())
+        self.assertIn("'rtsp-backchannel>=0.4,<0.5'", (self.root / "python" / "README.ko.md").read_text())
+        self.assertIn('rtsp-backchannel = "0.4"', (self.root / "rust" / "README.md").read_text())
+        self.assertIn('rtsp-backchannel = "0.4"', (self.root / "rust" / "README.ko.md").read_text())
+
+    def test_patch_bump_leaves_all_six_readmes_byte_identical(self):
+        before = {
+            name: (self.root / name).read_bytes()
+            for name in [
+                "README.md",
+                "README.ko.md",
+                "python/README.md",
+                "python/README.ko.md",
+                "rust/README.md",
+                "rust/README.ko.md",
+            ]
+        }
+
+        rewrite_readme_pins(self.root, Version.parse("0.3.1"), Version.parse("0.3.2"))
+
+        for name, content in before.items():
+            self.assertEqual((self.root / name).read_bytes(), content, name)
+
+    def test_a_missing_pin_is_an_error(self):
+        (self.root / "rust" / "README.md").write_text("# no pin here\n", encoding="utf-8")
+
+        with self.assertRaises(BumpError) as caught:
+            rewrite_readme_pins(self.root, Version.parse("0.3.1"), Version.parse("0.4.0"))
+
+        self.assertIn("README.md", str(caught.exception))
+
+    def test_rewrites_the_python_version_assertion(self):
+        rewrite_version_assertion(self.root, Version.parse("0.3.1"), Version.parse("0.4.0"))
+
+        self.assertIn(
+            'self.assertEqual(metadata["project"]["version"], "0.4.0")',
+            (self.root / "python" / "test_library_api.py").read_text(),
+        )
+
+
+class GateVerification(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = pathlib.Path(self._tmp.name)
+        write_fixture_repo(self.root)
+
+    def test_a_consistent_tree_verifies(self):
+        verify(self.root, Version.parse("0.3.1"))
+
+    def test_a_mismatched_manifest_fails_verification(self):
+        (self.root / "python" / "pyproject.toml").write_text(
+            '[project]\nname = "rtsp-backchannel"\nversion = "0.2.9"\n', encoding="utf-8"
+        )
+
+        with self.assertRaises(BumpError) as caught:
+            verify(self.root, Version.parse("0.3.1"))
+
+        self.assertIn("pyproject.toml", str(caught.exception))
+
+    def test_a_missing_dated_section_fails_verification(self):
+        # Move the manifests, pins and assertion to the target but leave the
+        # changelog behind, so check 1 passes and check 2 is what fails.
+        old, new = Version.parse("0.3.1"), Version.parse("0.4.0")
+        rewrite_manifests(self.root, old, new)
+        rewrite_readme_pins(self.root, old, new)
+        rewrite_version_assertion(self.root, old, new)
+
+        with self.assertRaises(BumpError) as caught:
+            verify(self.root, new)
+
+        self.assertIn("CHANGELOG.md", str(caught.exception))
+
+    def test_a_tree_consistently_on_the_wrong_version_fails_verification(self):
+        """Agreeing with each other is not enough; the five must equal the target."""
+        with self.assertRaises(BumpError) as caught:
+            verify(self.root, Version.parse("0.3.2"))
+
+        self.assertIn("package.json", str(caught.exception))
+
+    def test_a_duplicated_dated_section_fails_verification(self):
+        path = self.root / "CHANGELOG.md"
+        path.write_text(
+            path.read_text(encoding="utf-8").replace(
+                "## [0.3.1] - 2026-08-13",
+                "## [0.3.1] - 2026-08-13\n\n### Added\n\n- Dup.\n\n## [0.3.1] - 2026-08-14",
+                1,
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(BumpError):
+            verify(self.root, Version.parse("0.3.1"))
+
+    def test_a_stale_readme_pin_fails_verification(self):
+        (self.root / "rust" / "README.md").write_text(
+            '# rtsp-backchannel\n\n```toml\n[dependencies]\nrtsp-backchannel = "0.2"\n```\n',
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(BumpError) as caught:
+            verify(self.root, Version.parse("0.3.1"))
+
+        self.assertIn("README.md", str(caught.exception))
 
 
 if __name__ == "__main__":

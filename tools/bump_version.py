@@ -12,9 +12,11 @@ expects, which is a condition a human has to look at.
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 
 GITHUB_REPO_URL = "https://github.com/GagaKor/rtsp-backchannel"
 
@@ -231,3 +233,147 @@ class Changelog:
         )
 
         return Changelog(head=self.head, sections=sections, links=links)
+
+
+# Each site is one template. Formatting it with the old version gives the exact
+# text to find; formatting it with the new version gives the exact text to
+# write. Deriving both from one string is what makes them impossible to
+# misalign.
+_MANIFEST_SITES: list[tuple[str, str]] = [
+    ("package.json", '\n  "version": "{version}",\n'),
+    # Anchored on surrounding structure rather than on the version alone: a
+    # dependency could legitimately share the project's version number.
+    (
+        "package-lock.json",
+        '{{\n  "name": "rtsp-backchannel",\n  "version": "{version}",\n',
+    ),
+    (
+        "package-lock.json",
+        '    "": {{\n      "name": "rtsp-backchannel",\n      "version": "{version}",\n',
+    ),
+    ("python/pyproject.toml", '\nversion = "{version}"\n'),
+    ("rust/Cargo.toml", '\nversion = "{version}"\n'),
+    ("rust/Cargo.lock", '\nname = "rtsp-backchannel"\nversion = "{version}"\n'),
+]
+
+_PIN_SITES: list[tuple[str, str]] = [
+    ("README.md", "npm install rtsp-backchannel@^{line}\n"),
+    ("README.ko.md", "npm install rtsp-backchannel@^{line}\n"),
+    ("python/README.md", "'rtsp-backchannel>={line},<{following}'"),
+    ("python/README.ko.md", "'rtsp-backchannel>={line},<{following}'"),
+    ("rust/README.md", 'rtsp-backchannel = "{line}"\n'),
+    ("rust/README.ko.md", 'rtsp-backchannel = "{line}"\n'),
+]
+
+_ASSERTION_SITE = (
+    "python/test_library_api.py",
+    'self.assertEqual(metadata["project"]["version"], "{version}")',
+)
+
+
+def _render(template: str, version: Version) -> str:
+    return template.format(
+        version=version,
+        line=version.line,
+        following=f"{version.major}.{version.minor + 1}",
+    )
+
+
+def _replace_exactly_once(path: Path, needle: str, replacement: str) -> None:
+    """Rewrite a file, insisting the needle occurred exactly once.
+
+    A zero-count replacement is the failure that matters: it leaves one manifest
+    behind, and release.yml then rejects the release with three registries
+    already half-considered. Failing here names the file instead.
+    """
+    if not path.is_file():
+        raise BumpError(f"{path}: missing")
+    text = path.read_text(encoding="utf-8")
+    found = text.count(needle)
+    if found != 1:
+        raise BumpError(f"{path}: expected 1 occurrence of {needle!r}, found {found}")
+    if needle != replacement:
+        path.write_text(text.replace(needle, replacement), encoding="utf-8")
+
+
+def _rewrite_sites(root: Path, sites: Sequence[tuple[str, str]], old: Version, new: Version) -> None:
+    for relative, template in sites:
+        _replace_exactly_once(
+            root / relative, _render(template, old), _render(template, new)
+        )
+
+
+def read_manifest_version(root: Path) -> Version:
+    package = json.loads((root / "package.json").read_text(encoding="utf-8"))
+    return Version.parse(package["version"])
+
+
+def rewrite_manifests(root: Path, old: Version, new: Version) -> None:
+    _rewrite_sites(root, _MANIFEST_SITES, old, new)
+
+
+def rewrite_readme_pins(root: Path, old: Version, new: Version) -> None:
+    """Move the six install pins onto the target's release line.
+
+    Always run, not only on minor bumps. The pins carry MAJOR.MINOR only, so a
+    patch bump renders the same text for old and new, leaves every README
+    byte-identical, and still asserts each pin is present and on the expected
+    line -- which is gate check 4 for free.
+    """
+    _rewrite_sites(root, _PIN_SITES, old, new)
+
+
+def rewrite_version_assertion(root: Path, old: Version, new: Version) -> None:
+    _rewrite_sites(root, [_ASSERTION_SITE], old, new)
+
+
+def verify(root: Path, target: Version) -> None:
+    """Reproduce release.yml's gate before anything is pushed.
+
+    A GITHUB_TOKEN push starts no workflow run, so the pull request's checks
+    never see the bump commit. Without this the bump would be verified for the
+    first time during publishing. It re-reads from disk rather than trusting
+    what the rewriters just did.
+    """
+    expected = str(target)
+
+    # Check 1: the five values release.yml cross-checks, read the way it reads
+    # them -- structurally, not by matching the string we hoped to write.
+    package = json.loads((root / "package.json").read_text(encoding="utf-8"))
+    lock = json.loads((root / "package-lock.json").read_text(encoding="utf-8"))
+    found = {
+        "package.json": package["version"],
+        "package-lock.json (.version)": lock["version"],
+        'package-lock.json (.packages[""].version)': lock["packages"][""]["version"],
+    }
+    for relative in ["python/pyproject.toml", "rust/Cargo.toml"]:
+        match = re.search(
+            r'^version = "([^"]+)"$',
+            (root / relative).read_text(encoding="utf-8"),
+            re.MULTILINE,
+        )
+        found[relative] = match[1] if match else "<missing>"
+    match = re.search(
+        r'^name = "rtsp-backchannel"\nversion = "([^"]+)"$',
+        (root / "rust" / "Cargo.lock").read_text(encoding="utf-8"),
+        re.MULTILINE,
+    )
+    found["rust/Cargo.lock"] = match[1] if match else "<missing>"
+
+    for where, value in found.items():
+        if value != expected:
+            raise BumpError(f"{where}: expected {expected}, found {value}")
+
+    # Check 2: exactly one dated section, the same predicate release.yml applies.
+    changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
+    dated = changelog.count(f"\n## [{expected}] - ")
+    if dated != 1:
+        raise BumpError(
+            f"CHANGELOG.md: expected exactly 1 dated section for {expected}, found {dated}"
+        )
+
+    # Check 4: the six install pins and the hard-coded assertion.
+    for relative, template in [*_PIN_SITES, _ASSERTION_SITE]:
+        text = (root / relative).read_text(encoding="utf-8")
+        if text.count(_render(template, target)) != 1:
+            raise BumpError(f"{relative}: not on version {expected}")
