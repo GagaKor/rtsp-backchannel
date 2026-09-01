@@ -12,10 +12,14 @@ expects, which is a condition a human has to look at.
 
 from __future__ import annotations
 
+import argparse
 import json
 import re
+import subprocess
+import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 GITHUB_REPO_URL = "https://github.com/GagaKor/rtsp-backchannel"
@@ -377,3 +381,114 @@ def verify(root: Path, target: Version) -> None:
         text = (root / relative).read_text(encoding="utf-8")
         if text.count(_render(template, target)) != 1:
             raise BumpError(f"{relative}: not on version {expected}")
+
+
+def _git(root: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", *args], cwd=root, capture_output=True, text=True, check=False
+    )
+    if result.returncode != 0:
+        raise BumpError(f"git {' '.join(args)} failed: {result.stderr.strip()}")
+    return result.stdout.strip()
+
+
+def _tag_exists(root: Path, tag: str) -> bool:
+    result = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", f"refs/tags/{tag}"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def last_released(root: Path, manifest: Version) -> Version | None:
+    """The version the last release actually shipped.
+
+    Normally the manifest holds it and release.yml tagged it. On a branch that
+    already carries a bump commit the manifest is ahead of every tag, so fall
+    back to the most recent tag reachable from HEAD. A repository with no tags
+    at all yields None and the caller scans the whole history.
+    """
+    if _tag_exists(root, f"v{manifest}"):
+        return manifest
+    result = subprocess.run(
+        ["git", "describe", "--tags", "--abbrev=0", "--match", "v*"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    return Version.parse(result.stdout.strip().removeprefix("v"))
+
+
+def commit_messages(root: Path, since: Version | None) -> list[str]:
+    """Full commit messages since a release, merges excluded.
+
+    Merge commits are the only non-conventional subjects in this history, and
+    NUL record separators keep multi-line bodies intact so a BREAKING CHANGE
+    footer is not split across records.
+    """
+    rev_range = f"v{since}..HEAD" if since is not None else "HEAD"
+    out = _git(root, "log", "--no-merges", "--format=%B%x00", rev_range)
+    return [message.strip() for message in out.split("\0") if message.strip()]
+
+
+def apply_bump(root: Path, *, today: str) -> dict:
+    manifest = read_manifest_version(root)
+    changelog = Changelog.parse((root / "CHANGELOG.md").read_text(encoding="utf-8"))
+
+    if not changelog.pending():
+        # The hand-written [Unreleased] section is what declares a release. An
+        # empty one means nothing to ship -- and after a bump it is empty, which
+        # is also what makes a re-run a no-op.
+        return {"bumped": False, "reason": "empty-unreleased", "version": str(manifest)}
+
+    released = last_released(root, manifest)
+    base = released if released is not None else manifest
+    level = level_from_commits(commit_messages(root, released), major=base.major)
+    target = base.bumped(level)
+
+    (root / "CHANGELOG.md").write_text(
+        changelog.promoted(target=target, last_released=base, today=today).render(),
+        encoding="utf-8",
+    )
+    rewrite_manifests(root, manifest, target)
+    rewrite_readme_pins(root, manifest, target)
+    rewrite_version_assertion(root, manifest, target)
+
+    verify(root, target)
+
+    return {
+        "bumped": True,
+        "level": level,
+        "previous": str(base),
+        "version": str(target),
+    }
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", default=".", help="repository root (default: %(default)s)")
+    parser.add_argument(
+        "--today",
+        default=None,
+        help="release date as YYYY-MM-DD (default: today, UTC)",
+    )
+    args = parser.parse_args(argv)
+
+    today = args.today or datetime.now(timezone.utc).date().isoformat()
+    try:
+        summary = apply_bump(Path(args.root), today=today)
+    except BumpError as error:
+        print(f"bump_version: {error}", file=sys.stderr)
+        return 1
+    print(json.dumps(summary))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,6 +1,8 @@
 """Tests for tools/bump_version.py."""
 
+import json
 import pathlib
+import subprocess
 import tempfile
 import unittest
 
@@ -9,7 +11,11 @@ from tools.bump_version import (
     Changelog,
     GITHUB_REPO_URL,
     Version,
+    apply_bump,
+    commit_messages,
+    last_released,
     level_from_commits,
+    main,
     read_manifest_version,
     rewrite_manifests,
     rewrite_readme_pins,
@@ -564,6 +570,220 @@ class GateVerification(unittest.TestCase):
             verify(self.root, Version.parse("0.3.1"))
 
         self.assertIn("README.md", str(caught.exception))
+
+
+def git(root: pathlib.Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", *args], cwd=root, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+def init_repo(root: pathlib.Path, *, version: str = "0.3.1", unreleased: str = "") -> None:
+    git(root, "init", "-q", "-b", "main")
+    git(root, "config", "user.email", "test@example.com")
+    git(root, "config", "user.name", "Test")
+    write_fixture_repo(root, version=version, unreleased=unreleased)
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", f"chore(release): {version}")
+    git(root, "tag", f"v{version}")
+
+
+def commit(root: pathlib.Path, subject: str, body: str = "") -> None:
+    message = f"{subject}\n\n{body}" if body else subject
+    (root / "noise.txt").write_text(subject, encoding="utf-8")
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", message)
+
+
+class GitIntegration(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = pathlib.Path(self._tmp.name)
+
+    def test_last_released_prefers_the_tag_matching_the_manifest(self):
+        init_repo(self.root)
+        self.assertEqual(last_released(self.root, Version.parse("0.3.1")), Version.parse("0.3.1"))
+
+    def test_last_released_falls_back_when_the_manifest_is_already_ahead(self):
+        init_repo(self.root)
+        self.assertEqual(last_released(self.root, Version.parse("0.4.0")), Version.parse("0.3.1"))
+
+    def test_last_released_is_none_without_tags(self):
+        git(self.root, "init", "-q", "-b", "main")
+        git(self.root, "config", "user.email", "t@e.com")
+        git(self.root, "config", "user.name", "T")
+        write_fixture_repo(self.root)
+        git(self.root, "add", "-A")
+        git(self.root, "commit", "-q", "-m", "init")
+
+        self.assertIsNone(last_released(self.root, Version.parse("0.3.1")))
+
+    def test_commit_messages_excludes_merges_and_reads_full_bodies(self):
+        init_repo(self.root)
+        commit(self.root, "fix(vigi): a fix")
+        commit(self.root, "refactor: move things", "BREAKING CHANGE: it moved.")
+
+        messages = commit_messages(self.root, Version.parse("0.3.1"))
+
+        self.assertEqual(len(messages), 2)
+        self.assertIn("BREAKING CHANGE: it moved.", messages[0] + messages[1])
+
+
+class ApplyBump(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = pathlib.Path(self._tmp.name)
+
+    def test_empty_unreleased_yields_no_bump_and_touches_nothing(self):
+        init_repo(self.root)
+        commit(self.root, "feat(cli): add a flag")
+        before = {
+            str(p.relative_to(self.root)): p.read_bytes()
+            for p in self.root.rglob("*")
+            if p.is_file() and ".git" not in p.parts
+        }
+
+        result = apply_bump(self.root, today="2026-09-01")
+
+        self.assertEqual(result, {"bumped": False, "reason": "empty-unreleased", "version": "0.3.1"})
+        after = {
+            str(p.relative_to(self.root)): p.read_bytes()
+            for p in self.root.rglob("*")
+            if p.is_file() and ".git" not in p.parts
+        }
+        self.assertEqual(before, after)
+
+    def test_feature_commit_produces_a_minor_bump(self):
+        init_repo(self.root, unreleased="### Added\n\n- A transport.")
+        commit(self.root, "feat(cli): add --transport")
+
+        result = apply_bump(self.root, today="2026-09-01")
+
+        self.assertEqual(result["bumped"], True)
+        self.assertEqual(result["level"], "minor")
+        self.assertEqual(result["previous"], "0.3.1")
+        self.assertEqual(result["version"], "0.4.0")
+        self.assertEqual(read_manifest_version(self.root), Version.parse("0.4.0"))
+        self.assertIn("rtsp-backchannel@^0.4", (self.root / "README.md").read_text())
+
+    def test_fix_only_produces_a_patch_bump_and_leaves_readmes_alone(self):
+        init_repo(self.root, unreleased="### Fixed\n\n- A bug.")
+        before = (self.root / "README.md").read_bytes()
+        commit(self.root, "fix(vigi): a fix")
+
+        result = apply_bump(self.root, today="2026-09-01")
+
+        self.assertEqual(result["version"], "0.3.2")
+        self.assertEqual((self.root / "README.md").read_bytes(), before)
+
+    def test_result_satisfies_the_release_gate(self):
+        init_repo(self.root, unreleased="### Added\n\n- A transport.")
+        commit(self.root, "feat(cli): add --transport")
+
+        apply_bump(self.root, today="2026-09-01")
+
+        verify(self.root, Version.parse("0.4.0"))
+
+    def test_promoted_changelog_is_dated_and_unreleased_is_emptied(self):
+        init_repo(self.root, unreleased="### Added\n\n- A transport.")
+        commit(self.root, "feat(cli): add --transport")
+
+        apply_bump(self.root, today="2026-09-01")
+
+        text = (self.root / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertIn("## [0.4.0] - 2026-09-01", text)
+        self.assertIn("## [Unreleased]\n\n## [0.4.0]", text)
+        self.assertIn("- A transport.", text)
+
+    def test_rerunning_with_no_new_work_changes_nothing(self):
+        init_repo(self.root, unreleased="### Added\n\n- A transport.")
+        commit(self.root, "feat(cli): add --transport")
+        apply_bump(self.root, today="2026-09-01")
+        after_first = {
+            str(p.relative_to(self.root)): p.read_bytes()
+            for p in self.root.rglob("*")
+            if p.is_file() and ".git" not in p.parts
+        }
+
+        result = apply_bump(self.root, today="2026-09-02")
+
+        self.assertEqual(result["bumped"], False)
+        after_second = {
+            str(p.relative_to(self.root)): p.read_bytes()
+            for p in self.root.rglob("*")
+            if p.is_file() and ".git" not in p.parts
+        }
+        self.assertEqual(after_first, after_second)
+
+    def test_rerun_with_a_feature_raises_a_staged_patch_to_a_minor(self):
+        init_repo(self.root, unreleased="### Fixed\n\n- A bug.")
+        commit(self.root, "fix(vigi): a fix")
+        apply_bump(self.root, today="2026-09-01")
+        self.assertEqual(read_manifest_version(self.root), Version.parse("0.3.2"))
+
+        # The pull request gains a feature and a fresh changelog entry.
+        path = self.root / "CHANGELOG.md"
+        path.write_text(
+            path.read_text(encoding="utf-8").replace(
+                "## [Unreleased]\n\n", "## [Unreleased]\n\n### Added\n\n- A flag.\n\n", 1
+            ),
+            encoding="utf-8",
+        )
+        git(self.root, "add", "-A")
+        git(self.root, "commit", "-q", "-m", "chore(release): bump version to 0.3.2")
+        commit(self.root, "feat(cli): add --transport")
+
+        result = apply_bump(self.root, today="2026-09-02")
+
+        self.assertEqual(result["version"], "0.4.0")
+        self.assertEqual(read_manifest_version(self.root), Version.parse("0.4.0"))
+        text = path.read_text(encoding="utf-8")
+        self.assertEqual(text.count("## [0.4.0] - "), 1)
+        self.assertNotIn("## [0.3.2]", text)
+        self.assertIn("- A bug.", text)
+        self.assertIn("- A flag.", text)
+        self.assertIn("rtsp-backchannel@^0.4", (self.root / "README.md").read_text())
+        verify(self.root, Version.parse("0.4.0"))
+
+
+class CommandLine(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = pathlib.Path(self._tmp.name)
+
+    def test_prints_a_json_summary_and_exits_zero(self):
+        import contextlib
+        import io
+
+        init_repo(self.root, unreleased="### Added\n\n- A transport.")
+        commit(self.root, "feat(cli): add --transport")
+
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = main(["--root", str(self.root), "--today", "2026-09-01"])
+
+        self.assertEqual(code, 0)
+        summary = json.loads(stdout.getvalue())
+        self.assertEqual(summary["bumped"], True)
+        self.assertEqual(summary["version"], "0.4.0")
+
+    def test_reports_a_bad_tree_on_stderr_and_exits_nonzero(self):
+        import contextlib
+        import io
+
+        init_repo(self.root, unreleased="### Added\n\n- A transport.")
+        (self.root / "rust" / "README.md").write_text("# no pin\n", encoding="utf-8")
+        commit(self.root, "feat(cli): add --transport")
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            code = main(["--root", str(self.root), "--today", "2026-09-01"])
+
+        self.assertEqual(code, 1)
+        self.assertIn("README.md", stderr.getvalue())
 
 
 if __name__ == "__main__":
