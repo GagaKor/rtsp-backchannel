@@ -4,6 +4,7 @@ export type { PlaybackDependencies, PlaybackOptions } from './cli.ts';
 export {
   PACKET_MS,
   SAMPLE_RATE,
+  BackchannelUnavailableError,
   openBackchannel,
   sendPacedFrames,
   sendPacedG711,
@@ -11,8 +12,17 @@ export {
 export type {
   BackchannelOptions,
   BackchannelSession,
+  BackchannelTransport,
   PacingClock,
 } from './backchannel.ts';
+export { openVigiControl, VigiControlError } from './vigi/control.ts';
+export type {
+  VigiAudioCapability,
+  VigiControlOptions,
+  VigiControlSession,
+} from './vigi/control.ts';
+export { createVigiTalkSession } from './vigi/talk.ts';
+export type { VigiTalkMode, VigiTalkOptions, VigiTalkSession } from './vigi/talk.ts';
 
 export {
   aacRfc3640Payload,
@@ -40,6 +50,7 @@ export type {
 
 export { getCameraCapabilities } from './onvif/capabilities.ts';
 export type {
+  CameraCapabilityAudioSend,
   CameraCapabilityOptions,
   CameraCapabilityProfile,
   CameraCapabilityReport,

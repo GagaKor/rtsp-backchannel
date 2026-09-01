@@ -32,7 +32,7 @@ Discovery, capability reporting, and stream URI lookup do not require FFmpeg.
 Install a released version from PyPI:
 
 ```bash
-python3 -m pip install 'rtsp-backchannel>=0.3,<0.4'
+python3 -m pip install 'rtsp-backchannel>=0.4,<0.5'
 ```
 
 To install the current `master` source instead of a registry release:
@@ -394,6 +394,13 @@ only as `SOAP Fault: Fault`.
 `timeout` applies per request; because one report performs multiple requests,
 its total elapsed time can exceed one timeout interval.
 
+This package's `get_camera_capabilities` does not include the TypeScript
+package's default audio-send probe described in the root
+[README.md](https://github.com/GagaKor/rtsp-backchannel/blob/master/README.md#camera-capability-reports):
+there is no `probe_audio_send` option, no `audio_send` field on
+`CameraCapabilityReport`, and no extra ONVIF or VIGI OpenAPI round trip
+performed here. This call's cost and behavior are unchanged.
+
 ### `open_ptz_session`
 
 ```python
@@ -466,9 +473,19 @@ finally:
     session.close()
 ```
 
-**Experimental.** Verified: session open, capability guarding, request
-construction, timeout inclusion, and stop-on-close. Unverified: that a
-camera physically moves as intended — no PTZ hardware was available.
+**Experimental.** Physical movement is now verified, against one camera: a
+TP-Link VIGI C540V (firmware 2.2.0 and 2.3.3), where `relativeMove`,
+`continuousMove`,
+and `absoluteMove` each moved the camera in the requested direction on both
+pan/tilt and zoom, `getStatus` tracked every move, and an `absoluteMove` back
+to the starting coordinates restored them exactly. Session open, capability
+guarding, request construction, timeout inclusion, and stop-on-close remain
+covered by tests. Unverified beyond that one model — no camera with optical
+zoom (the C540V's is digital) or with mechanical preset tours has been
+exercised. That camera also rejects any sub-second `Timeout`, so
+`continuousMove` with `timeoutMs` under 1000 fails on it; whole seconds are
+sent as `PT1S` rather than `PT1.000S` precisely because it rejects the
+decimal point.
 
 ### `play_file`
 
@@ -515,6 +532,28 @@ result = play_file(
 Embedded credentials are parsed automatically; explicit non-empty arguments
 override them. Prefer `%40` for `@` in a password. Raw `@` uses the final
 authority separator. Request URIs and logs strip credentials.
+
+### Audio Send Transports
+
+The TypeScript package in this repository added a second audio-send
+transport alongside the ONVIF backchannel: TP-Link's VIGI OpenAPI `talk`
+protocol, selected with `transport: 'auto' | 'onvif' | 'vigi'` (`--transport`
+on its CLI). It targets cameras that have a working speaker but no working
+ONVIF backchannel — confirmed, for example, on a TP-Link VIGI C540V whose
+ONVIF answers a backchannel `DESCRIBE` with a receive-only track and reports
+no audio output configuration, yet whose VIGI OpenAPI speaker plays audio
+normally. `'auto'` tries ONVIF first and only falls back to VIGI when the
+camera's SDP has no sendonly track; every other failure still propagates.
+See the root
+[README.md](https://github.com/GagaKor/rtsp-backchannel/blob/master/README.md#audio-send-transports)
+for the full details, including the OpenAPI setup step and its G.711-only,
+model-dependent nature.
+
+This Python package does not implement that transport. `play_file` and the
+lower-level RTSP backchannel support here speak ONVIF backchannel only —
+there is no `transport` argument and no VIGI fallback. A camera whose only
+working audio-send path is VIGI OpenAPI cannot be reached from this package
+today.
 
 ## CLI
 

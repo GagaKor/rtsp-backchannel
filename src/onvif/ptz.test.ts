@@ -20,7 +20,8 @@ const MEDIA1_NS = 'http://www.onvif.org/ver10/media/wsdl';
 const MEDIA2_NS = 'http://www.onvif.org/ver20/media/wsdl';
 const PTZ_NS = 'http://www.onvif.org/ver20/ptz/wsdl';
 
-const GET_SERVICES = `<GetServices xmlns="${DEV_NS}"/>`;
+const GET_SERVICES =
+  `<GetServices xmlns="${DEV_NS}"><IncludeCapability>false</IncludeCapability></GetServices>`;
 const GET_NODES = `<GetNodes xmlns="${PTZ_NS}"/>`;
 const MEDIA1_GET_PROFILES = `<GetProfiles xmlns="${MEDIA1_NS}"/>`;
 const MEDIA2_GET_PROFILES = `<GetProfiles xmlns="${MEDIA2_NS}"><Type>All</Type></GetProfiles>`;
@@ -38,26 +39,45 @@ test('formats PTZ numbers as fixed six-decimal strings', () => {
   );
 });
 
-test('formats PTZ durations as fixed three-decimal seconds', () => {
-  assert.equal(formatPtzDuration(1000), 'PT1.000S');
+test('formats whole-second PTZ durations without a fraction and the rest to three decimals', () => {
+  assert.equal(formatPtzDuration(1000), 'PT1S');
+  assert.equal(formatPtzDuration(2000), 'PT2S');
   assert.equal(formatPtzDuration(1500), 'PT1.500S');
   assert.equal(formatPtzDuration(250), 'PT0.250S');
+  // The whole-second test must be applied to the rendered three-decimal text,
+  // not to the raw quotient: 999.9999 ms renders as "1.000", so deciding on
+  // the quotient emitted PT1.000S -- the one spelling the strict gSOAP stack
+  // rejects, for a value PT1S expresses exactly.
+  assert.equal(formatPtzDuration(999.9999), 'PT1S');
+  assert.equal(formatPtzDuration(1000.0001), 'PT1S');
+  assert.equal(formatPtzDuration(1), 'PT0.001S');
+  // A timeout that cannot render as a non-zero guard is rejected rather than
+  // emitted: PT0.000S is a camera-side stop deadline of zero, so a crashed
+  // client would leave the camera moving indefinitely.
+  assert.throws(
+    () => formatPtzDuration(0.4),
+    /PTZ timeout must be finite and at least 1 ms/,
+  );
+  assert.throws(
+    () => formatPtzDuration(0.9999),
+    /PTZ timeout must be finite and at least 1 ms/,
+  );
   assert.throws(
     () => formatPtzDuration(0),
-    { message: 'PTZ timeout must be finite and greater than 0' },
+    { message: 'PTZ timeout must be finite and at least 1 ms' },
   );
   assert.throws(
     () => formatPtzDuration(-1),
-    { message: 'PTZ timeout must be finite and greater than 0' },
+    { message: 'PTZ timeout must be finite and at least 1 ms' },
   );
   assert.throws(
     () => formatPtzDuration(Number.NaN),
-    { message: 'PTZ timeout must be finite and greater than 0' },
+    { message: 'PTZ timeout must be finite and at least 1 ms' },
   );
 });
 
 test('rejects a PTZ duration above the 60000ms ceiling but accepts the boundary', () => {
-  assert.equal(formatPtzDuration(60_000), 'PT60.000S');
+  assert.equal(formatPtzDuration(60_000), 'PT60S');
   assert.throws(
     () => formatPtzDuration(60_001),
     { message: 'PTZ timeout must not exceed 60000 ms' },
@@ -214,7 +234,7 @@ test('sends every continuous move with an explicit timeout', async () => {
   await session.continuousMove({ panTilt: { x: 0.5, y: -0.25 } });
 
   const move = calls.at(-1)!.body;
-  assert.match(move, /<Timeout>PT1\.000S<\/Timeout>/);
+  assert.match(move, /<Timeout>PT1S<\/Timeout>/);
   assert.match(move, /x="0\.500000"/);
   assert.match(move, /y="-0\.250000"/);
 });
@@ -748,7 +768,7 @@ test('continuousMove sends an explicit per-call timeout in the body', async () =
   // The Timeout element is the runaway guard: it must reach the wire as the
   // value the caller actually asked for, not a hardcoded default. Every
   // other test in this suite uses the 1000ms default, so without this test
-  // a hardcoded PT1.000S could pass the whole suite undetected.
+  // a hardcoded PT1S could pass the whole suite undetected.
   const calls: RecordedPtzCall[] = [];
   const session = await openPtzSessionWithDependencies(
     { host: 'camera', user: 'operator', pass: 'secret' },

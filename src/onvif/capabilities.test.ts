@@ -15,7 +15,13 @@ import {
   parseScopesResponse,
   parseServicesResponse,
   selectService,
+  OnvifResponseError,
+  probeOnvifBackchannelWithDependencies,
+  type BackchannelProbeDependencies,
+  type BackchannelProbeRtsp,
   type CameraCapabilityDependencies,
+  type CameraCapabilityOptions,
+  type CameraCapabilityReport,
 } from './capabilities.ts';
 
 const SOAP_NS = 'http://www.w3.org/2003/05/soap-envelope';
@@ -629,6 +635,11 @@ function fakeCapabilityDependencies(
         return respond(body, endpoint);
       },
     }),
+    // Fixture tests are about the ONVIF facts above; default the audioSend
+    // probes to a quiet "no answer" so they never add unexpected warnings
+    // or network attempts. Tests that care override these explicitly.
+    probeOnvifBackchannel: async () => false,
+    probeVigiTalk: async () => false,
   };
 }
 
@@ -668,6 +679,40 @@ async function assertCanonicalAuthFailure(
   assert.deepEqual(calls.map(({ body }) => body), [GET_SCOPES, GET_SERVICES]);
 }
 
+/**
+ * Builds a report using the same fake-device plumbing as every other test
+ * here. None of the ONVIF SOAP calls are stubbed to succeed — every one
+ * throws and is absorbed as an ordinary warning by the existing enrichment
+ * try/catches — so each test can focus purely on the two audioSend probes
+ * it injects, which run only after every other fact-gathering step has
+ * already failed or succeeded.
+ */
+function capabilityReportWithProbes(
+  probes: Pick<CameraCapabilityDependencies, 'probeOnvifBackchannel' | 'probeVigiTalk'>,
+  options: Partial<CameraCapabilityOptions> = {},
+  device: { manufacturer?: string; model?: string } = VIGI_DEVICE,
+): Promise<CameraCapabilityReport> {
+  const calls: RecordedCapabilityCall[] = [];
+  const dependencies: CameraCapabilityDependencies = {
+    ...fakeCapabilityDependencies(
+      calls,
+      async () => { throw new Error('onvif call not stubbed for audioSend fixture'); },
+      { connect: async () => device },
+    ),
+    ...probes,
+  };
+  return getCameraCapabilitiesWithDependencies({ host: 'camera', ...options }, dependencies);
+}
+
+/**
+ * The VIGI probe is gated on vendor evidence, so audioSend tests that want it
+ * to run must report hardware that names itself. Tests about the gate itself
+ * pass one of the other two explicitly.
+ */
+const VIGI_DEVICE = { manufacturer: 'TP-LINK', model: 'VIGI C540V' };
+const OTHER_VENDOR_DEVICE = { manufacturer: 'AXIS', model: 'P3245' };
+const ANONYMOUS_DEVICE = {};
+
 test('orchestrates exact authenticated bodies and routes advertised services deterministically', async () => {
   const calls: RecordedCapabilityCall[] = [];
   const createCalls: unknown[] = [];
@@ -705,6 +750,7 @@ test('orchestrates exact authenticated bodies and routes advertised services det
     throw new Error(`unexpected fake operation: ${body} at ${endpoint}`);
   });
   const wrappedDependencies: CameraCapabilityDependencies = {
+    ...dependencies,
     createDevice: (host, user, pass, options) => {
       createCalls.push({ host, user, pass, options });
       return dependencies.createDevice(host, user, pass, options);
@@ -1125,6 +1171,10 @@ test('retains cross-host advertised XAddr facts but warns without contacting the
       user: 'viewer',
       pass: 'camera-secret',
       deviceUrls: [`http://127.0.0.1:${deviceAddress.port}/onvif/device_service`],
+      // This test is about ONVIF service-discovery safety, not audioSend;
+      // disable the probes so the real default dependencies never open a
+      // second device connection or dispatch real network I/O to VIGI.
+      probeAudioSend: false,
     });
 
     assert.equal(report.device.manufacturer, 'Acme & Co');
@@ -1232,12 +1282,358 @@ test('capability report matches shared cross-language fixture', async () => {
       pass: 'camera-secret',
       deviceUrls: [`${baseUrl}/device`],
       timeoutMs: 2_000,
+      // audioSend is TypeScript-only so far; the shared fixture (consumed
+      // by the Rust parity test too) does not describe it. Disable the
+      // probes here and compare the rest of the report exactly.
+      probeAudioSend: false,
     });
 
     assert.deepEqual(operationsSeen, expectedOperations);
-    assert.deepEqual(JSON.parse(JSON.stringify(report)), fixture.expectedReport);
+    assert.deepEqual(JSON.parse(JSON.stringify(report)), {
+      ...(fixture.expectedReport as object),
+      audioSend: { detected: null, transport: null, onvifBackchannel: null, vigiTalk: null },
+    });
   } finally {
     await new Promise<void>((resolve, reject) =>
       server.close((error) => (error ? reject(error) : resolve())));
   }
+});
+
+test('reports an ONVIF backchannel as the audio-send transport', async () => {
+  const report = await capabilityReportWithProbes({
+    probeOnvifBackchannel: async () => true,
+    probeVigiTalk: async () => { throw new Error('must not be probed'); },
+  });
+  assert.deepEqual(report.audioSend, {
+    detected: true, transport: 'onvif', onvifBackchannel: true, vigiTalk: null,
+  });
+});
+
+test('falls through to VIGI when no sendonly track is offered', async () => {
+  const report = await capabilityReportWithProbes({
+    probeOnvifBackchannel: async () => false,
+    probeVigiTalk: async () => true,
+  });
+  assert.deepEqual(report.audioSend, {
+    detected: true, transport: 'vigi', onvifBackchannel: false, vigiTalk: true,
+  });
+});
+
+test('reports no audio-send path when neither transport answers', async () => {
+  const report = await capabilityReportWithProbes({
+    probeOnvifBackchannel: async () => false,
+    probeVigiTalk: async () => false,
+  });
+  assert.deepEqual(report.audioSend, {
+    detected: false, transport: null, onvifBackchannel: false, vigiTalk: false,
+  });
+});
+
+test('a failed ONVIF probe warns, skips VIGI entirely, and leaves every fact null', async () => {
+  // A probe that throws has not proven anything — not even that ONVIF lacks
+  // a backchannel. Falling through to VIGI here would fire a credential-
+  // bearing doAuth against a password ONVIF never validated (VIGI hardware
+  // configures the OpenAPI admin account separately from the ONVIF
+  // account), advancing the device's lockout counter. See capabilities.ts.
+  const report = await capabilityReportWithProbes({
+    probeOnvifBackchannel: async () => { throw new Error('describe blew up'); },
+    probeVigiTalk: async () => { throw new Error('must not be probed'); },
+  });
+  assert.equal(report.audioSend.onvifBackchannel, null);
+  assert.equal(report.audioSend.vigiTalk, null);
+  assert.equal(report.audioSend.detected, null);
+  assert.equal(report.audioSend.transport, null);
+  assert.ok(report.warnings.some((w) => w.operation === 'AudioSendProbe'));
+});
+
+test('a failed VIGI probe warns and leaves detected null rather than false', async () => {
+  // The ONVIF fact is established (no sendonly track), but the VIGI probe
+  // never answered, so "this camera cannot receive audio" is unproven. A
+  // false here is the exact false negative this module exists to prevent:
+  // a caller reading detected === false stops looking for a speaker that
+  // may well be there.
+  const report = await capabilityReportWithProbes({
+    probeOnvifBackchannel: async () => false,
+    probeVigiTalk: async () => { throw new Error('doAuth timed out'); },
+  });
+  assert.deepEqual(report.audioSend, {
+    detected: null, transport: null, onvifBackchannel: false, vigiTalk: null,
+  });
+  assert.ok(report.warnings.some((w) => w.operation === 'AudioSendProbe'));
+});
+
+test('an auth-classified probe failure warns instead of discarding the report', async () => {
+  // `warn` re-throws authentication failures so that bad credentials fail fast
+  // rather than yielding a report made entirely of warnings. The audioSend
+  // probes must not inherit that: the device already connected with these
+  // credentials, so `ter:NotAuthorized` from GetStreamUri is a fact about one
+  // operation's permissions, and the report is already fully assembled by the
+  // time the probe runs. Aborting here throws away work that succeeded.
+  const report = await capabilityReportWithProbes({
+    probeOnvifBackchannel: async () => {
+      throw new OnvifResponseError('fault', 'SOAP Fault: ter:NotAuthorized', 'Unauthorized');
+    },
+    probeVigiTalk: async () => { throw new Error('must not be probed'); },
+  });
+  assert.deepEqual(report.audioSend, {
+    detected: null, transport: null, onvifBackchannel: null, vigiTalk: null,
+  });
+  assert.ok(report.warnings.some((w) => w.operation === 'AudioSendProbe'));
+});
+
+test('an auth-classified VIGI probe failure also warns instead of aborting', async () => {
+  const report = await capabilityReportWithProbes({
+    probeOnvifBackchannel: async () => false,
+    probeVigiTalk: async () => {
+      throw new OnvifResponseError('fault', 'SOAP Fault: ter:NotAuthorized', 'Unauthorized');
+    },
+  });
+  assert.equal(report.audioSend.onvifBackchannel, false);
+  assert.equal(report.audioSend.detected, null);
+  assert.ok(report.warnings.some((w) => w.operation === 'AudioSendProbe'));
+});
+
+test('auto mode sends no doAuth to hardware that names another vendor', async () => {
+  // The VIGI probe is not a read-only question: it performs a credential-
+  // bearing doAuth against a port that counts failures toward a device-side
+  // lockout, using a password ONVIF never validated (the OpenAPI admin
+  // account is configured separately). Firing that at an Axis camera spends
+  // a lockout attempt on an API the device cannot even have.
+  let probed = false;
+  const report = await capabilityReportWithProbes(
+    {
+      probeOnvifBackchannel: async () => false,
+      probeVigiTalk: async () => { probed = true; return true; },
+    },
+    {},
+    OTHER_VENDOR_DEVICE,
+  );
+  assert.equal(probed, false);
+  // ONVIF was the only candidate transport for this camera and it answered
+  // no, so "no audio-send path" is established rather than merely unproven.
+  assert.deepEqual(report.audioSend, {
+    detected: false, transport: null, onvifBackchannel: false, vigiTalk: null,
+  });
+});
+
+test('auto mode probes hardware that names itself TP-Link VIGI', async () => {
+  const report = await capabilityReportWithProbes(
+    { probeOnvifBackchannel: async () => false, probeVigiTalk: async () => true },
+    {},
+    VIGI_DEVICE,
+  );
+  assert.deepEqual(report.audioSend, {
+    detected: true, transport: 'vigi', onvifBackchannel: false, vigiTalk: true,
+  });
+});
+
+test('auto mode leaves detected null when the device names no vendor at all', async () => {
+  // "We could not tell" must not collapse into "not VIGI": a camera that
+  // answered GetDeviceInformation sparsely would become a false negative.
+  let probed = false;
+  const report = await capabilityReportWithProbes(
+    {
+      probeOnvifBackchannel: async () => false,
+      probeVigiTalk: async () => { probed = true; return true; },
+    },
+    {},
+    ANONYMOUS_DEVICE,
+  );
+  assert.equal(probed, false);
+  assert.deepEqual(report.audioSend, {
+    detected: null, transport: null, onvifBackchannel: false, vigiTalk: null,
+  });
+});
+
+test("probeVigiTalk 'always' probes a device that names another vendor", async () => {
+  const report = await capabilityReportWithProbes(
+    { probeOnvifBackchannel: async () => false, probeVigiTalk: async () => true },
+    { probeVigiTalk: 'always' },
+    OTHER_VENDOR_DEVICE,
+  );
+  assert.deepEqual(report.audioSend, {
+    detected: true, transport: 'vigi', onvifBackchannel: false, vigiTalk: true,
+  });
+});
+
+test("probeVigiTalk 'never' leaves the OpenAPI port alone and detected unproven", async () => {
+  // Opting out is not evidence of absence: the caller declined to look, so
+  // detected stays null rather than becoming false.
+  let probed = false;
+  const report = await capabilityReportWithProbes(
+    {
+      probeOnvifBackchannel: async () => false,
+      probeVigiTalk: async () => { probed = true; return true; },
+    },
+    { probeVigiTalk: 'never' },
+    VIGI_DEVICE,
+  );
+  assert.equal(probed, false);
+  assert.deepEqual(report.audioSend, {
+    detected: null, transport: null, onvifBackchannel: false, vigiTalk: null,
+  });
+});
+
+test('probeAudioSend false leaves every audioSend fact null and runs no probe', async () => {
+  let probed = false;
+  const report = await capabilityReportWithProbes(
+    {
+      probeOnvifBackchannel: async () => { probed = true; return true; },
+      probeVigiTalk: async () => { probed = true; return true; },
+    },
+    { probeAudioSend: false },
+  );
+  assert.equal(probed, false);
+  assert.deepEqual(report.audioSend, {
+    detected: null, transport: null, onvifBackchannel: null, vigiTalk: null,
+  });
+});
+
+/**
+ * The ONVIF backchannel probe had no coverage at all: it constructed
+ * OnvifDevice and RtspClient directly, so every test had to stub the whole
+ * probe out and its profile selection, DESCRIBE handling and socket cleanup
+ * went unexercised.
+ */
+interface ProbeCalls {
+  devices: Array<{ host: string; user: string; pass: string }>;
+  rtsp: Array<{ host: string; port: number; user: string; pass: string; timeoutMs?: number }>;
+  /** Profile tokens the probe asked for a stream URI, in order. */
+  streamUriTokens: string[];
+  described: string[];
+  closes: number;
+}
+
+function sdp(direction: 'sendonly' | 'recvonly' | undefined): string {
+  const attrs = direction ? `a=${direction}\r\n` : '';
+  return 'v=0\r\no=- 0 0 IN IP4 cam\r\ns=-\r\n'
+    + 'm=video 0 RTP/AVP 96\r\na=control:track1\r\n'
+    + `m=audio 0 RTP/AVP 8\r\na=control:track2\r\n${attrs}`;
+}
+
+function probeHarness(
+  calls: ProbeCalls,
+  overrides: {
+    profiles?: () => Promise<{ token: string }[]>;
+    streamUri?: string;
+    describe?: BackchannelProbeRtsp['describe'];
+    rtspConnect?: () => Promise<void>;
+  } = {},
+): BackchannelProbeDependencies {
+  return {
+    createDevice: (host, user, pass) => {
+      calls.devices.push({ host, user, pass });
+      return {
+        connect: async () => ({}),
+        getProfiles: overrides.profiles ?? (async () => [{ token: 'p1' }, { token: 'p2' }]),
+        getStreamUri: async (token) => {
+          calls.streamUriTokens.push(token);
+          return overrides.streamUri ?? 'rtsp://cam:554/stream1';
+        },
+      };
+    },
+    createRtsp: (host, port, user, pass, timeoutMs) => {
+      calls.rtsp.push({ host, port, user, pass, ...(timeoutMs !== undefined ? { timeoutMs } : {}) });
+      return {
+        connect: overrides.rtspConnect ?? (async () => {}),
+        describe: overrides.describe
+          ?? (async (uri) => {
+            calls.described.push(uri);
+            return { status: 200, statusLine: 'RTSP/1.0 200 OK', body: sdp('sendonly') };
+          }),
+        close: () => { calls.closes += 1; },
+      };
+    },
+  };
+}
+
+function emptyCalls(): ProbeCalls {
+  return { devices: [], rtsp: [], streamUriTokens: [], described: [], closes: 0 };
+}
+
+test('the backchannel probe reports a sendonly audio track as usable', async () => {
+  const calls = emptyCalls();
+  const found = await probeOnvifBackchannelWithDependencies(
+    'cam', 'admin', 'secret', { timeoutMs: 4000 }, probeHarness(calls),
+  );
+  assert.equal(found, true);
+  assert.deepEqual(calls.devices, [{ host: 'cam', user: 'admin', pass: 'secret' }]);
+  // The first profile is the one used -- not the last, and not a search across
+  // all of them, which would multiply the probe's cost by the profile count.
+  assert.deepEqual(calls.streamUriTokens, ['p1']);
+  assert.deepEqual(calls.rtsp, [
+    { host: 'cam', port: 554, user: 'admin', pass: 'secret', timeoutMs: 4000 },
+  ]);
+  assert.deepEqual(calls.described, ['rtsp://cam:554/stream1']);
+  assert.equal(calls.closes, 1);
+});
+
+test('the backchannel probe reports a recvonly-only camera as unusable', async () => {
+  const calls = emptyCalls();
+  const found = await probeOnvifBackchannelWithDependencies(
+    'cam', 'admin', 'secret', {},
+    probeHarness(calls, {
+      describe: async () => ({
+        status: 200, statusLine: 'RTSP/1.0 200 OK', body: sdp('recvonly'),
+      }),
+    }),
+  );
+  // An answer, not a failure: this is the fact the VIGI fall-through needs.
+  assert.equal(found, false);
+  assert.equal(calls.closes, 1);
+});
+
+test('the backchannel probe rejects a camera with no media profiles', async () => {
+  const calls = emptyCalls();
+  await assert.rejects(
+    probeOnvifBackchannelWithDependencies(
+      'cam', 'admin', 'secret', {}, probeHarness(calls, { profiles: async () => [] }),
+    ),
+    /no media profiles/,
+  );
+  // No RTSP socket is opened, so there is nothing to leak.
+  assert.deepEqual(calls.rtsp, []);
+  assert.equal(calls.closes, 0);
+});
+
+test('the backchannel probe surfaces a non-200 DESCRIBE and still closes', async () => {
+  const calls = emptyCalls();
+  await assert.rejects(
+    probeOnvifBackchannelWithDependencies(
+      'cam', 'admin', 'secret', {},
+      probeHarness(calls, {
+        describe: async () => ({
+          status: 401, statusLine: 'RTSP/1.0 401 Unauthorized', body: '',
+        }),
+      }),
+    ),
+    /backchannel DESCRIBE RTSP\/1\.0 401 Unauthorized/,
+  );
+  assert.equal(calls.closes, 1, 'the socket is closed on the failure path too');
+});
+
+test('the backchannel probe closes the socket when connect itself throws', async () => {
+  // The finally block is the only thing standing between a probe that runs on
+  // every getCameraCapabilities call and a leaked socket per failure.
+  const calls = emptyCalls();
+  await assert.rejects(
+    probeOnvifBackchannelWithDependencies(
+      'cam', 'admin', 'secret', {},
+      probeHarness(calls, { rtspConnect: async () => { throw new Error('ECONNREFUSED'); } }),
+    ),
+    /ECONNREFUSED/,
+  );
+  assert.equal(calls.closes, 1);
+});
+
+test('the backchannel probe takes credentials from the stream URI when it carries them', async () => {
+  const calls = emptyCalls();
+  await probeOnvifBackchannelWithDependencies(
+    'cam', 'admin', 'secret', {},
+    probeHarness(calls, { streamUri: 'rtsp://other:9554/stream9' }),
+  );
+  assert.deepEqual(calls.rtsp, [
+    { host: 'other', port: 9554, user: 'admin', pass: 'secret' },
+  ]);
+  assert.deepEqual(calls.described, ['rtsp://other:9554/stream9']);
 });

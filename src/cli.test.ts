@@ -46,6 +46,8 @@ test('documents the capabilities command in global and command help without expo
     assert.match(result.stdout, /--pass <password>/);
     assert.match(result.stdout, /--device-url <url>/);
     assert.match(result.stdout, /--timeout-ms <ms>/);
+    assert.match(result.stdout, /--probe-audio-send/);
+    assert.match(result.stdout, /--probe-vigi-talk/);
     assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /help-only-secret/);
   }
 });
@@ -247,6 +249,21 @@ test('accepts only public codec preference values', () => {
   );
 });
 
+test('accepts only public transport preference values', () => {
+  const required = ['--host', 'camera', '--file', 'event.mp3'];
+  const transports = ['auto', 'onvif', 'vigi'];
+  for (const transport of transports) {
+    const parsed = cli.parseCliArgs([...required, '--transport', transport]) as unknown as {
+      transport?: string;
+    };
+    assert.equal(parsed.transport, transport);
+  }
+  assert.throws(
+    () => cli.parseCliArgs([...required, '--transport', 'nope']),
+    /transport must be one of/,
+  );
+});
+
 test('uses ONVIF_PASSWORD when --pass is omitted', () => {
   type Parsed = { pass: string };
   type Parser = (argv: string[]) => Parsed;
@@ -366,7 +383,7 @@ test('passes codec preference through negotiation and sends codec-neutral file f
         host: string,
         user?: string,
         pass?: string,
-        options?: { codec?: string },
+        options?: { codec?: string; transport?: string },
       ): Promise<{
         codec: typeof codec;
         payloadType: number;
@@ -422,8 +439,75 @@ test('passes codec preference through negotiation and sends codec-neutral file f
     host: 'rtsp://embedded:secret@camera/live',
     user: '',
     pass: '',
-    options: { codec: 'g726-32' },
+    options: { codec: 'g726-32', transport: 'auto' },
   }]);
+});
+
+test('playFile passes the transport through to openBackchannel', async () => {
+  const seen: Array<Record<string, unknown>> = [];
+  const dependencies: PublicPlaybackDependencies = {
+    openBackchannel: async (_host, _user, _pass, options) => {
+      seen.push({ ...options });
+      return {
+        codec: { name: 'pcma', payloadType: 8, encoding: 'PCMA', clockRate: 8000 },
+        payloadType: 8,
+        clockRate: 8000,
+        rtpChannel: 0,
+        send: async () => 1,
+        close: async () => {},
+      };
+    },
+    fileToG711,
+    fileToRtpAudio: async () => ({
+      codec: 'pcma',
+      clockRate: 8000,
+      frames: [{ payload: Buffer.alloc(160), samples: 160 }],
+      byteLength: 160,
+      sampleCount: 160,
+    }),
+    log: () => {},
+  };
+
+  await cli.playFile({ host: 'cam', file: '/tmp/a.wav', transport: 'vigi' }, dependencies);
+
+  assert.equal(seen[0].transport, 'vigi');
+});
+
+test('playFile defaults the transport to auto', async () => {
+  const seen: Array<Record<string, unknown>> = [];
+  const dependencies: PublicPlaybackDependencies = {
+    openBackchannel: async (_host, _user, _pass, options) => {
+      seen.push({ ...options });
+      return {
+        codec: { name: 'pcma', payloadType: 8, encoding: 'PCMA', clockRate: 8000 },
+        payloadType: 8,
+        clockRate: 8000,
+        rtpChannel: 0,
+        send: async () => 1,
+        close: async () => {},
+      };
+    },
+    fileToG711,
+    fileToRtpAudio: async () => ({
+      codec: 'pcma',
+      clockRate: 8000,
+      frames: [{ payload: Buffer.alloc(160), samples: 160 }],
+      byteLength: 160,
+      sampleCount: 160,
+    }),
+    log: () => {},
+  };
+
+  await cli.playFile({ host: 'cam', file: '/tmp/a.wav' }, dependencies);
+
+  assert.equal(seen[0].transport, 'auto');
+});
+
+test('the play command rejects an unknown --transport value', () => {
+  assert.throws(
+    () => cli.parseCliArgs(['--host', 'cam', '--file', '/tmp/a.wav', '--transport', 'nope']),
+    /transport must be one of/,
+  );
 });
 
 test('keeps the RTSP session alive while codec-neutral file encoding runs', async () => {
@@ -816,6 +900,67 @@ test('invokes capabilities exactly once and logs the native report as one JSON l
   assert.doesNotMatch(logs[0] ?? '', /command-only-secret/);
 });
 
+test('threads --probe-audio-send through to getCameraCapabilities and rejects other values', async () => {
+  const logs: string[] = [];
+  const dependencies = commandDependencies(logs);
+  const calls: unknown[] = [];
+  dependencies.getCameraCapabilities = async (options) => {
+    calls.push(options);
+    return {};
+  };
+
+  for (const value of ['true', 'false']) {
+    await commandMain()(
+      ['capabilities', '--host', 'camera.local', '--probe-audio-send', value],
+      dependencies,
+    );
+  }
+
+  assert.deepEqual(calls, [
+    { host: 'camera.local', user: '', pass: '', probeAudioSend: true },
+    { host: 'camera.local', user: '', pass: '', probeAudioSend: false },
+  ]);
+
+  await assert.rejects(
+    commandMain()(
+      ['capabilities', '--host', 'camera.local', '--probe-audio-send', 'yes'],
+      dependencies,
+    ),
+    /probe-audio-send must be one of: true, false/,
+  );
+});
+
+test('threads --probe-vigi-talk through to getCameraCapabilities and rejects other values', async () => {
+  const logs: string[] = [];
+  const dependencies = commandDependencies(logs);
+  const calls: unknown[] = [];
+  dependencies.getCameraCapabilities = async (options) => {
+    calls.push(options);
+    return {};
+  };
+
+  for (const value of ['auto', 'always', 'never']) {
+    await commandMain()(
+      ['capabilities', '--host', 'camera.local', '--probe-vigi-talk', value],
+      dependencies,
+    );
+  }
+
+  assert.deepEqual(calls, [
+    { host: 'camera.local', user: '', pass: '', probeVigiTalk: 'auto' },
+    { host: 'camera.local', user: '', pass: '', probeVigiTalk: 'always' },
+    { host: 'camera.local', user: '', pass: '', probeVigiTalk: 'never' },
+  ]);
+
+  await assert.rejects(
+    commandMain()(
+      ['capabilities', '--host', 'camera.local', '--probe-vigi-talk', 'true'],
+      dependencies,
+    ),
+    /probe-vigi-talk must be one of: auto, always, never/,
+  );
+});
+
 test('applies capability credential defaults and omits absent optional client settings', async () => {
   const previous = process.env.ONVIF_PASSWORD;
   const logs: string[] = [];
@@ -959,6 +1104,28 @@ test('rejects missing or flag-shaped values for every capability option', async 
     {
       option: 'timeout-ms',
       argv: ['capabilities', '--host', 'camera.local', '--timeout-ms', '-h'],
+    },
+    {
+      option: 'probe-vigi-talk',
+      argv: ['capabilities', '--host', 'camera.local', '--probe-vigi-talk'],
+    },
+    {
+      option: 'probe-audio-send',
+      argv: ['capabilities', '--host', 'camera.local', '--probe-audio-send'],
+    },
+    {
+      option: 'probe-audio-send',
+      argv: ['capabilities', '--host', 'camera.local', '--probe-audio-send', ''],
+    },
+    {
+      option: 'probe-audio-send',
+      argv: [
+        'capabilities', '--host', 'camera.local', '--probe-audio-send', '--user', 'operator',
+      ],
+    },
+    {
+      option: 'probe-audio-send',
+      argv: ['capabilities', '--host', 'camera.local', '--probe-audio-send', '-h'],
     },
   ];
 

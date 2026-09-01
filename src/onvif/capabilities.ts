@@ -14,6 +14,10 @@ import {
   textOf,
   type XmlElement,
 } from './xml.ts';
+import { parseRtspTarget } from '../backchannel.ts';
+import { RtspClient } from '../rtsp/backchannelClient.ts';
+import { findBackchannelAudio, parseSdp } from '../rtsp/sdp.ts';
+import { openVigiControl } from '../vigi/control.ts';
 
 const SOAP_12_NS = 'http://www.w3.org/2003/05/soap-envelope';
 const SOAP_11_NS = 'http://schemas.xmlsoap.org/soap/envelope/';
@@ -31,7 +35,30 @@ export interface CameraCapabilityOptions {
   pass?: string;
   deviceUrls?: string[];
   timeoutMs?: number;
+  /** Probe whether ONVIF backchannel or VIGI talk can send audio. Default true. */
+  probeAudioSend?: boolean;
+  /**
+   * How to decide whether to ask the VIGI OpenAPI control channel about a
+   * speaker once ONVIF has reported no backchannel. Default `'auto'`.
+   *
+   * This probe is not the read-only question the ONVIF one is: it performs a
+   * credential-bearing `doAuth` against a port that counts failed attempts
+   * toward a device-side lockout, and on VIGI hardware the OpenAPI admin
+   * account is configured separately from the ONVIF account -- so a
+   * successful ONVIF exchange does not prove the password it would send.
+   *
+   * - `'auto'`   probe only when device information names TP-Link/VIGI
+   *              hardware, so cameras that cannot have the API are never
+   *              touched.
+   * - `'always'` probe regardless, for VIGI devices that report an
+   *              unexpected manufacturer.
+   * - `'never'`  leave the OpenAPI port alone entirely.
+   */
+  probeVigiTalk?: VigiTalkProbeMode;
 }
+
+/** @internal */
+export type VigiTalkProbeMode = 'auto' | 'always' | 'never';
 
 export interface CameraCapabilityService {
   namespace: string;
@@ -55,6 +82,13 @@ export interface CameraCapabilityWarning {
   message: string;
 }
 
+export interface CameraCapabilityAudioSend {
+  detected: boolean | null;
+  transport: 'onvif' | 'vigi' | null;
+  onvifBackchannel: boolean | null;
+  vigiTalk: boolean | null;
+}
+
 export interface CameraCapabilityReport {
   device: DeviceInfo;
   scopes: string[];
@@ -75,6 +109,7 @@ export interface CameraCapabilityReport {
     encodings: string[];
     h265Supported: boolean | null;
   };
+  audioSend: CameraCapabilityAudioSend;
   warnings: CameraCapabilityWarning[];
 }
 
@@ -586,6 +621,20 @@ export interface CameraCapabilityDependencies {
     pass: string,
     options: OnvifOptions,
   ): CameraCapabilityDevice;
+  /** Whether the camera offers a usable ONVIF backchannel sendonly audio track. */
+  probeOnvifBackchannel(
+    host: string,
+    user: string,
+    pass: string,
+    options: OnvifOptions,
+  ): Promise<boolean>;
+  /** Whether the VIGI OpenAPI reports a speaker (audio send via VIGI talk). */
+  probeVigiTalk(
+    host: string,
+    user: string,
+    pass: string,
+    options: OnvifOptions,
+  ): Promise<boolean>;
 }
 
 class OnvifHttpError extends Error {
@@ -595,8 +644,152 @@ class OnvifHttpError extends Error {
   }
 }
 
+/**
+ * Opens a fresh ONVIF device/media session and performs a backchannel
+ * DESCRIBE, exactly as `openOnvifBackchannel` does, but stops after reading
+ * the SDP instead of proceeding to SETUP/PLAY: this probe only answers
+ * "is a sendonly audio track offered", it never sends audio. The RTSP
+ * socket is always closed before returning, whether the probe succeeds or
+ * throws, so a failed probe cannot leak a socket.
+ */
+/** @internal The media calls the backchannel probe makes on a device. */
+export interface BackchannelProbeDevice {
+  connect(): Promise<unknown>;
+  getProfiles(): Promise<{ token: string }[]>;
+  getStreamUri(profileToken: string): Promise<string>;
+}
+
+/** @internal The RTSP calls the backchannel probe makes. */
+export interface BackchannelProbeRtsp {
+  connect(): Promise<void>;
+  describe(
+    uri: string,
+    opts: { backchannel?: boolean },
+  ): Promise<{ status: number; statusLine: string; body: string }>;
+  close(): void;
+}
+
+/**
+ * @internal Exported for tests; the probe's two transports are injected.
+ *
+ * Deliberately separate from `CameraCapabilityDependencies.createDevice`.
+ * `CameraCapabilityDevice` exposes only `connect`, `connectedMediaUrl` and
+ * `serviceCall`, while this probe needs `getProfiles` and `getStreamUri` —
+ * routing it through that factory would mean adding both to an interface the
+ * main path never calls them on, so every existing test double would grow two
+ * methods to satisfy a caller it does not exercise. Each seam stays narrowed
+ * to what its own caller uses.
+ */
+export interface BackchannelProbeDependencies {
+  createDevice(
+    host: string,
+    user: string,
+    pass: string,
+    options: OnvifOptions,
+  ): BackchannelProbeDevice;
+  createRtsp(
+    host: string,
+    port: number,
+    user: string,
+    pass: string,
+    timeoutMs: number | undefined,
+  ): BackchannelProbeRtsp;
+}
+
+const defaultProbeTransports: BackchannelProbeDependencies = {
+  createDevice: (host, user, pass, options) => new OnvifDevice(host, user, pass, options),
+  createRtsp: (host, port, user, pass, timeoutMs) =>
+    new RtspClient(host, port, user, pass, timeoutMs),
+};
+
+/** @internal */
+export async function probeOnvifBackchannelWithDependencies(
+  host: string,
+  user: string,
+  pass: string,
+  options: OnvifOptions,
+  dependencies: BackchannelProbeDependencies,
+): Promise<boolean> {
+  const device = dependencies.createDevice(host, user, pass, options);
+  await device.connect();
+  const profiles = await device.getProfiles();
+  if (profiles.length === 0) throw new Error('no media profiles');
+  const endpoint = parseRtspTarget(await device.getStreamUri(profiles[0].token), user, pass);
+  const rtsp = dependencies.createRtsp(
+    endpoint.host, endpoint.port, endpoint.user, endpoint.pass, options.timeoutMs,
+  );
+  try {
+    await rtsp.connect();
+    const desc = await rtsp.describe(endpoint.uri, { backchannel: true });
+    if (desc.status !== 200) throw new Error(`backchannel DESCRIBE ${desc.statusLine}`);
+    const track = findBackchannelAudio(parseSdp(desc.body));
+    return Boolean(track?.control);
+  } finally {
+    rtsp.close();
+  }
+}
+
+function defaultProbeOnvifBackchannel(
+  host: string,
+  user: string,
+  pass: string,
+  options: OnvifOptions,
+): Promise<boolean> {
+  return probeOnvifBackchannelWithDependencies(
+    host, user, pass, options, defaultProbeTransports,
+  );
+}
+
+/** Asks the VIGI OpenAPI control channel whether the device reports a speaker. */
+async function defaultProbeVigiTalk(
+  host: string,
+  _user: string,
+  pass: string,
+  options: OnvifOptions,
+): Promise<boolean> {
+  // The ONVIF username is deliberately not forwarded. VigiControlOptions
+  // documents `admin` as the only OpenAPI account, so passing an arbitrary
+  // ONVIF name (`--user viewer`) turns a probe that might have succeeded into
+  // a guaranteed failed auth attempt against the device's lockout counter.
+  // openVigiBackchannel keeps `user || 'admin'` because there the caller
+  // explicitly asked for VIGI and may legitimately name another account; this
+  // is an automatic probe nobody asked for.
+  const control = await openVigiControl({
+    host,
+    pass,
+    ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+  });
+  const capability = await control.getAudioCapability();
+  return capability.speaker;
+}
+
+/**
+ * TP-Link ships the VIGI line under both spellings of its own name and puts
+ * `VIGI` in the model string, so either field is enough to identify it.
+ */
+const VIGI_VENDOR_PATTERN = /tp[-\s]?link|vigi/i;
+
+/**
+ * Whether device information identifies TP-Link VIGI hardware: `true` when a
+ * vendor string names it, `false` when the device names some other vendor,
+ * and `null` when it reported neither a manufacturer nor a model.
+ *
+ * The `null` case is the point of returning three values rather than two.
+ * "We could not tell" must not collapse into "not VIGI", or a camera that
+ * simply answered GetDeviceInformation sparsely becomes a false negative --
+ * the failure mode the whole audioSend block exists to prevent.
+ */
+/** @internal Exported for src/audiocheck.ts, which needs the same gate. */
+export function vigiHardwareLikelihood(device: DeviceInfo): boolean | null {
+  const vendor = [device.manufacturer, device.model].filter(Boolean).join(' ');
+  if (vendor === '') return null;
+  return VIGI_VENDOR_PATTERN.test(vendor);
+}
+
 const defaultDependencies: CameraCapabilityDependencies = {
   createDevice: (host, user, pass, options) => new OnvifDevice(host, user, pass, options),
+  probeOnvifBackchannel: defaultProbeOnvifBackchannel,
+  probeVigiTalk: defaultProbeVigiTalk,
 };
 
 const GET_SCOPES = `<GetScopes xmlns="${DEV_NS}"/>`;
@@ -685,6 +878,19 @@ export async function getCameraCapabilitiesWithDependencies(
   const warnings: CameraCapabilityWarning[] = [];
   const warn = (operation: string, error: unknown) => {
     if (isAuthenticationFailure(error)) throw error;
+    warnings.push({ operation, message: sanitizedWarningMessage(error) });
+  };
+  /**
+   * Records a warning for an operation that must never abort the report, even
+   * on an authentication failure. Reserved for the optional `audioSend`
+   * probes: the device client has already completed `connect()` with these
+   * credentials, so an auth-classified probe error is a fact about one
+   * operation's permissions rather than evidence the session is unusable —
+   * and by the time the probes run the report is already fully assembled, so
+   * there is nothing left to fail fast for. Every genuine ONVIF service call
+   * above uses `warn`, which keeps its fail-fast contract.
+   */
+  const warnOnly = (operation: string, error: unknown) => {
     warnings.push({ operation, message: sanitizedWarningMessage(error) });
   };
   const call = async <T>(
@@ -795,6 +1001,84 @@ export async function getCameraCapabilitiesWithDependencies(
       .map((profile) => profile.token),
   )].sort(compareText);
 
+  // Optional enrichment, run only after every ONVIF fact above has been
+  // collected. The ONVIF probe is free: it reuses credentials connect() has
+  // already proven and stops at the SDP without sending audio.
+  //
+  // The VIGI probe is not. It issues a credential-bearing doAuth against a
+  // port that counts failed attempts toward a device-side lockout, and on
+  // VIGI hardware the OpenAPI admin account is configured separately from the
+  // ONVIF account -- so a successful ONVIF exchange does NOT prove the
+  // password this probe would send. Two gates follow from that:
+  //
+  //   1. onvifBackchannel === false, an affirmative "ONVIF answered and
+  //      offered no sendonly track", never merely "not true". A probe that
+  //      threw established nothing, so it must not trigger a doAuth.
+  //   2. `probeVigiTalk` (default 'auto'), which consults device information
+  //      so the great majority of cameras -- ones that cannot have the
+  //      OpenAPI at all -- are never touched.
+  //
+  // Whenever a gate stops the probe without ruling VIGI out, every audioSend
+  // field it would have set stays null. Reporting `detected: false` from an
+  // unproven state is the false negative this block exists to prevent.
+  const audioSend: CameraCapabilityAudioSend = {
+    detected: null, transport: null, onvifBackchannel: null, vigiTalk: null,
+  };
+  if (options.probeAudioSend ?? true) {
+    try {
+      audioSend.onvifBackchannel = await dependencies.probeOnvifBackchannel(
+        options.host, user, pass, clientOptions,
+      );
+    } catch (error) {
+      warnOnly('AudioSendProbe', error);
+    }
+    if (audioSend.onvifBackchannel === true) {
+      audioSend.detected = true;
+      audioSend.transport = 'onvif';
+    } else if (audioSend.onvifBackchannel === false) {
+      const mode = options.probeVigiTalk ?? 'auto';
+      // 'never' maps to null, not false: the caller declining to look is not
+      // evidence that the OpenAPI speaker is absent, so it must leave
+      // `detected` unproven exactly as an unknown vendor does.
+      const applicable: boolean | null = mode === 'always' ? true
+        : mode === 'never' ? null
+          : vigiHardwareLikelihood(device);
+      if (applicable === true) {
+        try {
+          audioSend.vigiTalk = await dependencies.probeVigiTalk(
+            options.host, user, pass, clientOptions,
+          );
+        } catch (error) {
+          warnOnly('AudioSendProbe', error);
+        }
+        if (audioSend.vigiTalk === true) {
+          audioSend.detected = true;
+          audioSend.transport = 'vigi';
+        } else if (audioSend.vigiTalk === false) {
+          // Both transports answered and neither offers a path: the only
+          // state in which "no audio send" is an established fact.
+          audioSend.detected = false;
+        }
+      } else if (applicable === false) {
+        // Device information names a vendor that is not TP-Link, so the VIGI
+        // OpenAPI cannot apply: ONVIF was the only candidate transport for
+        // this camera and it answered no. That settles the question without
+        // spending a doAuth attempt on an API the device cannot have.
+        audioSend.detected = false;
+      }
+      // else: applicable === null -- the vendor is unknown or the caller opted
+      // out. VIGI was not ruled out, only left unexamined, so detected stays
+      // null rather than claiming a fact nothing established.
+      // else: vigiTalk === null (the probe threw) — ONVIF proved there is no
+      // sendonly track, but nothing proved the absence of a VIGI speaker, so
+      // detected stays null. Reporting false here would be the same false
+      // negative this whole audioSend block exists to eliminate.
+    }
+    // else: onvifBackchannel === null (the probe threw) — the ONVIF fact
+    // itself could not be established, so VIGI must not be attempted and
+    // every audioSend field beyond onvifBackchannel stays null.
+  }
+
   return {
     device,
     scopes,
@@ -815,6 +1099,7 @@ export async function getCameraCapabilitiesWithDependencies(
       encodings,
       h265Supported,
     },
+    audioSend,
     warnings,
   };
 }

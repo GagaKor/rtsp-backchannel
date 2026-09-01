@@ -12,10 +12,11 @@ import {
   redactRtspCredentials,
   SAMPLE_RATE,
   type BackchannelSession,
+  type BackchannelTransport,
 } from './backchannel.ts';
 import { fileToG711, fileToRtpAudio } from './audio/transcode.ts';
 import { pathToFileURL } from 'node:url';
-import { getCameraCapabilities } from './onvif/capabilities.ts';
+import { getCameraCapabilities, type VigiTalkProbeMode } from './onvif/capabilities.ts';
 import { discoverDevices } from './onvif/discovery.ts';
 import { getStreamUris } from './onvif/streams.ts';
 import type { CodecPreference } from './rtsp/sdp.ts';
@@ -34,6 +35,7 @@ Options:
   --user <name>       ONVIF/RTSP user
   --pass <password>   ONVIF/RTSP password (or set ONVIF_PASSWORD)
   --codec <name>      auto|pcma|pcmu|g726-16|g726-24|g726-32|g726-40|aac
+  --transport <name>  auto|onvif|vigi (default: auto)
   --volume <0..1>     linear volume (default: 0.05)
 
 Discovery options:
@@ -44,8 +46,11 @@ Discovery options:
   --timeout-ms <ms>   discovery timeout (default: 3000)
 
 Capability options:
-  --device-url <url>  ONVIF Device Service URL (repeatable)
-  --timeout-ms <ms>   finite positive per-request timeout (maximum: 86,400,000 ms)
+  --device-url <url>      ONVIF Device Service URL (repeatable)
+  --timeout-ms <ms>       finite positive per-request timeout (maximum: 86,400,000 ms)
+  --probe-audio-send <b>  true|false, probe ONVIF/VIGI audio-send support (default: true)
+  --probe-vigi-talk <m>   auto|always|never, when to ask the VIGI OpenAPI
+                          control channel about a speaker (default: auto)
 
 Playback profile: SDP codec negotiation, TCP interleaved RTP, real-time pacing.
 `;
@@ -60,6 +65,7 @@ const CODEC_PREFERENCES: readonly CodecPreference[] = [
   'g726-40',
   'aac',
 ];
+const TRANSPORTS: readonly BackchannelTransport[] = ['auto', 'onvif', 'vigi'];
 const MAX_CAPABILITY_TIMEOUT_MS = 86_400_000;
 const CAPABILITY_TIMEOUT_RANGE_ERROR = 'timeout-ms exceeds the 24-hour maximum';
 const CAPABILITY_TERMINATOR_ERROR = 'capabilities does not accept an argument terminator';
@@ -79,6 +85,7 @@ export interface PlaybackOptions {
   file: string;
   volume?: number;
   codec?: CodecPreference;
+  transport?: BackchannelTransport;
 }
 
 type PlaybackBackchannelSession = Omit<BackchannelSession, 'withKeepAlive'> & {
@@ -128,8 +135,16 @@ const CAPABILITY_OPTION_NAMES = [
   'pass',
   'device-url',
   'timeout-ms',
+  'probe-audio-send',
+  'probe-vigi-talk',
 ] as const;
 type CapabilityOptionName = typeof CAPABILITY_OPTION_NAMES[number];
+const PROBE_AUDIO_SEND_VALUES = ['true', 'false'] as const;
+const PROBE_AUDIO_SEND_RANGE_ERROR =
+  `probe-audio-send must be one of: ${PROBE_AUDIO_SEND_VALUES.join(', ')}`;
+const PROBE_VIGI_TALK_VALUES = ['auto', 'always', 'never'] as const;
+const PROBE_VIGI_TALK_RANGE_ERROR =
+  `probe-vigi-talk must be one of: ${PROBE_VIGI_TALK_VALUES.join(', ')}`;
 
 function exactCapabilityOptionName(value: string): CapabilityOptionName | undefined {
   return CAPABILITY_OPTION_NAMES.find((name) => value === `--${name}`);
@@ -162,6 +177,8 @@ interface ParsedCapabilityArguments {
   pass: string[];
   'device-url': string[];
   'timeout-ms': string[];
+  'probe-audio-send': string[];
+  'probe-vigi-talk': string[];
 }
 
 function parseCapabilityArguments(argv: string[]): ParsedCapabilityArguments {
@@ -178,6 +195,8 @@ function parseCapabilityArguments(argv: string[]): ParsedCapabilityArguments {
     pass: [],
     'device-url': [],
     'timeout-ms': [],
+    'probe-audio-send': [],
+    'probe-vigi-talk': [],
   };
   for (let index = 0; index < argv.length; index++) {
     const attached = attachedCapabilityOption(argv[index]);
@@ -222,6 +241,10 @@ export function parseCliArgs(argv: string[]): PlaybackOptions {
   if (!CODEC_PREFERENCES.includes(codecValue as CodecPreference)) {
     throw new RangeError(`codec must be one of: ${CODEC_PREFERENCES.join(', ')}`);
   }
+  const transportValue = arg(argv, 'transport', 'auto').toLowerCase();
+  if (!TRANSPORTS.includes(transportValue as BackchannelTransport)) {
+    throw new RangeError(`transport must be one of: ${TRANSPORTS.join(', ')}`);
+  }
   return {
     host: arg(argv, 'host'),
     user: arg(argv, 'user', ''),
@@ -229,6 +252,7 @@ export function parseCliArgs(argv: string[]): PlaybackOptions {
     file: arg(argv, 'file'),
     volume,
     codec: codecValue as CodecPreference,
+    transport: transportValue as BackchannelTransport,
   };
 }
 
@@ -243,9 +267,10 @@ export async function playFile(
     file,
     volume = 0.05,
     codec = 'auto',
+    transport = 'auto',
   } = options;
   dependencies.log(`# play "${file}" -> ${displayRtspTarget(host)} speaker (backchannel)`);
-  const session = await dependencies.openBackchannel(host, user, pass, { codec });
+  const session = await dependencies.openBackchannel(host, user, pass, { codec, transport });
   let sent = 0;
   let playbackFailed = false;
   let playbackError: unknown;
@@ -363,6 +388,8 @@ export async function main(
     const passwords = parsed.pass;
     const deviceUrls = parsed['device-url'];
     const timeoutValues = parsed['timeout-ms'];
+    const probeAudioSendValues = parsed['probe-audio-send'];
+    const probeVigiTalkValues = parsed['probe-vigi-talk'];
     if (hosts.length === 0) throw new Error('missing --host');
     const timeoutMs = timeoutValues.length > 0 ? Number(timeoutValues[0]) : undefined;
     if (timeoutMs !== undefined && (!Number.isFinite(timeoutMs) || timeoutMs <= 0)) {
@@ -371,12 +398,30 @@ export async function main(
     if (timeoutMs !== undefined && timeoutMs > MAX_CAPABILITY_TIMEOUT_MS) {
       throw new RangeError(CAPABILITY_TIMEOUT_RANGE_ERROR);
     }
+    let probeAudioSend: boolean | undefined;
+    if (probeAudioSendValues.length > 0) {
+      const value = probeAudioSendValues[0].toLowerCase();
+      if (!PROBE_AUDIO_SEND_VALUES.includes(value as typeof PROBE_AUDIO_SEND_VALUES[number])) {
+        throw new RangeError(PROBE_AUDIO_SEND_RANGE_ERROR);
+      }
+      probeAudioSend = value === 'true';
+    }
+    let probeVigiTalk: VigiTalkProbeMode | undefined;
+    if (probeVigiTalkValues.length > 0) {
+      const value = probeVigiTalkValues[0].toLowerCase();
+      if (!PROBE_VIGI_TALK_VALUES.includes(value as VigiTalkProbeMode)) {
+        throw new RangeError(PROBE_VIGI_TALK_RANGE_ERROR);
+      }
+      probeVigiTalk = value as VigiTalkProbeMode;
+    }
     const report = await dependencies.getCameraCapabilities({
       host: hosts[0],
       user: users[0] ?? '',
       pass: passwords.length > 0 ? passwords[0] : process.env.ONVIF_PASSWORD ?? '',
       ...(deviceUrls.length > 0 ? { deviceUrls } : {}),
       ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+      ...(probeAudioSend !== undefined ? { probeAudioSend } : {}),
+      ...(probeVigiTalk !== undefined ? { probeVigiTalk } : {}),
     });
     dependencies.log(JSON.stringify(report));
     return;

@@ -16,87 +16,36 @@ import {
 import { RtpPacketizer, interleave } from './rtp/sender.ts';
 import type { G711Variant } from './audio/g711.ts';
 import type { EncodedAudio, EncodedAudioFrame } from './audio/transcode.ts';
+import {
+  openVigiControl,
+  type VigiControlOptions,
+  type VigiControlSession,
+} from './vigi/control.ts';
+import {
+  createVigiTalkSession,
+  type VigiTalkOptions,
+  type VigiTalkSession,
+} from './vigi/talk.ts';
+import {
+  PACKET_MS,
+  SAMPLE_RATE,
+  sendPacedFrames,
+  sendPacedG711,
+  systemClock,
+  type PacingClock,
+} from './audio/pacing.ts';
 
-export const SAMPLE_RATE = 8000;
-export const PACKET_MS = 40;
-const SAMPLES_PER_PACKET = (SAMPLE_RATE * PACKET_MS) / 1000; // 320
-
-const sleep = (ms: number): Promise<void> =>
-  new Promise<void>((resolve) => setTimeout(resolve, Math.max(0, ms)));
-
-export interface PacingClock {
-  now(): number;
-  sleep(milliseconds: number): Promise<void>;
-}
-
-const systemClock: PacingClock = {
-  now: () => performance.now(),
-  sleep,
-};
-
-async function waitUntil(deadline: number, clock: PacingClock): Promise<number> {
-  let now = clock.now();
-  while (now < deadline) {
-    await clock.sleep(deadline - now);
-    now = clock.now();
-  }
-  return now;
-}
-
-/** Send timestamped frames without bursty catch-up after scheduler stalls. */
-export async function sendPacedFrames(
-  frames: Iterable<EncodedAudioFrame>,
-  clockRate: number,
-  sendPacket: (payload: Buffer, samples: number) => void | Promise<void>,
-  clock: PacingClock = systemClock,
-  beforePacket?: () => Promise<void>,
-): Promise<number> {
-  if (!Number.isFinite(clockRate) || clockRate <= 0) {
-    throw new RangeError('RTP clock rate must be finite and greater than 0');
-  }
-  let sent = 0;
-  let deadline = clock.now();
-  for (const frame of frames) {
-    if (!Number.isInteger(frame.samples) || frame.samples <= 0) {
-      throw new RangeError('audio frame samples must be a positive integer');
-    }
-    const durationMs = (frame.samples * 1000) / clockRate;
-    let actual = await waitUntil(deadline, clock);
-    if (beforePacket) {
-      await beforePacket();
-      actual = clock.now();
-    }
-    if (sent > 0 && actual - deadline >= durationMs) deadline = actual;
-
-    await sendPacket(frame.payload, frame.samples);
-    sent++;
-    deadline += durationMs;
-  }
-  if (sent > 0) await waitUntil(deadline, clock);
-  return sent;
-}
-
-/** Send G.711 as 40 ms packets without bursty catch-up after scheduler stalls. */
-export function sendPacedG711(
-  g711: Buffer,
-  sendPacket: (payload: Buffer) => void | Promise<void>,
-  clock: PacingClock = systemClock,
-  beforePacket?: () => Promise<void>,
-): Promise<number> {
-  function* frames(): Generator<EncodedAudioFrame> {
-    for (let offset = 0; offset < g711.length; offset += SAMPLES_PER_PACKET) {
-      const payload = g711.subarray(offset, offset + SAMPLES_PER_PACKET);
-      yield { payload, samples: payload.length };
-    }
-  }
-  return sendPacedFrames(
-    frames(),
-    SAMPLE_RATE,
-    (payload) => sendPacket(payload),
-    clock,
-    beforePacket,
-  );
-}
+// Pacing lives in ./audio/pacing.ts so that vigi/talk.ts can take
+// SAMPLE_RATE from there instead of from here. Importing it from this module
+// made backchannel.ts -> vigi/talk.ts -> backchannel.ts a load-time cycle.
+// Re-exported so this module's published surface is unchanged.
+export {
+  PACKET_MS,
+  SAMPLE_RATE,
+  sendPacedFrames,
+  sendPacedG711,
+  type PacingClock,
+} from './audio/pacing.ts';
 
 export interface BackchannelSession {
   /** Complete SDP codec selected for this RTP sender. */
@@ -113,8 +62,53 @@ export interface BackchannelSession {
   close(): Promise<void>;
 }
 
+export type BackchannelTransport = 'auto' | 'onvif' | 'vigi';
+
+/**
+ * The camera answered a backchannel DESCRIBE but offered no sendonly audio
+ * track. This is the one ONVIF outcome that `transport: 'auto'` treats as
+ * "try the other transport"; every other failure propagates, so a network or
+ * authentication fault is never reported as a missing vendor API.
+ */
+export class BackchannelUnavailableError extends Error {
+  readonly kind = 'no-sendonly-track' as const;
+  constructor() {
+    super('no sendonly backchannel audio track');
+    this.name = 'BackchannelUnavailableError';
+  }
+}
+
 export interface BackchannelOptions {
   codec?: CodecPreference;
+  transport?: BackchannelTransport;
+  /** VIGI OpenAPI control port. Defaults to 20443. */
+  vigiControlPort?: number;
+}
+
+/** @internal Exported for tests; the transport openers are injected. */
+export async function selectBackchannelTransport(
+  transport: BackchannelTransport,
+  openers: {
+    openOnvif(): Promise<BackchannelSession>;
+    openVigi(): Promise<BackchannelSession>;
+  },
+): Promise<BackchannelSession> {
+  if (transport === 'onvif') return openers.openOnvif();
+  if (transport === 'vigi') return openers.openVigi();
+  try {
+    return await openers.openOnvif();
+  } catch (error) {
+    if (!(error instanceof BackchannelUnavailableError)) throw error;
+    try {
+      return await openers.openVigi();
+    } catch (vigiError) {
+      const detail = vigiError instanceof Error ? vigiError.message : String(vigiError);
+      throw new Error(
+        'no audio send path: ONVIF backchannel absent (no sendonly track); '
+          + detail,
+      );
+    }
+  }
 }
 
 async function maintainRtspSession<T>(
@@ -326,7 +320,7 @@ export function resolveTrackUri(
   }
 }
 
-export async function openBackchannel(
+export async function openOnvifBackchannel(
   host: string,
   user = '',
   pass = '',
@@ -356,7 +350,7 @@ export async function openBackchannel(
     if (desc.status !== 200) throw new Error(`backchannel DESCRIBE ${desc.statusLine}`);
     const sdp = parseSdp(desc.body);
     const track = findBackchannelAudio(sdp);
-    if (!track?.control) throw new Error('no sendonly backchannel audio track');
+    if (!track?.control) throw new BackchannelUnavailableError();
     const preference = options.codec ?? 'auto';
     const codec = pickSendCodec(track, preference);
     if (!codec) {
@@ -486,4 +480,101 @@ export async function openBackchannel(
     rtsp.close();
     throw err;
   }
+}
+
+/**
+ * @internal Exported for tests: the VIGI control session and the talk
+ * session factory are injected instead of the real network-backed
+ * implementations, so `openVigiBackchannel`'s open-time codec/speaker
+ * checks and its `send` framing can be driven without a real device.
+ */
+export interface VigiBackchannelDependencies {
+  openVigiControl(options: VigiControlOptions): Promise<VigiControlSession>;
+  createVigiTalkSession(options: VigiTalkOptions): VigiTalkSession;
+}
+
+export async function openVigiBackchannel(
+  host: string,
+  user = '',
+  pass = '',
+  options: BackchannelOptions = {},
+): Promise<BackchannelSession> {
+  return openVigiBackchannelWithDependencies(host, user, pass, options, {
+    openVigiControl,
+    createVigiTalkSession,
+  });
+}
+
+/** @internal Exported for tests; see VigiBackchannelDependencies. */
+export async function openVigiBackchannelWithDependencies(
+  host: string,
+  user = '',
+  pass = '',
+  options: BackchannelOptions = {},
+  dependencies: VigiBackchannelDependencies,
+): Promise<BackchannelSession> {
+  const preference = options.codec ?? 'auto';
+  if (preference !== 'auto' && preference !== 'pcma') {
+    throw new Error(`VIGI talk supports G.711 a-law only, not ${preference}`);
+  }
+  const control = await dependencies.openVigiControl({
+    host,
+    user: user || 'admin',
+    pass,
+    ...(options.vigiControlPort === undefined
+      ? {}
+      : { port: options.vigiControlPort }),
+  });
+  const audio = await control.getAudioCapability();
+  if (!audio.speaker) throw new Error('VIGI OpenAPI reports no speaker');
+  const streamPort = await control.getStreamPort();
+  const talk = dependencies.createVigiTalkSession({
+    host, user: user || 'admin', pass, streamPort,
+  });
+
+  const codec: SendCodec = {
+    name: 'pcma',
+    payloadType: talk.payloadType,
+    encoding: 'PCMA',
+    clockRate: talk.clockRate,
+  };
+  return {
+    codec,
+    variant: 'PCMA',
+    payloadType: talk.payloadType,
+    clockRate: talk.clockRate,
+    rtpChannel: talk.rtpChannel,
+    // No keep-alive exists for a talk session, and none is needed: the stream
+    // socket is not opened until the first send.
+    withKeepAlive: (operation) => operation(),
+    async send(audioData: Buffer | EncodedAudio): Promise<number> {
+      if (Buffer.isBuffer(audioData)) return talk.send(audioData);
+      if (audioData.codec !== codec.name || audioData.clockRate !== codec.clockRate) {
+        throw new Error(
+          `encoded audio ${audioData.codec}/${audioData.clockRate} does not match ` +
+            `${codec.name}/${codec.clockRate}`,
+        );
+      }
+      // EncodedAudio has no single `data` buffer, only per-packet frames.
+      // Flattening frames and letting talk.send re-cut them at 160 bytes is
+      // lossless ONLY because PCMA is one byte per sample: there is no frame
+      // boundary to preserve. Do not reuse this concat-then-recut approach
+      // for AAC or G.726, where a frame is a decode unit and splitting it at
+      // an arbitrary byte offset would corrupt the audio.
+      return talk.send(Buffer.concat(audioData.frames.map((frame) => frame.payload)));
+    },
+    close: () => talk.close(),
+  };
+}
+
+export function openBackchannel(
+  host: string,
+  user = '',
+  pass = '',
+  options: BackchannelOptions = {},
+): Promise<BackchannelSession> {
+  return selectBackchannelTransport(options.transport ?? 'auto', {
+    openOnvif: () => openOnvifBackchannel(host, user, pass, options),
+    openVigi: () => openVigiBackchannel(host, user, pass, options),
+  });
 }

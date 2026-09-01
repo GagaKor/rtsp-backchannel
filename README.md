@@ -22,7 +22,8 @@ are implemented in TypeScript. FFmpeg is not bundled or installed by this packag
 
 ## Requirements
 
-- Node.js 22 or later
+- Node.js 22 or later to `import` the package; 22.12 or later to `require()` it
+  (see [Module Formats](#module-formats))
 - `ffmpeg` on `PATH` for file playback
 - A camera that exposes an ONVIF `sendonly` audio backchannel
 
@@ -37,7 +38,7 @@ npm install rtsp-backchannel
 To pin the current release line:
 
 ```bash
-npm install rtsp-backchannel@^0.3
+npm install rtsp-backchannel@^0.4
 ```
 
 To install the current `master` source instead of a registry release:
@@ -60,6 +61,80 @@ sudo apt-get install ffmpeg
 On Windows, install a build from the
 [FFmpeg download page](https://ffmpeg.org/download.html) and add the directory
 containing `ffmpeg.exe` to `PATH`.
+
+## Module Formats
+
+The package ships a single ES module build and is reachable from both module
+systems.
+
+```typescript
+// ES modules
+import { playFile } from 'rtsp-backchannel';
+```
+
+```javascript
+// CommonJS
+const { playFile } = require('rtsp-backchannel');
+```
+
+`require()` works because Node loads an ES module synchronously from CommonJS
+from 22.12.0 onward. Both entry points resolve to the same file, so a process
+never holds two copies of the library and its state.
+
+`engines` allows Node 22 and later, because `import` works on all of those. The
+22.12 floor applies only to `require()`: on an earlier 22.x, `require()` of this
+package fails with `ERR_REQUIRE_ESM`.
+
+### TypeScript and CommonJS
+
+A CommonJS TypeScript project needs `moduleResolution` set to `nodenext` (or
+`bundler`):
+
+```jsonc
+{ "compilerOptions": { "module": "nodenext", "moduleResolution": "nodenext" } }
+```
+
+Under `moduleResolution: node16`, importing this package from a CommonJS file
+raises `TS1479` ("the referenced file is an ECMAScript module and cannot be
+imported with 'require'"). `node16` has no model for Node's `require(esm)`, and
+the package ships one ES module rather than a second CommonJS declaration tree,
+so that setting cannot type-check against it. Runtime behaviour is unaffected —
+only the compile step.
+
+### `require()` returns a frozen namespace
+
+`require()` of an ES module yields Node's module namespace object, which is
+sealed. Reading exports works exactly as expected, but replacing one does not:
+
+```javascript
+const lib = require('rtsp-backchannel');
+
+lib.playFile;                    // fine
+lib.playFile = fake;             // TypeError in strict mode; silently ignored in sloppy mode
+jest.spyOn(lib, 'playFile');     // TypeError: Cannot redefine property: playFile
+```
+
+`sinon.stub(lib, 'playFile')` fails the same way. To substitute behaviour in
+tests, stub the boundary the library calls (`ffmpeg`, the socket) rather than
+the library's own exports, or use an ESM loader mock such as `esmock`.
+
+### Silencing MODULE_TYPELESS_PACKAGE_JSON
+
+Running an `import` statement from a `.js` file produces this warning:
+
+```
+[MODULE_TYPELESS_PACKAGE_JSON] Warning: Module type of file:///.../use.js is not
+specified and it doesn't parse as CommonJS. Reparsing as ES module because module
+syntax was detected. This incurs a performance overhead.
+```
+
+The warning is about the file being run, not about this package: Node found no
+`"type"` field in the nearest `package.json`, guessed CommonJS, failed, and
+reparsed. Any one of these resolves it:
+
+- add `"type": "module"` to your own `package.json`
+- rename the file to `.mjs`
+- use `require()` instead
 
 ## Quick Playback
 
@@ -360,6 +435,14 @@ The public report fields have these meanings:
   WSSE digest material, URL userinfo, or raw or real camera response payload.
   Initial connection and authentication failures are fatal; they reject the
   promise instead of becoming warnings.
+- `audioSend` reports which transport, if any, can deliver audio to the
+  camera. `onvifBackchannel` and `vigiTalk` are two separate tri-state facts,
+  not independent probes: `vigiTalk` is attempted (and otherwise stays
+  `null`) only once `onvifBackchannel` comes back a confirmed `false`, so a
+  camera with a working ONVIF backchannel never triggers a VIGI probe at
+  all. `transport` names whichever one succeeded (`'onvif'`, `'vigi'`, or
+  `null` if neither did), and `detected` is `true` only once one of them has.
+  See below for what this probe costs and how to turn it off.
 
 Authenticated service routing is anchored to the selected Device Service URL.
 The connected Media endpoint and every advertised Media1, Media2, or PTZ
@@ -388,6 +471,20 @@ certification.
 requests, so total elapsed time can exceed one timeout interval. Optional
 enrichment failures can add warnings and continue; they do not extend a single
 request's timeout.
+
+**By default, this call is more expensive than it looks.** `getCameraCapabilities`
+also probes whether the camera has a usable audio-send path, to populate
+`audioSend`. That probe is not another read against the connection already
+open above — it opens a second, fully authenticated ONVIF session from
+scratch (its own service discovery and login) purely to issue a real
+backchannel `DESCRIBE`, and only if that finds no sendonly track does it also
+attempt one VIGI OpenAPI `doAuth` handshake. Concretely: several extra SOAP
+round trips and one full ONVIF re-authentication and re-discovery on every
+default call, plus, for the common case of a camera with no ONVIF
+backchannel, one additional HTTPS request to a VIGI control port most
+cameras never answer. Pass `probeAudioSend: false` to skip all of it and
+leave `audioSend` at its neutral default (`detected`, `transport`,
+`onvifBackchannel`, and `vigiTalk` all `null`).
 
 ### PTZ Control
 
@@ -448,9 +545,19 @@ try {
 }
 ```
 
-**Experimental.** Verified: session open, capability guarding, request
-construction, timeout inclusion, and stop-on-close. Unverified: that a
-camera physically moves as intended — no PTZ hardware was available.
+**Experimental.** Physical movement is now verified, against one camera: a
+TP-Link VIGI C540V (firmware 2.2.0 and 2.3.3), where `relativeMove`,
+`continuousMove`,
+and `absoluteMove` each moved the camera in the requested direction on both
+pan/tilt and zoom, `getStatus` tracked every move, and an `absoluteMove` back
+to the starting coordinates restored them exactly. Session open, capability
+guarding, request construction, timeout inclusion, and stop-on-close remain
+covered by tests. Unverified beyond that one model — no camera with optical
+zoom (the C540V's is digital) or with mechanical preset tours has been
+exercised. That camera also rejects any sub-second `Timeout`, so
+`continuousMove` with `timeoutMs` under 1000 fails on it; whole seconds are
+sent as `PT1S` rather than `PT1.000S` precisely because it rejects the
+decimal point.
 
 ### Low-Level Backchannel API
 
@@ -507,6 +614,35 @@ const packetsSent = await playFile({
 Prefer `%40` for a password containing `@`. A raw `@` is interpreted using the
 final `@` in the authority. Request URIs and displayed errors strip embedded
 credentials.
+
+### Audio Send Transports
+
+`openBackchannel` and `playFile` accept a `transport` option —
+`'auto'` (the default), `'onvif'`, or `'vigi'` — and the CLI exposes the same
+choice as `--transport`. `'onvif'` and `'vigi'` each commit to one transport
+outright. `'auto'` tries the ONVIF backchannel first and falls back to VIGI
+only when the camera answered but its SDP offered no sendonly audio track;
+every other failure — a network error, a rejected credential, a malformed
+response — propagates instead of silently trying the other transport, so a
+broken camera is never mistaken for one that simply lacks a vendor API.
+
+The VIGI transport speaks TP-Link's VIGI OpenAPI `talk` protocol rather than
+an ONVIF backchannel, for cameras that have a working speaker but no working
+ONVIF backchannel. It requires OpenAPI to be turned on in the camera's own
+web UI, under Settings > Network Settings > OpenAPI, and connects to a
+control port that defaults to 20443. The transport carries G.711 a-law only;
+requesting an explicit non-G.711 codec over it fails when the session opens
+rather than being resampled or silently downgraded. The library never
+changes the device's own speaker volume — whatever level is set on the
+camera (80 out of 100 by default, which is loud indoors) is what plays, and
+adjusting it means using the camera's UI, not this library.
+
+Not every camera with a VIGI badge implements this API. TP-Link publishes the
+list of IPC and NVR models it covers at
+https://www.tp-link.com/en/vigi-open-api/product-list/; check a specific
+model against that list rather than assuming support from the brand alone.
+VIGI NVRs appear on that list too, but they speak a different, unrelated
+protocol and are out of scope for this transport.
 
 ## CLI
 

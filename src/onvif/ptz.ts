@@ -41,6 +41,7 @@ const DEFAULT_MOVE_TIMEOUT_MS = 1000;
 // unbounded timeout would let a single continuousMove keep a camera moving
 // for as long as the caller likes, with no ceiling on how long the
 // device-side stop-on-close backstop takes to kick in.
+const MIN_MOVE_TIMEOUT_MS = 1;
 const MAX_MOVE_TIMEOUT_MS = 60_000;
 const PAN_TILT_RANGE: readonly [number, number] = [-1, 1];
 /** Every zoom quantity is -1..1 except an absolute zoom *position*, which is 0..1. */
@@ -268,13 +269,29 @@ export function formatPtzNumber(value: number): string {
 
 /** @internal */
 export function formatPtzDuration(milliseconds: number): string {
-  if (!Number.isFinite(milliseconds) || milliseconds <= 0) {
-    throw new RangeError('PTZ timeout must be finite and greater than 0');
+  // The lower bound is 1 ms, not 0: anything smaller renders as PT0.000S, a
+  // device-side stop deadline of zero. `Timeout` is what makes a crashed
+  // client safe, so emitting a guard of zero is worse than refusing the value.
+  if (!Number.isFinite(milliseconds) || milliseconds < MIN_MOVE_TIMEOUT_MS) {
+    throw new RangeError('PTZ timeout must be finite and at least 1 ms');
   }
   if (milliseconds > MAX_MOVE_TIMEOUT_MS) {
     throw new RangeError('PTZ timeout must not exceed 60000 ms');
   }
-  return `PT${(milliseconds / 1000).toFixed(3)}S`;
+  // Whole seconds are emitted without a fraction: `PT1S`, not `PT1.000S`. Both are
+  // valid xs:duration, but a strict gSOAP stack (TP-Link VIGI C540V, firmware 2.2.0 and 2.3.3)
+  // rejects any decimal point with ter:InvalidArgVal, and the default move timeout is
+  // a whole second. Sub-second timeouts keep the fractional form — it is the only
+  // faithful representation, and such a camera rejects them either way.
+  //
+  // The test is on the *rendered* text, not on the raw quotient. Deciding on the
+  // quotient meant testing one value and printing another: 999.9999 ms has a
+  // non-integral quotient but renders as `1.000`, so it went out as PT1.000S —
+  // the one spelling this rule exists to avoid, for a value PT1S expresses
+  // exactly. See docs/decisions/2026-08-25-ptz-duration-decide-on-rendered-text.md.
+  const text = (milliseconds / 1000).toFixed(3);
+  const [whole, fraction] = text.split('.');
+  return fraction === '000' ? `PT${whole}S` : `PT${text}S`;
 }
 
 function vectorXml(tag: string, panTilt?: PtzVector, zoom?: number): string {
@@ -467,9 +484,13 @@ const defaultDependencies: PtzSessionDependencies = {
   createDevice: (host, user, pass, options) => new OnvifDevice(host, user, pass, options),
 };
 
-// Plain form, unlike capabilities.ts's IncludeCapability=true: this session only needs the
+// IncludeCapability=false, unlike capabilities.ts's true: this session only needs the
 // XAddr list, and capabilities would inflate the response against the shared 1MB body cap.
-const GET_SERVICES = `<GetServices xmlns="${DEV_NS}"/>`;
+// The element itself is not optional — it is minOccurs=1 in the Device WSDL, and a strict
+// gSOAP stack (TP-Link VIGI C540V, firmware 2.2.0 and 2.3.3) answers a bare
+// <GetServices/> with
+// HTTP 400 and a SOAP-ENV:Sender Fault, which used to fail openPtzSession outright.
+const GET_SERVICES = `<GetServices xmlns="${DEV_NS}"><IncludeCapability>false</IncludeCapability></GetServices>`;
 const GET_NODES = `<GetNodes xmlns="${PTZ_NS}"/>`;
 const MEDIA1_GET_PROFILES = `<GetProfiles xmlns="${MEDIA1_NS}"/>`;
 // Same body capabilities.ts sends for Media2 GetProfiles — not a second dialect.
@@ -596,10 +617,12 @@ class PtzSessionImpl implements PtzSession {
 /**
  * Open a PTZ control session.
  *
- * @experimental Physical movement is unverified against real PTZ hardware.
- * Request construction, capability guarding, the device-side move timeout,
- * and stop-on-close are covered by tests; that a camera actually moves as
- * intended is not.
+ * @experimental Physical movement is verified against one camera only — a
+ * TP-Link VIGI C540V, firmware 2.2.0 and 2.3.3, on which every move method moved
+ * pan/tilt and zoom in the requested direction and returned to its starting
+ * coordinates. Request construction, capability guarding, the device-side
+ * move timeout, and stop-on-close are covered by tests. No optical-zoom or
+ * preset-tour camera has been exercised.
  */
 export function openPtzSession(options: PtzSessionOptions): Promise<PtzSession> {
   return openPtzSessionWithDependencies(options, defaultDependencies);

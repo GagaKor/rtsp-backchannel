@@ -21,7 +21,8 @@ FFmpeg가 필요하며 GStreamer는 사용하지 않습니다.
 
 ## 요구 사항
 
-- Node.js 22 이상
+- 패키지를 `import`하려면 Node.js 22 이상, `require()`하려면 22.12 이상
+  ([모듈 형식](#모듈-형식) 참고)
 - 파일 재생 시 `PATH`에서 실행할 수 있는 `ffmpeg`
 - ONVIF `sendonly` 오디오 백채널을 제공하는 카메라
 
@@ -36,7 +37,7 @@ npm install rtsp-backchannel
 현재 릴리스 계열에 고정하려면 다음 명령을 사용합니다.
 
 ```bash
-npm install rtsp-backchannel@^0.3
+npm install rtsp-backchannel@^0.4
 ```
 
 Registry 릴리스 대신 현재 `master` 소스를 설치하려면 다음 명령을 사용합니다.
@@ -58,6 +59,78 @@ sudo apt-get install ffmpeg
 
 Windows에서는 [FFmpeg 다운로드 페이지](https://ffmpeg.org/download.html)에서 빌드를
 설치한 뒤 `ffmpeg.exe`가 있는 디렉터리를 `PATH`에 추가합니다.
+
+## 모듈 형식
+
+이 패키지는 ES 모듈 빌드 하나만 배포하며, 두 모듈 시스템 모두에서 불러올 수 있습니다.
+
+```typescript
+// ES 모듈
+import { playFile } from 'rtsp-backchannel';
+```
+
+```javascript
+// CommonJS
+const { playFile } = require('rtsp-backchannel');
+```
+
+`require()`가 동작하는 이유는 Node 22.12.0부터 CommonJS에서 ES 모듈을 동기적으로 불러올 수
+있기 때문입니다. 두 진입점이 같은 파일을 가리키므로 한 프로세스가 라이브러리와 그 상태를
+두 벌 들고 있는 일은 발생하지 않습니다.
+
+`engines`는 Node 22 이상을 허용합니다. `import`는 그 전체 범위에서 동작하기 때문입니다.
+22.12 하한은 `require()`에만 적용되며, 그 이전 22.x에서 이 패키지를 `require()`하면
+`ERR_REQUIRE_ESM`으로 실패합니다.
+
+### TypeScript와 CommonJS
+
+CommonJS TypeScript 프로젝트는 `moduleResolution`을 `nodenext`(또는 `bundler`)로
+설정해야 합니다.
+
+```jsonc
+{ "compilerOptions": { "module": "nodenext", "moduleResolution": "nodenext" } }
+```
+
+`moduleResolution: node16`에서는 CommonJS 파일에서 이 패키지를 import하면 `TS1479`가
+발생합니다("the referenced file is an ECMAScript module and cannot be imported with
+'require'"). `node16`에는 Node의 `require(esm)`에 대한 모델이 없고, 이 패키지는 CommonJS
+선언 트리를 따로 배포하지 않고 ES 모듈 하나만 배포하므로 그 설정으로는 타입 검사를 통과할
+수 없습니다. 런타임 동작에는 영향이 없고 컴파일 단계만 해당합니다.
+
+### `require()`는 frozen 네임스페이스를 반환합니다
+
+ES 모듈을 `require()`하면 Node의 module namespace 객체가 반환되는데, 이 객체는 sealed
+상태입니다. export를 읽는 것은 문제없지만 교체는 되지 않습니다.
+
+```javascript
+const lib = require('rtsp-backchannel');
+
+lib.playFile;                    // 정상
+lib.playFile = fake;             // strict 모드에서 TypeError, sloppy 모드에서는 조용히 무시됨
+jest.spyOn(lib, 'playFile');     // TypeError: Cannot redefine property: playFile
+```
+
+`sinon.stub(lib, 'playFile')`도 같은 방식으로 실패합니다. 테스트에서 동작을 바꿔야 한다면
+라이브러리의 export가 아니라 라이브러리가 호출하는 경계(`ffmpeg`, 소켓)를 stub하거나,
+`esmock` 같은 ESM 로더 mock을 사용하세요.
+
+### MODULE_TYPELESS_PACKAGE_JSON 경고 없애기
+
+`.js` 파일에서 `import` 문을 실행하면 다음 경고가 나타납니다.
+
+```
+[MODULE_TYPELESS_PACKAGE_JSON] Warning: Module type of file:///.../use.js is not
+specified and it doesn't parse as CommonJS. Reparsing as ES module because module
+syntax was detected. This incurs a performance overhead.
+```
+
+이 경고는 이 패키지가 아니라 실행 중인 파일에 대한 것입니다. Node가 가장 가까운
+`package.json`에서 `"type"` 필드를 찾지 못해 CommonJS로 추측했다가 실패하고 다시 파싱한
+것입니다. 다음 중 하나로 해결됩니다.
+
+- 자신의 `package.json`에 `"type": "module"` 추가
+- 파일 확장자를 `.mjs`로 변경
+- `import` 대신 `require()` 사용
 
 ## 빠른 재생
 
@@ -342,6 +415,13 @@ scope에서 얻은 자기 보고일 뿐 독립적인 ONVIF 인증 결과가 아�
   generic canonical message만 사용하며 credentials, WSSE digest material,
   URL userinfo, raw or real camera response payload를 포함하지 않습니다. 최초 연결 또는
   인증 실패는 치명적이며 Promise를 reject하므로 warning으로 바뀌지 않습니다.
+- `audioSend`는 카메라로 오디오를 보낼 수 있는 전송 방식이 있는지를 보고합니다.
+  `onvifBackchannel`과 `vigiTalk`는 서로 독립적인 probe가 아니라, 서로 다른 두 개의
+  3상 사실입니다. `vigiTalk`는 `onvifBackchannel`이 확정적으로 `false`로 확인된
+  경우에만 probe되고 그 외에는 `null`로 남으므로, ONVIF backchannel이 정상 동작하는
+  카메라에서는 VIGI probe 자체가 실행되지 않습니다. `transport`는 그중 성공한 쪽의
+  이름(`'onvif'`, `'vigi'`, 둘 다 실패하면 `null`)이며, `detected`는 둘 중 하나라도
+  성공했을 때만 `true`입니다. 이 probe의 비용과 끄는 방법은 아래를 참고하십시오.
 
 인증된 서비스 요청의 신뢰 기준은 선택된 Device Service URL입니다. 연결된 Media
 endpoint와 광고된 모든 Media1, Media2, PTZ XAddr는 같은 scheme과 canonical
@@ -367,6 +447,18 @@ option 보강은 유용한 근거이지만 Profile T 인증의 증명은 아닙�
 수행하므로 전체 소요 시간은 timeout 한 구간보다 길 수 있습니다. 선택적인 보강
 요청은 실패 시 warning을 추가하고 계속할 수 있지만 단일 요청의 timeout을 늘리지는
 않습니다.
+
+**기본값에서는 이 호출이 보이는 것보다 비쌉니다.** `getCameraCapabilities`는
+`audioSend`를 채우기 위해 카메라에 오디오를 보낼 수 있는 경로가 있는지도 기본적으로
+함께 확인합니다. 이 probe는 위에서 이미 연 연결을 다시 읽는 것이 아니라, 실제
+backchannel `DESCRIBE`를 보내려고 처음부터 새로 인증하는 ONVIF 세션(자체 서비스
+검색과 로그인 포함)을 하나 더 엽니다. 그 결과 송신 가능한 track을 찾지 못했을 때만
+VIGI OpenAPI `doAuth` 핸드셰이크를 한 번 더 시도합니다. 구체적으로는 기본 호출마다
+여러 번의 추가 SOAP 왕복과 ONVIF 재인증·재검색 한 번이 붙고, ONVIF backchannel이
+없는 흔한 경우에는 대부분의 카메라가 아예 응답하지 않는 VIGI 제어 포트로의 HTTPS
+요청이 한 번 더 붙습니다. 이 전부를 건너뛰려면 `probeAudioSend: false`를
+넘기십시오. 이 경우 `audioSend`는 중립적인 기본값(`detected`, `transport`,
+`onvifBackchannel`, `vigiTalk` 모두 `null`)으로 남습니다.
 
 ### PTZ 제어
 
@@ -426,9 +518,17 @@ try {
 }
 ```
 
-**실험적 기능입니다.** 검증됨: 세션 열기, 기능 지원 확인(guard), 요청 구성,
-timeout 포함, close 시 stop 호출. 미검증: 카메라가 의도한 대로 실제로
-움직이는지 여부 — 실제 PTZ 하드웨어가 없어 확인하지 못했습니다.
+**실험적 기능입니다.** 물리적 움직임은 이제 카메라 한 대에서 검증되었습니다.
+TP-Link VIGI C540V(펌웨어 2.2.0 및 2.3.3)에서 `relativeMove`, `continuousMove`,
+`absoluteMove`가 pan/tilt와 zoom 양쪽 모두 요청한 방향으로 카메라를 움직였고,
+`getStatus`가 매 이동을 추적했으며, 시작 좌표로의 `absoluteMove`가 원위치를
+정확히 복원했습니다. 세션 열기, 기능 지원 확인(guard), 요청 구성, timeout 포함,
+close 시 stop 호출은 그대로 테스트로 덮여 있습니다. 이 한 모델을 넘어서는
+미검증입니다 — 광학 zoom(C540V는 디지털입니다)이나 기계식 preset tour를 갖춘
+카메라는 확인하지 못했습니다. 또한 이 카메라는 1초 미만 `Timeout`을 거부하므로
+`timeoutMs`가 1000 미만인 `continuousMove`는 실패합니다. 정수 초를
+`PT1.000S`가 아니라 `PT1S`로 보내는 것도 이 카메라가 소수점을 거부하기
+때문입니다.
 
 ### 저수준 백채널 API
 
@@ -462,6 +562,33 @@ try {
 
 PCM 생성, 인코딩 또는 페이싱을 직접 제어할 수 있도록 `pcm16ToG711`,
 `linearToALaw`, `linearToMuLaw`, `generateTonePcm`, `sendPacedG711`도 공개합니다.
+
+### 오디오 송신 전송
+
+`openBackchannel`과 `playFile`은 `transport` 옵션으로 `'auto'`(기본값),
+`'onvif'`, `'vigi'`를 받아들이며, CLI도 같은 선택지를 `--transport`로 제공합니다.
+`'onvif'`와 `'vigi'`는 각각 하나의 전송 방식을 확정적으로 사용합니다. `'auto'`는
+먼저 ONVIF 백채널을 시도하고, 카메라가 응답은 했지만 SDP에 sendonly 오디오 track이
+없을 때만 VIGI로 대체합니다. 그 밖의 모든 실패 — 네트워크 오류, 자격 증명 거부,
+잘못된 응답 — 는 다른 전송 방식으로 조용히 넘어가지 않고 그대로 전파되므로, 고장난
+카메라를 단순히 벤더 API가 없는 카메라로 오인하지 않습니다.
+
+VIGI 전송 방식은 ONVIF 백채널 대신 TP-Link의 VIGI OpenAPI `talk` 프로토콜을
+사용합니다. 스피커는 동작하지만 ONVIF 백채널이 없거나 제대로 동작하지 않는 카메라를
+위한 것입니다. 카메라 자체의 웹 UI에서 Settings > Network Settings > OpenAPI로
+OpenAPI를 켜야 하며, 제어 연결은 기본적으로 20443 포트를 사용합니다. 이 전송
+방식은 G.711 a-law만 전달합니다. G.711이 아닌 코덱을 명시적으로 요청하면
+resampling이나 조용한 다운그레이드 대신 세션을 여는 시점에 실패합니다. 라이브러리는
+장치의 스피커 볼륨을 직접 바꾸지 않습니다 — 카메라에 설정된 값(기본값 80/100이며
+실내에서는 큰 편입니다)이 그대로 재생되며, 볼륨을 바꾸려면 이 라이브러리가 아니라
+카메라 자체 UI를 사용해야 합니다.
+
+VIGI 배지가 붙어 있다고 해서 모든 카메라가 이 API를 지원하는 것은 아닙니다.
+TP-Link는 지원하는 IPC 및 NVR 모델 목록을
+https://www.tp-link.com/en/vigi-open-api/product-list/ 에 공개해 두었으므로,
+브랜드만 보고 지원 여부를 가정하지 말고 실제 모델을 그 목록과 대조하십시오. VIGI
+NVR도 이 목록에 함께 실려 있지만 전혀 다른 프로토콜을 사용하므로 이 전송 방식의
+지원 대상이 아닙니다.
 
 ## CLI
 

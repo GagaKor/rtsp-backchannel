@@ -1,0 +1,31 @@
+{
+  "host": "cam",
+  "user": "admin",
+  "pass": "secret",
+  "streamPort": 554,
+  "controlPort": 20443,
+  "challenge": {
+    "realm": "TP-LINK IP-Camera",
+    "nonce": "n7",
+    "algorithm": "SHA-256",
+    "qop": "auth",
+    "uri": "doAuth",
+    "method": "POST"
+  },
+  "cnonce": "aaaabbbbccccdddd",
+  "nonceCount": 1,
+  "requests": {
+    "doAuthChallenge": "{\"method\":\"doAuth\",\"params\":null}",
+    "doAuthResponse": "{\"method\":\"doAuth\",\"params\":{\"nonce\":\"n7\",\"response\":\"5c2958e207a8fcc2cff6dba700282e83f3348288f9ccc2d5705ff73a8abd2536\"}}",
+    "talkBody": "{\"type\":\"request\",\"seq\":\"1\",\"params\":{\"method\":\"get\",\"talk\":{\"mode\":\"half_duplex\"}}}",
+    "multitransUnauthenticated": "MULTITRANS rtsp://cam/multitrans RTSP/1.0\r\nCSeq: 1\r\nContent-Type: application/json\r\nContent-Length: 84\r\n\r\n{\"type\":\"request\",\"seq\":\"1\",\"params\":{\"method\":\"get\",\"talk\":{\"mode\":\"half_duplex\"}}}",
+    "authorizationHeader": "Digest username=\"admin\", realm=\"TP-LINK IP-Camera\", nonce=\"n7\", uri=\"rtsp://cam/multitrans\", qop=\"auth\", cnonce=\"aaaabbbbccccdddd\", nc=\"00000001\", response=\"7ebcb4398b563523ef42de05ba8b84a8caea8714d6d2b34db5f98b44fe5cd6e3\""
+  },
+  "rtp": {
+    "payloadType": 8,
+    "channel": 0,
+    "packetMs": 20,
+    "samplesPerPacket": 160,
+    "markerOnFirstPacket": true
+  }
+}
