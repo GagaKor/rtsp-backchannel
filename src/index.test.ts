@@ -351,17 +351,36 @@ test('declares an installable npm package with ESM and CommonJS entry points', (
   // #36's "raised the minimum Node.js version from 22 to 22.12.0" entry
   // outlived the change it described, because nothing tied the CHANGELOG to
   // the manifest -- 289 tests passed with the two contradicting each other.
-  // Any engines range quoted in the unreleased section must be the real one,
-  // and the real one must appear, so a future bump cannot land silently.
+  // Two halves guard that, scoped differently on purpose.
+  //
+  // Drift is checked against the CURRENT release notes only: [Unreleased]
+  // while work is pending, and the newest dated section once
+  // tools/bump_version.py has promoted it. The release automation empties
+  // [Unreleased] on every release, so reading [Unreleased] alone would fail on
+  // every bump commit. Older sections are left alone -- a section that shipped
+  // an earlier range is history, not drift.
+  //
+  // Existence is checked against the whole file, so changing engines without
+  // documenting it anywhere still fails, while a later cycle whose
+  // [Unreleased] simply has nothing to say about Node does not.
   const changelog = readFileSync('CHANGELOG.md', 'utf8');
   const unreleasedStart = changelog.indexOf('## [Unreleased]');
   assert.notEqual(unreleasedStart, -1, 'CHANGELOG must keep an [Unreleased] section');
-  const nextRelease = changelog.indexOf('\n## [', unreleasedStart + 1);
+  const afterUnreleased = changelog.indexOf('\n## [', unreleasedStart + 1);
   const unreleased = changelog.slice(
     unreleasedStart,
-    nextRelease === -1 ? undefined : nextRelease,
+    afterUnreleased === -1 ? undefined : afterUnreleased,
   );
-  for (const [, quoted] of unreleased.matchAll(/`(>=[\d.]+)`/g)) {
+  let current = unreleased;
+  if (unreleased.slice(unreleased.indexOf('\n') + 1).trim() === '' && afterUnreleased !== -1) {
+    const releasedStart = afterUnreleased + 1;
+    const afterReleased = changelog.indexOf('\n## [', releasedStart + 1);
+    current = changelog.slice(
+      releasedStart,
+      afterReleased === -1 ? undefined : afterReleased,
+    );
+  }
+  for (const [, quoted] of current.matchAll(/`(>=[\d.]+)`/g)) {
     assert.equal(
       quoted,
       manifest.engines.node,
@@ -369,8 +388,8 @@ test('declares an installable npm package with ESM and CommonJS entry points', (
     );
   }
   assert.ok(
-    unreleased.includes(`\`${manifest.engines.node}\``),
-    `the unreleased CHANGELOG must state the current engines range (${manifest.engines.node})`,
+    changelog.includes(`\`${manifest.engines.node}\``),
+    `the CHANGELOG must state the current engines range (${manifest.engines.node})`,
   );
   // npm rewrites the lockfile's own engines block from the manifest on the next
   // install, so a stale value here is a guaranteed unrelated diff in someone
