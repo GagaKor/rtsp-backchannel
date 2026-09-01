@@ -170,3 +170,64 @@ class Changelog:
                 out.append("")
         out.extend(self.links)
         return "\n".join(out) + "\n"
+
+    def _unreleased(self) -> Section:
+        for section in self.sections:
+            if section.version == "Unreleased":
+                return section
+        raise BumpError("CHANGELOG.md has no '## [Unreleased]' section")
+
+    def pending(self) -> tuple[str, ...]:
+        return self._unreleased().body
+
+    def staged(self, last_released: Version) -> Section | None:
+        """The dated section a previous bump run already created, if any."""
+        for section in self.sections:
+            if section.version == "Unreleased" or section.date is None:
+                continue
+            try:
+                version = Version.parse(section.version)
+            except BumpError:
+                continue
+            if version > last_released:
+                return section
+        return None
+
+    def promoted(self, target: Version, last_released: Version, today: str) -> "Changelog":
+        """Recompute the whole end state rather than patching a previous run.
+
+        A pull request that gains commits after the first bump needs the staged
+        section's heading raised and the newly written [Unreleased] prose folded
+        into it. Recomputing from the last release makes that one code path
+        instead of a special case.
+        """
+        pending = self.pending()
+        staged = self.staged(last_released)
+
+        body: tuple[str, ...] = staged.body if staged is not None else ()
+        if body and pending:
+            body = body + ("",) + pending
+        elif pending:
+            body = pending
+
+        carried = tuple(
+            section
+            for section in self.sections
+            if section.version != "Unreleased" and section is not staged
+        )
+        sections = (
+            Section("Unreleased", None, ()),
+            Section(str(target), today, body),
+            *carried,
+        )
+
+        dropped = {"[Unreleased]:", f"[{target}]:"}
+        if staged is not None:
+            dropped.add(f"[{staged.version}]:")
+        links = (
+            f"[Unreleased]: {GITHUB_REPO_URL}/compare/v{target}...HEAD",
+            f"[{target}]: {GITHUB_REPO_URL}/releases/tag/v{target}",
+            *(link for link in self.links if link.split(" ", 1)[0] not in dropped),
+        )
+
+        return Changelog(head=self.head, sections=sections, links=links)

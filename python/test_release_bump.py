@@ -105,6 +105,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [0.3.0]: https://github.com/GagaKor/rtsp-backchannel/releases/tag/v0.3.0
 """
 
+STAGED_FIXTURE = """\
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+## [Unreleased]
+
+### Added
+
+- A CLI flag that arrived after the PR opened.
+
+## [0.3.2] - 2026-08-30
+
+### Fixed
+
+- A thing the first run already promoted.
+
+## [0.3.1] - 2026-08-13
+
+### Changed
+
+- Corrected the stated Node minimum.
+
+[Unreleased]: https://github.com/GagaKor/rtsp-backchannel/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/GagaKor/rtsp-backchannel/releases/tag/v0.3.2
+[0.3.1]: https://github.com/GagaKor/rtsp-backchannel/releases/tag/v0.3.1
+"""
+
 
 class ChangelogRoundTrip(unittest.TestCase):
     def test_round_trips_the_fixture_byte_for_byte(self):
@@ -149,6 +177,121 @@ class ChangelogRoundTrip(unittest.TestCase):
     def test_rejects_a_changelog_with_no_sections(self):
         with self.assertRaises(BumpError):
             Changelog.parse("# Changelog\n\nNothing here.\n")
+
+
+class ChangelogPromotion(unittest.TestCase):
+    def test_pending_returns_the_unreleased_body(self):
+        self.assertEqual(
+            Changelog.parse(CHANGELOG_FIXTURE).pending(),
+            ("### Added", "", "- A second audio-send transport."),
+        )
+
+    def test_no_staged_section_on_a_freshly_released_tree(self):
+        changelog = Changelog.parse(CHANGELOG_FIXTURE)
+        self.assertIsNone(changelog.staged(Version.parse("0.3.1")))
+
+    def test_staged_section_is_the_one_ahead_of_the_last_release(self):
+        staged = Changelog.parse(STAGED_FIXTURE).staged(Version.parse("0.3.1"))
+
+        self.assertIsNotNone(staged)
+        self.assertEqual(staged.version, "0.3.2")
+
+    def test_fresh_promotion_dates_the_unreleased_body(self):
+        promoted = Changelog.parse(CHANGELOG_FIXTURE).promoted(
+            target=Version.parse("0.4.0"),
+            last_released=Version.parse("0.3.1"),
+            today="2026-09-01",
+        )
+
+        self.assertEqual(
+            [section.version for section in promoted.sections],
+            ["Unreleased", "0.4.0", "0.3.1", "0.3.0"],
+        )
+        self.assertEqual(promoted.sections[0].body, ())
+        self.assertEqual(promoted.sections[1].date, "2026-09-01")
+        self.assertEqual(
+            promoted.sections[1].body,
+            ("### Added", "", "- A second audio-send transport."),
+        )
+
+    def test_fresh_promotion_rewrites_the_link_references(self):
+        promoted = Changelog.parse(CHANGELOG_FIXTURE).promoted(
+            target=Version.parse("0.4.0"),
+            last_released=Version.parse("0.3.1"),
+            today="2026-09-01",
+        )
+
+        self.assertEqual(
+            promoted.links,
+            (
+                "[Unreleased]: https://github.com/GagaKor/rtsp-backchannel/compare/v0.4.0...HEAD",
+                "[0.4.0]: https://github.com/GagaKor/rtsp-backchannel/releases/tag/v0.4.0",
+                "[0.3.1]: https://github.com/GagaKor/rtsp-backchannel/releases/tag/v0.3.1",
+                "[0.3.0]: https://github.com/GagaKor/rtsp-backchannel/releases/tag/v0.3.0",
+            ),
+        )
+
+    def test_rerun_folds_new_prose_into_the_staged_section_and_raises_it(self):
+        promoted = Changelog.parse(STAGED_FIXTURE).promoted(
+            target=Version.parse("0.4.0"),
+            last_released=Version.parse("0.3.1"),
+            today="2026-09-02",
+        )
+
+        self.assertEqual(
+            [section.version for section in promoted.sections],
+            ["Unreleased", "0.4.0", "0.3.1"],
+        )
+        self.assertEqual(promoted.sections[1].date, "2026-09-02")
+        self.assertEqual(
+            promoted.sections[1].body,
+            (
+                "### Fixed",
+                "",
+                "- A thing the first run already promoted.",
+                "",
+                "### Added",
+                "",
+                "- A CLI flag that arrived after the PR opened.",
+            ),
+        )
+
+    def test_rerun_does_not_accumulate_a_stale_link_reference(self):
+        promoted = Changelog.parse(STAGED_FIXTURE).promoted(
+            target=Version.parse("0.4.0"),
+            last_released=Version.parse("0.3.1"),
+            today="2026-09-02",
+        )
+
+        self.assertNotIn(
+            "[0.3.2]: https://github.com/GagaKor/rtsp-backchannel/releases/tag/v0.3.2",
+            promoted.links,
+        )
+        self.assertEqual(promoted.links[0].split(": ")[1].split("/compare/")[1], "v0.4.0...HEAD")
+
+    def test_promotion_output_survives_a_render_parse_round_trip(self):
+        promoted = Changelog.parse(STAGED_FIXTURE).promoted(
+            target=Version.parse("0.4.0"),
+            last_released=Version.parse("0.3.1"),
+            today="2026-09-02",
+        )
+        text = promoted.render()
+
+        self.assertEqual(Changelog.parse(text).render(), text)
+
+    def test_exactly_one_dated_section_for_the_target(self):
+        text = Changelog.parse(STAGED_FIXTURE).promoted(
+            target=Version.parse("0.4.0"),
+            last_released=Version.parse("0.3.1"),
+            today="2026-09-02",
+        ).render()
+
+        self.assertEqual(text.count("## [0.4.0] - "), 1)
+
+    def test_missing_unreleased_section_is_an_error(self):
+        text = CHANGELOG_FIXTURE.replace("## [Unreleased]\n\n### Added\n\n- A second audio-send transport.\n\n", "")
+        with self.assertRaises(BumpError):
+            Changelog.parse(text).pending()
 
 
 if __name__ == "__main__":
