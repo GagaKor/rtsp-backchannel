@@ -69,13 +69,13 @@ result = play_file(
     user="",
     password="",
     file="/absolute/path/to/event.mp3",
-    volume=0.05,
+    volume=1.0,
 )
 
 print(result.packets_sent, result.duration_seconds)
 ```
 
-`volume` must be between `0.0` and `1.0`. The tested default is `0.05`.
+`volume` must be between `0.0` and `1.0`. The default is `1.0`, which sends the decoded audio at full scale.
 
 ## Complete Workflow
 
@@ -116,7 +116,7 @@ result = play_file(
     user="admin",
     password=password,
     file="/absolute/path/to/event.mp3",
-    volume=0.05,
+    volume=1.0,
 )
 
 print(result.codec, result.packets_sent, result.duration_seconds)
@@ -496,7 +496,7 @@ play_file(
     user: str,
     password: str,
     file: str,
-    volume: float = 0.05,
+    volume: float = 1.0,
     codec: str = "auto",
 ) -> PlaybackResult
 ```
@@ -604,7 +604,7 @@ rtsp-backchannel play \
   --user admin \
   --pass "$ONVIF_PASSWORD" \
   --file '/absolute/path/to/event.mp3' \
-  --volume 0.05 \
+  --volume 1.0 \
   --codec auto
 
 # No ONVIF or RTSP credentials.

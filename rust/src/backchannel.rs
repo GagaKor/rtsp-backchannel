@@ -222,7 +222,15 @@ impl BackchannelSession {
 
             let mut requested_channel = 0u8;
             for (index, track) in tracks.iter().enumerate() {
-                if index == send_index || track.direction != "recvonly" {
+                // RFC 4566 leaves an absent direction as sendrecv, so a track
+                // stays out of the session only when it says so itself.
+                // Requiring "recvonly" left cameras that omit the attribute
+                // (an antkr AMA-08055, for one) with a backchannel-only
+                // session, which is the session shape whose speaker is silent.
+                if index == send_index
+                    || track.direction == "sendonly"
+                    || track.direction == "inactive"
+                {
                     continue;
                 }
                 let Some(control) = &track.control else {
@@ -531,6 +539,86 @@ mod tests {
         assert_eq!(session.send(&[0xaa]).unwrap(), 1);
         session.close().unwrap();
         server.join().unwrap();
+    }
+
+    #[test]
+    fn sets_up_companion_tracks_when_the_sdp_omits_a_direction() {
+        // An antkr AMA-08055 declares no direction on its receive tracks. RFC
+        // 4566 leaves that as sendrecv, so they still belong in the session;
+        // skipping them leaves a backchannel-only session and a silent speaker.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let sdp = "v=0\r\n\
+                       m=video 0 RTP/AVP 96\r\n\
+                       a=control:video\r\n\
+                       a=rtpmap:96 H264/90000\r\n\
+                       m=audio 0 RTP/AVP 8\r\n\
+                       a=control:audioback\r\n\
+                       a=sendonly\r\n\
+                       a=rtpmap:8 PCMA/8000\r\n";
+            let mut setup_uris = Vec::new();
+            let mut channel = 0u8;
+            loop {
+                let request = read_request(&mut stream);
+                let request_line = request.lines().next().unwrap().to_owned();
+                let mut parts = request_line.split(' ');
+                let method = parts.next().unwrap().to_owned();
+                let uri = parts.next().unwrap().to_owned();
+                let cseq = request
+                    .lines()
+                    .find_map(|line| line.strip_prefix("CSeq: "))
+                    .unwrap()
+                    .to_owned();
+                let (extra, body) = match method.as_str() {
+                    "DESCRIBE" => (
+                        "Content-Type: application/sdp\r\n".to_owned(),
+                        sdp.to_owned(),
+                    ),
+                    "SETUP" => {
+                        setup_uris.push(uri);
+                        let headers = format!(
+                            "Session: directionless;timeout=60\r\n\
+                             Transport: RTP/AVP/TCP;interleaved={channel}-{}\r\n",
+                            channel + 1
+                        );
+                        channel += 2;
+                        (headers, String::new())
+                    }
+                    _ => (String::new(), String::new()),
+                };
+                write!(
+                    stream,
+                    "RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\n{extra}Content-Length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+                if method == "TEARDOWN" {
+                    break;
+                }
+            }
+            setup_uris
+        });
+
+        let target = format!("rtsp://127.0.0.1:{port}/stream1");
+        let mut session = super::BackchannelSession::open_with_codec(
+            &target,
+            "",
+            "",
+            crate::audio::CodecPreference::Pcma,
+        )
+        .unwrap();
+        session.close().unwrap();
+        let setup_uris = server.join().unwrap();
+
+        assert_eq!(
+            setup_uris,
+            [
+                format!("rtsp://127.0.0.1:{port}/video"),
+                format!("rtsp://127.0.0.1:{port}/audioback"),
+            ]
+        );
     }
 
     fn read_request(stream: &mut impl Read) -> String {

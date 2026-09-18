@@ -53,7 +53,7 @@ def _parser():
         default="",
     )
     parser.add_argument("--file", required=True)
-    parser.add_argument("--volume", type=_volume, default=0.05)
+    parser.add_argument("--volume", type=_volume, default=1.0)
     parser.add_argument(
         "--codec",
         choices=(

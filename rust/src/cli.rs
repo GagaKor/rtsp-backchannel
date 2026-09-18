@@ -38,7 +38,7 @@ pub struct Cli {
     #[arg(long)]
     pub file: PathBuf,
 
-    #[arg(long, default_value = "0.05", value_parser = parse_volume)]
+    #[arg(long, default_value = "1.0", value_parser = parse_volume)]
     pub volume: f64,
 
     #[arg(long, default_value = "auto")]
@@ -419,7 +419,7 @@ mod tests {
         assert_eq!(cli.host, "camera");
         assert_eq!(cli.user, "admin");
         assert_eq!(cli.password, "secret");
-        assert_eq!(cli.volume, 0.05);
+        assert_eq!(cli.volume, 1.0);
         assert_eq!(cli.file.to_string_lossy(), "event.mp3");
     }
 

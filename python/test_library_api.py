@@ -554,7 +554,7 @@ class LibraryApiTests(unittest.TestCase):
                 duration_seconds=0.08,
             ),
         )
-        encode.assert_called_once_with("event.mp3", 0.05, 8000, 3)
+        encode.assert_called_once_with("event.mp3", 1.0, 8000, 3)
         self.assertEqual([packet[12:] for packet in session.sent], [payload[:120], payload[120:]])
         timestamps = [int.from_bytes(packet[4:8], "big") for packet in session.sent]
         self.assertEqual((timestamps[1] - timestamps[0]) & 0xFFFFFFFF, 320)
@@ -635,7 +635,7 @@ class LibraryApiTests(unittest.TestCase):
                 duration_seconds=0.256,
             ),
         )
-        encode.assert_called_once_with("event.mp3", 0.05, 8000, 0)
+        encode.assert_called_once_with("event.mp3", 1.0, 8000, 0)
         self.assertEqual(
             [packet[12:] for packet in session.sent],
             [
@@ -734,7 +734,7 @@ class LibraryApiTests(unittest.TestCase):
             user="",
             password="",
             file="event.mp3",
-            volume=0.05,
+            volume=1.0,
             codec="auto",
         )
 
@@ -804,7 +804,7 @@ class LibraryApiTests(unittest.TestCase):
                 user="",
                 password="",
                 file="event.mp3",
-                volume=0.05,
+                volume=1.0,
                 codec=codec,
             )
 

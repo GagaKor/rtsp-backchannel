@@ -4,7 +4,7 @@
  * M4 — play an audio file out the camera speaker via the ONVIF backchannel.
  *
  *   rtsp-backchannel --host camera.local --user admin --pass '<password>' \
- *     --file announce.wav --volume 0.05
+ *     --file announce.wav
  */
 import {
   displayRtspTarget,
@@ -36,7 +36,7 @@ Options:
   --pass <password>   ONVIF/RTSP password (or set ONVIF_PASSWORD)
   --codec <name>      auto|pcma|pcmu|g726-16|g726-24|g726-32|g726-40|aac
   --transport <name>  auto|onvif|vigi (default: auto)
-  --volume <0..1>     linear volume (default: 0.05)
+  --volume <0..1>     linear volume (default: 1.0, full scale)
 
 Discovery options:
   --interface <IPv4>  local PC address for WS-Discovery (repeatable)
@@ -233,7 +233,7 @@ function parseCapabilityArguments(argv: string[]): ParsedCapabilityArguments {
 }
 
 export function parseCliArgs(argv: string[]): PlaybackOptions {
-  const volume = Number(arg(argv, 'volume', '0.05'));
+  const volume = Number(arg(argv, 'volume', '1'));
   if (!Number.isFinite(volume) || volume < 0 || volume > 1) {
     throw new RangeError('volume must be finite and between 0 and 1');
   }
@@ -265,7 +265,7 @@ export async function playFile(
     user = '',
     pass = '',
     file,
-    volume = 0.05,
+    volume = 1,
     codec = 'auto',
     transport = 'auto',
   } = options;

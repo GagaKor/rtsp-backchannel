@@ -142,13 +142,13 @@ const packetsSent = await playFile({
   user: '',
   pass: '',
   file: '/absolute/path/to/event.mp3',
-  volume: 0.05,
+  volume: 1.0,
 });
 
 console.log({ packetsSent });
 ```
 
-`volume`은 `0.0`부터 `1.0`까지 지정할 수 있으며 검증된 기본값은 `0.05`입니다.
+`volume`은 `0.0`부터 `1.0`까지 지정할 수 있으며 기본값은 `1.0`으로, 디코딩한 음원을 원음 그대로 내보냅니다.
 
 ## 전체 워크플로
 
@@ -187,7 +187,7 @@ const packetsSent = await playFile({
   user: 'admin',
   pass: password,
   file: '/absolute/path/to/event.mp3',
-  volume: 0.05,
+  volume: 1.0,
 });
 
 console.log({ packetsSent });
@@ -547,7 +547,7 @@ try {
     () => fileToRtpAudio(
       '/absolute/path/to/event.mp3',
       session.codec,
-      0.05,
+      1.0,
     ),
   );
   const packetsSent = await session.send(encoded);
@@ -638,7 +638,7 @@ rtsp-backchannel play \
   --host camera.local \
   --user admin \
   --file '/absolute/path/to/event.mp3' \
-  --volume 0.05
+  --volume 1.0
 ```
 
 하위 호환성을 위해 `play` 단어는 생략할 수 있습니다. 수동 실행에서는 `--pass`도

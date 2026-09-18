@@ -68,13 +68,13 @@ result = play_file(
     user="admin",
     password=os.environ["ONVIF_PASSWORD"],
     file="/absolute/path/to/event.mp3",
-    volume=0.05,
+    volume=1.0,
 )
 
 print(result.packets_sent, result.duration_seconds)
 ```
 
-`volume`은 `0.0`부터 `1.0`까지 지정할 수 있으며 검증된 기본값은 `0.05`입니다.
+`volume`은 `0.0`부터 `1.0`까지 지정할 수 있으며 기본값은 `1.0`으로, 디코딩한 음원을 원음 그대로 내보냅니다.
 
 ## 전체 워크플로
 
@@ -114,7 +114,7 @@ result = play_file(
     user="admin",
     password=password,
     file="/absolute/path/to/event.mp3",
-    volume=0.05,
+    volume=1.0,
 )
 
 print(result.codec, result.packets_sent, result.duration_seconds)
@@ -470,7 +470,7 @@ play_file(
     user: str,
     password: str,
     file: str,
-    volume: float = 0.05,
+    volume: float = 1.0,
 ) -> PlaybackResult
 ```
 
@@ -526,7 +526,7 @@ rtsp-backchannel play \
   --host camera.local \
   --user admin \
   --file '/absolute/path/to/event.mp3' \
-  --volume 0.05
+  --volume 1.0
 ```
 
 하위 호환성을 위해 `play` 단어는 생략할 수 있습니다. `streams`와 재생 명령은 기존의

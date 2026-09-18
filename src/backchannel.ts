@@ -362,9 +362,16 @@ export async function openOnvifBackchannel(
     // ONVIF Streaming 5.3.2 starts a bidirectional session with PLAY. Set up
     // the normal receive tracks first, just as rtspsrc does, then add the
     // sendonly audio track to the same RTSP session.
+    //
+    // A receive track is anything that is not this backchannel and not itself
+    // send-only or disabled. Requiring an explicit a=recvonly was too narrow:
+    // RFC 4566 makes an absent direction mean sendrecv, and cameras that omit
+    // it (an antkr AMA-08055, for one) were left with a backchannel-only
+    // session, which is exactly the session shape whose speaker stays silent.
     let requestedChannel = 0;
     for (const media of sdp.media) {
-      if (media === track || media.direction !== 'recvonly' || !media.control) continue;
+      if (media === track || !media.control) continue;
+      if (media.direction === 'sendonly' || media.direction === 'inactive') continue;
       const mediaUri = resolveTrackUri(streamUri, desc.headers['content-base'], media.control);
       await rtsp.setup(mediaUri, { rtpChannel: requestedChannel });
       requestedChannel += 2;

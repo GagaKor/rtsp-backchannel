@@ -73,7 +73,7 @@ fn main() -> anyhow::Result<()> {
         user: "admin".to_owned(),
         password: std::env::var("ONVIF_PASSWORD")?,
         file: PathBuf::from("/absolute/path/to/event.mp3"),
-        volume: 0.05,
+        volume: 1.0,
     })?;
 
     println!("{} RTP packets", result.packets_sent);
@@ -81,7 +81,7 @@ fn main() -> anyhow::Result<()> {
 }
 ```
 
-`volume`은 `0.0`부터 `1.0`까지 지정할 수 있으며 검증된 기본값은 `0.05`입니다.
+`volume`은 `0.0`부터 `1.0`까지 지정할 수 있으며 기본값은 `1.0`으로, 디코딩한 음원을 원음 그대로 내보냅니다.
 
 ## 전체 워크플로
 
@@ -125,7 +125,7 @@ fn main() -> Result<()> {
         user: "admin".to_owned(),
         password,
         file: PathBuf::from("/absolute/path/to/event.mp3"),
-        volume: 0.05,
+        volume: 1.0,
     })?;
 
     println!(
@@ -497,7 +497,7 @@ rtsp-backchannel play \
   --host camera.local \
   --user admin \
   --file '/absolute/path/to/event.mp3' \
-  --volume 0.05
+  --volume 1.0
 ```
 
 `capabilities` 명령은 상태 줄 없이 camelCase JSON 객체를 정확히 한 줄 출력하고 newline
@@ -552,7 +552,7 @@ use rtsp_backchannel::playback::{PlaybackConfig, play_file_with_codec};
 let result = play_file_with_codec(&PlaybackConfig {
     host: "rtsp://admin:p%40ss@camera.local/backchannel".to_owned(),
     user: "".to_owned(), password: "".to_owned(),
-    file: PathBuf::from("/absolute/path/to/event.mp3"), volume: 0.05,
+    file: PathBuf::from("/absolute/path/to/event.mp3"), volume: 1.0,
 }, CodecPreference::Auto)?;
 ```
 
