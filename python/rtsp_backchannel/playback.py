@@ -280,7 +280,7 @@ def play_file(
     file,
     user="",
     password="",
-    volume=0.05,
+    volume=1.0,
     codec="auto",
 ):
     """Play one audio file through a camera speaker, then close the session."""

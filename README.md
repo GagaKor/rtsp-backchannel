@@ -146,13 +146,13 @@ const packetsSent = await playFile({
   user: '',
   pass: '',
   file: '/absolute/path/to/event.mp3',
-  volume: 0.05,
+  volume: 1.0,
 });
 
 console.log({ packetsSent });
 ```
 
-`volume` must be between `0.0` and `1.0`. The tested default is `0.05`.
+`volume` must be between `0.0` and `1.0`. The default is `1.0`, which sends the decoded audio at full scale.
 
 ## Complete Workflow
 
@@ -192,7 +192,7 @@ const packetsSent = await playFile({
   user: 'admin',
   pass: password,
   file: '/absolute/path/to/event.mp3',
-  volume: 0.05,
+  volume: 1.0,
 });
 
 console.log({ packetsSent });
@@ -576,7 +576,7 @@ try {
     () => fileToRtpAudio(
       '/absolute/path/to/event.mp3',
       session.codec,
-      0.05,
+      1.0,
     ),
   );
   const packetsSent = await session.send(encoded);
@@ -693,7 +693,7 @@ rtsp-backchannel play \
   --user admin \
   --pass "$ONVIF_PASSWORD" \
   --file '/absolute/path/to/event.mp3' \
-  --volume 0.05 \
+  --volume 1.0 \
   --codec auto
 
 # No ONVIF or RTSP credentials.

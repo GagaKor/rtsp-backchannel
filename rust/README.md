@@ -75,7 +75,7 @@ fn main() -> anyhow::Result<()> {
         user: "".to_owned(),
         password: "".to_owned(),
         file: PathBuf::from("/absolute/path/to/event.mp3"),
-        volume: 0.05,
+        volume: 1.0,
     })?;
 
     println!("{} RTP packets", result.packets_sent);
@@ -83,7 +83,7 @@ fn main() -> anyhow::Result<()> {
 }
 ```
 
-`volume` must be between `0.0` and `1.0`. The tested default is `0.05`.
+`volume` must be between `0.0` and `1.0`. The default is `1.0`, which sends the decoded audio at full scale.
 
 ## Complete Workflow
 
@@ -128,7 +128,7 @@ fn main() -> Result<()> {
         user: "admin".to_owned(),
         password,
         file: PathBuf::from("/absolute/path/to/event.mp3"),
-        volume: 0.05,
+        volume: 1.0,
     })?;
 
     println!(
@@ -493,7 +493,7 @@ let result = play_file_with_codec(&PlaybackConfig {
     user: "".to_owned(),
     password: "".to_owned(),
     file: PathBuf::from("/absolute/path/to/event.mp3"),
-    volume: 0.05,
+    volume: 1.0,
 }, CodecPreference::Auto)?;
 ```
 
@@ -579,7 +579,7 @@ rtsp-backchannel play \
   --user admin \
   --pass "$ONVIF_PASSWORD" \
   --file '/absolute/path/to/event.mp3' \
-  --volume 0.05 \
+  --volume 1.0 \
   --codec auto
 
 # No ONVIF or RTSP credentials.

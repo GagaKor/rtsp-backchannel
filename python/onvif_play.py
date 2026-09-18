@@ -1052,7 +1052,14 @@ def open_backchannel_transport(
         if transport == "tcp":
             requested_channel = 0
             for receive_track in tracks:
-                if receive_track == send_track or "a=recvonly" not in receive_track:
+                if receive_track == send_track:
+                    continue
+                # RFC 4566 leaves an absent direction as sendrecv, so a track
+                # stays out of the session only when it says so itself.
+                # Requiring a=recvonly left cameras that omit the attribute
+                # (an antkr AMA-08055, for one) with a backchannel-only
+                # session, which is the session shape whose speaker is silent.
+                if "a=sendonly" in receive_track or "a=inactive" in receive_track:
                     continue
                 receive_control = track_control(receive_track)
                 if receive_control is None:
@@ -1621,8 +1628,8 @@ def build_argument_parser():
     input_group.add_argument("--pcma-input", type=pathlib.Path)
     ap.add_argument("--freq", type=int, default=1000)
     ap.add_argument("--ms", type=int, default=3000)
-    ap.add_argument("--volume", type=float, default=0.05,
-                    help="linear output gain, 0.0-1.0 (default: 0.05 / about -26 dB)")
+    ap.add_argument("--volume", type=float, default=1.0,
+                    help="linear output gain, 0.0-1.0 (default: 1.0 / full scale)")
     ap.add_argument("--sample-rate", type=int, choices=[8000, 16000, 32000, 48000, 64000],
                     default=8000, help="PCMA/PCMU RTP clock rate offered by the camera")
     ap.add_argument("--rtcp-interval", type=float, default=0,

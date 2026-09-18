@@ -22,7 +22,7 @@ test('prints TypeScript playback help without opening a camera connection', () =
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /--file/);
   assert.match(result.stdout, /--volume/);
-  assert.match(result.stdout, /default: 0\.05/);
+  assert.match(result.stdout, /default: 1\.0, full scale/);
   assert.match(result.stdout, /--codec <name>/);
   assert.match(result.stdout, /SDP codec negotiation/);
   assert.match(result.stdout, /real-time pacing/);
@@ -194,14 +194,14 @@ test('uses the built-in RTP encoder when an injected dependency omits it', async
   }
 });
 
-test('parses the validated 0.05 volume default and rejects invalid gain', () => {
+test('parses the full-scale volume default and rejects invalid gain', () => {
   type Parsed = { volume: number };
   type Parser = (argv: string[]) => Parsed;
   const parse = (cli as unknown as { parseCliArgs?: Parser }).parseCliArgs;
   assert.ok(parse);
 
   const required = ['--host', 'camera', '--pass', 'secret', '--file', 'event.mp3'];
-  assert.equal(parse(required).volume, 0.05);
+  assert.equal(parse(required).volume, 1);
   for (const volume of ['nan', '-0.1', '1.1']) {
     assert.throws(
       () => parse([...required, '--volume', volume]),
@@ -302,7 +302,7 @@ type PlayFile = (
     user: string;
     pass: string;
     file: string;
-    volume: number;
+    volume?: number;
   },
   dependencies: PlaybackDependencies,
 ) => Promise<number>;
@@ -313,7 +313,7 @@ function playFile(): PlayFile {
   return candidate;
 }
 
-test('passes volume 0.05 to the TypeScript encoder and sends the result once', async () => {
+test('passes the requested volume to the TypeScript encoder and sends the result once', async () => {
   const encoded = Buffer.alloc(640, 0xd5);
   let closed = 0;
   const dependencies: PlaybackDependencies = {
@@ -427,7 +427,7 @@ test('passes codec preference through negotiation and sends codec-neutral file f
         throw new Error('legacy encoder must not be used');
       },
       fileToRtpAudio: async (file, selected, volume) => {
-        assert.deepEqual([file, selected, volume], ['event.mp3', codec, 0.05]);
+        assert.deepEqual([file, selected, volume], ['event.mp3', codec, 1]);
         return encoded;
       },
       log: () => {},
@@ -1381,4 +1381,29 @@ test('keeps safe separate and attached hyphen-leading capability passwords opaqu
     { host: 'camera.local', user: '', pass: '' },
   ]);
   assert.ok(logs.every((line) => !/password-secret/.test(line)));
+});
+
+test('defaults playback volume to full scale when the caller omits it', async () => {
+  let encodedVolume: number | undefined;
+  const dependencies: PlaybackDependencies = {
+    openBackchannel: async () => ({
+      variant: 'PCMA',
+      payloadType: 8,
+      rtpChannel: 0,
+      send: async () => 1,
+      close: async () => {},
+    }),
+    fileToG711: async (_file, _variant, volume) => {
+      encodedVolume = volume;
+      return Buffer.alloc(320, 0xd5);
+    },
+    log: () => {},
+  };
+
+  await playFile()(
+    { host: 'camera', user: 'admin', pass: 'secret', file: 'event.mp3' },
+    dependencies,
+  );
+
+  assert.equal(encodedVolume, 1);
 });

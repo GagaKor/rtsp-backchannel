@@ -90,6 +90,20 @@ class FakeRtsp:
         "TEARDOWN"
     )
     session_header = "test-session;timeout=60"
+    describe_sdp = (
+        "v=0\r\n"
+        "m=video 0 RTP/AVP 96\r\n"
+        "a=control:trackID=0\r\n"
+        "a=recvonly\r\n"
+        "m=audio 0 RTP/AVP 8\r\n"
+        "a=control:trackID=1\r\n"
+        "a=rtpmap:8 PCMA/8000\r\n"
+        "a=recvonly\r\n"
+        "m=audio 0 RTP/AVP 8\r\n"
+        "a=control:trackID=5\r\n"
+        "a=rtpmap:8 PCMA/8000\r\n"
+        "a=sendonly\r\n"
+    )
 
     def __init__(self, host, port, user, password):
         self.host = host
@@ -107,21 +121,7 @@ class FakeRtsp:
         if method == "OPTIONS":
             return 200, {"public": self.public_header}, ""
         if method == "DESCRIBE":
-            sdp = (
-                "v=0\r\n"
-                "m=video 0 RTP/AVP 96\r\n"
-                "a=control:trackID=0\r\n"
-                "a=recvonly\r\n"
-                "m=audio 0 RTP/AVP 8\r\n"
-                "a=control:trackID=1\r\n"
-                "a=rtpmap:8 PCMA/8000\r\n"
-                "a=recvonly\r\n"
-                "m=audio 0 RTP/AVP 8\r\n"
-                "a=control:trackID=5\r\n"
-                "a=rtpmap:8 PCMA/8000\r\n"
-                "a=sendonly\r\n"
-            )
-            return 200, {"content-base": uri + "/"}, sdp
+            return 200, {"content-base": uri + "/"}, self.describe_sdp
         if method == "SETUP":
             if uri.endswith("trackID=0"):
                 channel = "0-1"
@@ -187,6 +187,28 @@ class FakeClock:
             + injected_ns
         )
         self.sleep_deadlines_ns.append(self.now_ns)
+
+
+class DirectionlessTracksRtsp(FakeRtsp):
+    """An antkr AMA-08055: no receive track declares a direction at all.
+
+    RFC 4566 leaves an absent direction as the sendrecv default, so these
+    tracks still have to be set up; skipping them leaves a backchannel-only
+    session whose speaker stays silent.
+    """
+
+    describe_sdp = (
+        "v=0\r\n"
+        "m=video 0 RTP/AVP 96\r\n"
+        "a=control:trackID=0\r\n"
+        "m=audio 0 RTP/AVP 8\r\n"
+        "a=control:trackID=1\r\n"
+        "a=rtpmap:8 PCMA/8000\r\n"
+        "m=audio 0 RTP/AVP 8\r\n"
+        "a=control:trackID=5\r\n"
+        "a=rtpmap:8 PCMA/8000\r\n"
+        "a=sendonly\r\n"
+    )
 
 
 class ParameterizedSessionRtsp(FakeRtsp):
@@ -1713,6 +1735,26 @@ class BackchannelTransportTest(unittest.TestCase):
         self.assertGreater(media_index, play_index)
         self.assertEqual(client.events[media_index], ("media", 6, packet))
         self.assertTrue(client.closed)
+
+    def test_opens_companion_tracks_when_the_sdp_omits_a_direction(self):
+        with onvif_play.open_backchannel_transport(
+            "example.invalid",
+            "fake-user",
+            "fake-password",
+            stream_uri="rtsp://example.invalid/live",
+            rtsp_factory=DirectionlessTracksRtsp,
+        ) as transport:
+            self.assertEqual(transport.rtp_channel, 6)
+
+        client = FakeRtsp.instances[0]
+        self.assertEqual(
+            [request[0] for request in client.requests],
+            ["OPTIONS", "DESCRIBE", "SETUP", "SETUP", "SETUP", "PLAY", "TEARDOWN"],
+        )
+        self.assertEqual(
+            [request[1].rsplit("/", 1)[-1] for request in client.requests[2:5]],
+            ["trackID=0", "trackID=1", "trackID=5"],
+        )
 
         describe = client.requests[1]
         backchannel_setup = client.requests[4]
@@ -3897,7 +3939,7 @@ class RtpSenderMainTest(unittest.TestCase):
                     )
 
                 metadata = [parse_rtp_packet(packet) for packet in packets]
-                encoder.assert_called_once_with("fake.aac", 0.05, 8000, 37)
+                encoder.assert_called_once_with("fake.aac", 1.0, 8000, 37)
                 self.assertEqual([packet[12:] for packet in packets], [
                     b"\x00\x10\x00\x10\x11\x22",
                     b"\x00\x10\x00\x08\x33",
@@ -3991,7 +4033,7 @@ class RtpSenderMainTest(unittest.TestCase):
             for index in range(expected_count)
         ]
 
-        encoder.assert_called_once_with("source.wav", 0.05, 8000, 0)
+        encoder.assert_called_once_with("source.wav", 1.0, 8000, 0)
         self.assertEqual(encoded_frames, expected_frames)
         self.assertEqual(len(packets), expected_count)
         self.assertEqual(
@@ -4367,7 +4409,7 @@ class RtpSenderMainTest(unittest.TestCase):
     def test_cli_defaults_to_validated_camera_profile(self):
         arguments = onvif_play.build_argument_parser().parse_args([])
 
-        self.assertEqual(arguments.volume, 0.05)
+        self.assertEqual(arguments.volume, 1.0)
         self.assertEqual(arguments.rtcp_interval, 0)
         self.assertEqual(arguments.preroll_ms, 0)
         self.assertEqual(arguments.packet_ms, 40)

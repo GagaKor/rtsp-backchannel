@@ -912,3 +912,95 @@ test('openVigiBackchannel.send rejects EncodedAudio for a codec other than pcma'
   assert.equal(socket.rtpFrames.length, 0, 'a rejected send must not reach the talk layer');
   await session.close();
 });
+
+test('sets up companion tracks whose SDP omits a direction attribute', async () => {
+  // Recorded from an antkr AMA-08055. None of its receive tracks carry
+  // a=recvonly — RFC 4566 leaves an absent direction as sendrecv — so
+  // requiring an explicit a=recvonly opened a backchannel-only session and
+  // the speaker stayed silent, while setting every track up made it play.
+  const setupUris: string[] = [];
+  let serverPort = 0;
+  const server = net.createServer((socket) => {
+    let input = Buffer.alloc(0);
+    socket.on('data', (chunk) => {
+      input = Buffer.concat([input, Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)]);
+      while (true) {
+        const end = input.indexOf('\r\n\r\n');
+        if (end < 0) return;
+        const request = input.subarray(0, end).toString('utf8');
+        input = input.subarray(end + 4);
+        const [requestLine, ...headerLines] = request.split('\r\n');
+        const [method, uri] = requestLine.split(' ');
+        const cseq = headerLines
+          .find((line) => line.toLowerCase().startsWith('cseq:'))
+          ?.slice('cseq:'.length)
+          .trim();
+        if (method === 'DESCRIBE') {
+          const body = [
+            'v=0',
+            'o=- 0 0 IN IP4 127.0.0.1',
+            'c=IN IP4 0.0.0.0',
+            't=0 0',
+            'a=control:*',
+            'm=video 0 RTP/AVP 96',
+            'a=rtpmap:96 H264/90000',
+            'a=control:video',
+            'm=audio 0 RTP/AVP 0',
+            'a=rtpmap:0 PCMU/8000/1',
+            'a=control:audio',
+            'm=application 0 RTP/AVP 107',
+            'a=rtpmap:107 vnd.onvif.metadata/90000',
+            'a=control:event',
+            'm=audio 0 RTP/AVP 0',
+            'a=rtpmap:0 PCMU/8000',
+            'a=control:audioback',
+            'a=sendonly',
+            '',
+          ].join('\r\n');
+          socket.write(
+            `RTSP/1.0 200 OK\r\nCSeq: ${cseq}\r\nContent-Type: application/sdp\r\n` +
+              `Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`,
+          );
+        } else if (method === 'SETUP') {
+          setupUris.push(uri);
+          const interleaved = headerLines
+            .find((line) => line.toLowerCase().startsWith('transport:'))
+            ?.match(/interleaved=(\d+-\d+)/)?.[1] ?? '0-1';
+          socket.write(
+            `RTSP/1.0 200 OK\r\nCSeq: ${cseq}\r\nSession: full-session;timeout=60\r\n` +
+              `Transport: RTP/AVP/TCP;unicast;interleaved=${interleaved}\r\n` +
+              'Content-Length: 0\r\n\r\n',
+          );
+        } else {
+          socket.write(`RTSP/1.0 200 OK\r\nCSeq: ${cseq}\r\nContent-Length: 0\r\n\r\n`);
+        }
+      }
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+  serverPort = address.port;
+  const base = `rtsp://127.0.0.1:${serverPort}/stream1`;
+
+  try {
+    const session = await backchannel.openBackchannel(base);
+    try {
+      assert.equal(session.codec.name, 'pcmu');
+      assert.equal(session.rtpChannel, 6);
+    } finally {
+      await session.close();
+    }
+  } finally {
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
+
+  assert.deepEqual(setupUris, [
+    `${base}/video`,
+    `${base}/audio`,
+    `${base}/event`,
+    `${base}/audioback`,
+  ]);
+});

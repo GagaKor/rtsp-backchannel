@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** playback defaults to full-scale volume (`1.0`) instead of
+  `0.05`, in all three packages and in both the library entry points and the
+  `--volume` CLI flag. Audio that relied on the old default now plays about
+  26 dB louder; pass `volume: 0.05` (`--volume 0.05`) to keep the previous
+  level.
+
+### Fixed
+
+- The ONVIF backchannel sets up every companion track that is not itself
+  send-only or inactive, instead of requiring an explicit `a=recvonly`, in all
+  three packages. RFC 4566 makes an absent direction mean `sendrecv`, and a
+  camera that omits the attribute (reproduced on an antkr AMA-08055, firmware
+  NT28_SWU1_V1.0.1.05) was left with a backchannel-only session and a silent
+  speaker, while a client that set every track up played audio through that
+  same speaker. Cameras that do declare `a=recvonly` (checked against a vht
+  VNV84371MR) negotiate exactly as before.
+
 ## [0.4.0] - 2026-09-01
 
 ### Added

@@ -105,7 +105,7 @@ export function runFfmpeg(
 export function fileToG711(
   path: string,
   variant: G711Variant,
-  volume = 0.05,
+  volume = 1,
 ): Promise<Buffer> {
   return runFfmpeg([
       '-nostdin',
@@ -224,7 +224,7 @@ function ffmpegInput(path: string, volume: number): string[] {
 export async function fileToRtpAudio(
   path: string,
   codec: SendCodec,
-  volume = 0.05,
+  volume = 1,
 ): Promise<EncodedAudio> {
   if (codec.name === 'pcma' || codec.name === 'pcmu') {
     const variant: G711Variant = codec.name === 'pcma' ? 'PCMA' : 'PCMU';

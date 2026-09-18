@@ -65,6 +65,7 @@
     "streams": "node --experimental-transform-types src/streams.ts",
     "m1": "node --experimental-transform-types src/m1.ts",
     "m3": "node --experimental-transform-types src/m3.ts",
+    "diagnose": "node --experimental-transform-types src/diagnose.ts",
     "play": "node --experimental-transform-types src/cli.ts",
     "test": "node --experimental-transform-types --test",
     "typecheck": "tsc --noEmit"
