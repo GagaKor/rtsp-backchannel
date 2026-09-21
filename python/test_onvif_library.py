@@ -747,5 +747,49 @@ class OnvifLibraryTests(unittest.TestCase):
         self.assertIn("<wsse:Username>admin</wsse:Username>", header)
 
 
+class ClockProbeAuthenticationTests(unittest.TestCase):
+    """A Zycoo SW15 answers 401 to the clock probe ONVIF says needs no auth."""
+
+    CLOCK_XML = (
+        '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">'
+        "<s:Body><GetSystemDateAndTimeResponse>"
+        "<UTCDateTime><Time><Hour>8</Hour><Minute>3</Minute>"
+        "<Second>34</Second></Time>"
+        "<Date><Year>2026</Year><Month>9</Month><Day>21</Day></Date>"
+        "</UTCDateTime></GetSystemDateAndTimeResponse></s:Body></s:Envelope>"
+    )
+
+    def test_retries_the_clock_probe_with_credentials_after_401(self):
+        from rtsp_backchannel import onvif
+
+        headers = []
+
+        def fake_response(url, body, header, timeout, stop_on_auth_error=False):
+            headers.append(header)
+            if not header:
+                return onvif._SoapResponse(401, "")
+            return onvif._SoapResponse(200, self.CLOCK_XML)
+
+        with patch.object(onvif, "_soap_response", side_effect=fake_response):
+            device = onvif.OnvifDevice("camera", "admin", "admin")
+            moment = device._system_time("http://camera/onvif/device_service")
+
+        self.assertEqual(moment.year, 2026)
+        self.assertEqual(moment.hour, 8)
+        # The spec-compliant unauthenticated probe is still tried first.
+        self.assertEqual(headers[0], "")
+        self.assertIn("PasswordDigest", headers[1])
+
+    def test_keeps_the_401_failure_when_there_are_no_credentials(self):
+        from rtsp_backchannel import onvif
+
+        with patch.object(
+            onvif, "_soap_response", return_value=onvif._SoapResponse(401, "")
+        ):
+            device = onvif.OnvifDevice("camera", "", "")
+            with self.assertRaises(RuntimeError):
+                device._system_time("http://camera/onvif/device_service")
+
+
 if __name__ == "__main__":
     unittest.main()

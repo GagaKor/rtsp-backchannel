@@ -9,7 +9,7 @@ import { RtspClient } from './rtsp/backchannelClient.ts';
 import {
   parseSdp,
   findBackchannelAudio,
-  pickSendCodec,
+  pickSendTrack,
   type CodecPreference,
   type SendCodec,
 } from './rtsp/sdp.ts';
@@ -349,10 +349,13 @@ export async function openOnvifBackchannel(
     const desc = await rtsp.describe(streamUri, { backchannel: true });
     if (desc.status !== 200) throw new Error(`backchannel DESCRIBE ${desc.statusLine}`);
     const sdp = parseSdp(desc.body);
-    const track = findBackchannelAudio(sdp);
-    if (!track?.control) throw new BackchannelUnavailableError();
     const preference = options.codec ?? 'auto';
-    const codec = pickSendCodec(track, preference);
+    // The codec may live in any sendonly section, not just the first one, so
+    // resolve track and codec together before deciding the session is usable.
+    const chosen = pickSendTrack(sdp, preference);
+    const track = chosen?.track ?? findBackchannelAudio(sdp);
+    if (!track?.control) throw new BackchannelUnavailableError();
+    const codec = chosen?.codec;
     if (!codec) {
       if (preference === 'auto') {
         throw new Error('no supported backchannel audio codec offered');

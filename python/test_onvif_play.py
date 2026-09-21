@@ -211,6 +211,28 @@ class DirectionlessTracksRtsp(FakeRtsp):
     )
 
 
+class SplitCodecTracksRtsp(FakeRtsp):
+    """A Zycoo IPS-M1-BW: PCMU and PCMA sit in two sendonly sections that
+    share one a=control URI instead of on one m= line, so reading only the
+    first section pins every session to PCMU."""
+
+    describe_sdp = (
+        "v=0\r\n"
+        "m=video 0 RTP/AVP 96\r\n"
+        "a=control:stream=0\r\n"
+        "a=recvonly\r\n"
+        "a=rtpmap:96 H264/90000\r\n"
+        "m=audio 0 RTP/AVP 0\r\n"
+        "a=control:stream=1\r\n"
+        "a=sendonly\r\n"
+        "a=rtpmap:0 PCMU/8000\r\n"
+        "m=audio 0 RTP/AVP 8\r\n"
+        "a=control:stream=1\r\n"
+        "a=sendonly\r\n"
+        "a=rtpmap:8 PCMA/8000\r\n"
+    )
+
+
 class ParameterizedSessionRtsp(FakeRtsp):
     session_header = "  durable-session ; mode=play ; TiMeOuT = 42  "
 
@@ -4723,3 +4745,81 @@ class BackchannelRequestTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SplitCodecSectionsTransportTests(unittest.TestCase):
+    def test_send_track_exposes_a_codec_from_a_later_sendonly_section(self):
+        from rtsp_backchannel import playback
+
+        with onvif_play.open_backchannel_transport(
+            "example.invalid",
+            "fake-user",
+            "fake-password",
+            stream_uri="rtsp://example.invalid/live",
+            rtsp_factory=SplitCodecTracksRtsp,
+        ) as transport:
+            selected = playback._select_codec(transport.send_track, "pcma")
+
+        self.assertEqual(selected.codec, "pcma")
+        self.assertEqual(selected.payload_type, 8)
+
+
+class LegacyOnvifClockProbeTests(unittest.TestCase):
+    """A Zycoo SW15 keeps ONVIF on :8000 and wants auth for the clock probe."""
+
+    CLOCK_XML = (
+        "<s:Envelope><s:Body><GetSystemDateAndTimeResponse><UTCDateTime>"
+        "<Time><Hour>8</Hour><Minute>3</Minute><Second>34</Second></Time>"
+        "<Date><Year>2026</Year><Month>9</Month><Day>21</Day></Date>"
+        "</UTCDateTime></GetSystemDateAndTimeResponse></s:Body></s:Envelope>"
+    )
+
+    def test_clock_probe_retries_with_credentials_after_401(self):
+        headers = []
+
+        def fake(url, body, header=""):
+            headers.append(header)
+            if not header:
+                return (401, "")
+            return (200, self.CLOCK_XML)
+
+        with patch.object(onvif_play, "soap_response", side_effect=fake):
+            when = onvif_play.dev_time(
+                "http://camera:8000/onvif/device_service", "admin", "admin"
+            )
+
+        self.assertEqual((when.year, when.month, when.day), (2026, 9, 21))
+        self.assertEqual(headers[0], "")
+        self.assertIn("PasswordDigest", headers[1])
+
+    def test_stream_uri_falls_back_to_the_alternate_onvif_port(self):
+        seen = []
+
+        def fake(url, body, header=""):
+            seen.append(url)
+            if ":8000" not in url:
+                return (401, "")
+            if "GetSystemDateAndTime" in body:
+                return (200, self.CLOCK_XML)
+            if "GetDeviceInformation" in body:
+                return (
+                    200,
+                    "<GetDeviceInformationResponse><Model>SW15</Model>"
+                    "</GetDeviceInformationResponse>",
+                )
+            if "GetCapabilities" in body:
+                return (200, "<Capabilities/>")
+            if "GetProfiles" in body:
+                return (200, '<Profiles token="p1"/>')
+            if "GetStreamUri" in body:
+                return (200, "<Uri>rtsp://camera:554/MainStream</Uri>")
+            return (200, "<Response/>")
+
+        with patch.object(onvif_play, "soap_response", side_effect=fake):
+            uri, _model = onvif_play.onvif_stream_uri("camera", "admin", "admin")
+
+        self.assertEqual(uri, "rtsp://camera:554/MainStream")
+        self.assertTrue(any(":8000" in url for url in seen))
+        # the media service inherits the port that actually answered
+        self.assertTrue(any(":8000" in url and "media_service" in url for url in seen))
+

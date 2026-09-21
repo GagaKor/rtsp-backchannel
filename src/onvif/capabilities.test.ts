@@ -1637,3 +1637,25 @@ test('the backchannel probe takes credentials from the stream URI when it carrie
   ]);
   assert.deepEqual(calls.described, ['rtsp://other:9554/stream9']);
 });
+
+test('the backchannel probe finds a control URI in a later sendonly section', async () => {
+  // A device may split its backchannel offer across sendonly sections and
+  // carry the control URI on a later one; reporting "no backchannel" then
+  // sends the caller down the VIGI fallback for a working ONVIF speaker.
+  const calls = emptyCalls();
+  const body = 'v=0\r\no=- 0 0 IN IP4 cam\r\ns=-\r\n'
+    + 'm=video 0 RTP/AVP 96\r\na=control:track1\r\n'
+    + 'm=audio 0 RTP/AVP 0\r\na=sendonly\r\n'
+    + 'm=audio 0 RTP/AVP 8\r\na=control:track2\r\na=sendonly\r\n';
+
+  const found = await probeOnvifBackchannelWithDependencies(
+    'cam', 'admin', 'secret', {}, probeHarness(calls, {
+      describe: async (uri) => {
+        calls.described.push(uri);
+        return { status: 200, statusLine: 'RTSP/1.0 200 OK', body };
+      },
+    }),
+  );
+
+  assert.equal(found, true);
+});
