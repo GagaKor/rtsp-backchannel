@@ -1,0 +1,24 @@
+#!/bin/sh
+# Refuse a direct push to master.
+#
+# master is written by merging a `dev` -> `master` pull request, and only that
+# path raises the version: version-bump.yml runs for head_ref == 'dev' alone.
+# A push that lands here directly ships nothing and strands dev at the old
+# version, so it is worth catching on this machine rather than in review.
+#
+# Enable once per clone:  git config core.hooksPath .githooks
+# Override a single push: git push --no-verify
+
+while read -r _local_ref _local_sha remote_ref _remote_sha; do
+	case "$remote_ref" in
+	refs/heads/master)
+		echo "pre-push: refusing to push straight to master." >&2
+		echo "  Work reaches master through a 'dev' -> 'master' pull request." >&2
+		echo "  Pushing here skips the version bump, so the release never happens." >&2
+		echo "  See CONTRIBUTING.md; override this once with 'git push --no-verify'." >&2
+		exit 1
+		;;
+	esac
+done
+
+exit 0

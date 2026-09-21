@@ -13,6 +13,36 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  branch-flow:
+    name: Branch flow
+    # Only a pull request has a head branch to judge; a push to master has
+    # already happened and this job would have nothing left to protect.
+    if: github.event_name == 'pull_request' && github.base_ref == 'master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # A feature branch merged straight into master skips version-bump.yml,
+      # whose job runs only for head_ref == 'dev'. The CHANGELOG entry then
+      # exists on master alone, so the next dev -> master pull request reads an
+      # empty [Unreleased] and publishes nothing -- the release is lost with
+      # every check green. Refuse the merge instead.
+      - name: Require dev or dependabot as the source branch
+        env:
+          # Through the environment, not string interpolation: a branch name is
+          # attacker-controlled text and must never be pasted into the script.
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          set -euo pipefail
+          case "$HEAD_REF" in
+          dev | dependabot/*)
+            echo "'$HEAD_REF' may target master."
+            ;;
+          *)
+            echo "::error::'$HEAD_REF' cannot target master. Retarget this pull request at 'dev'; master takes only 'dev' and dependabot branches. See CONTRIBUTING.md."
+            exit 1
+            ;;
+          esac
+
   typescript:
     name: TypeScript / Node.js 22
     runs-on: ubuntu-latest
