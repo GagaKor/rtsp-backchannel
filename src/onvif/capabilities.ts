@@ -16,7 +16,7 @@ import {
 } from './xml.ts';
 import { parseRtspTarget } from '../backchannel.ts';
 import { RtspClient } from '../rtsp/backchannelClient.ts';
-import { findBackchannelAudio, parseSdp } from '../rtsp/sdp.ts';
+import { findBackchannelAudioTracks, parseSdp } from '../rtsp/sdp.ts';
 import { openVigiControl } from '../vigi/control.ts';
 
 const SOAP_12_NS = 'http://www.w3.org/2003/05/soap-envelope';
@@ -722,8 +722,9 @@ export async function probeOnvifBackchannelWithDependencies(
     await rtsp.connect();
     const desc = await rtsp.describe(endpoint.uri, { backchannel: true });
     if (desc.status !== 200) throw new Error(`backchannel DESCRIBE ${desc.statusLine}`);
-    const track = findBackchannelAudio(parseSdp(desc.body));
-    return Boolean(track?.control);
+    // The control URI may sit on any sendonly section, not just the first.
+    return findBackchannelAudioTracks(parseSdp(desc.body))
+      .some((track) => Boolean(track.control));
   } finally {
     rtsp.close();
   }

@@ -166,6 +166,56 @@ pub fn pick_g711_codec(track: &MediaTrack) -> Option<G711Codec> {
     None
 }
 
+/// Choose the sendonly track and the codec to transmit on it.
+///
+/// A device may split one backchannel offer across several sendonly audio
+/// sections instead of listing every payload type on a single m= line: a Zycoo
+/// IPS-M1-BW advertises PCMU and PCMA as two m= lines that share one control
+/// URI. Applying the codec preference across all of them -- rather than within
+/// whichever section comes first -- is what makes the later section reachable.
+pub fn pick_send_track(
+    tracks: &[MediaTrack],
+    preference: CodecPreference,
+) -> Result<(usize, SendCodec), String> {
+    let sendonly: Vec<usize> = tracks
+        .iter()
+        .enumerate()
+        .filter(|(_, track)| track.media == "audio" && track.direction == "sendonly")
+        .map(|(index, _)| index)
+        .collect();
+    let first = *sendonly
+        .first()
+        .ok_or("no sendonly audio backchannel track")?;
+    if sendonly.len() == 1 {
+        return pick_send_codec(&tracks[first], preference).map(|codec| (first, codec));
+    }
+    for candidate in codec_search_order(preference) {
+        for &index in &sendonly {
+            if let Ok(codec) = pick_send_codec(&tracks[index], candidate) {
+                return Ok((index, codec));
+            }
+        }
+    }
+    // Nothing matched anywhere: report exactly what one track alone would say,
+    // so the MP4A-LATM and AAC diagnostics keep their wording.
+    pick_send_codec(&tracks[first], preference).map(|codec| (first, codec))
+}
+
+fn codec_search_order(preference: CodecPreference) -> Vec<CodecPreference> {
+    match preference {
+        CodecPreference::Auto => vec![
+            CodecPreference::Pcma,
+            CodecPreference::Pcmu,
+            CodecPreference::G72632,
+            CodecPreference::G72624,
+            CodecPreference::G72616,
+            CodecPreference::G72640,
+            CodecPreference::Aac,
+        ],
+        explicit => vec![explicit],
+    }
+}
+
 pub fn pick_send_codec(
     track: &MediaTrack,
     preference: CodecPreference,
@@ -397,7 +447,9 @@ mod tests {
 
     use crate::audio::{AudioCodec, CodecPreference, G711Variant, ffmpeg_encode_args};
 
-    use super::{find_backchannel_audio, parse_sdp, pick_g711_codec, pick_send_codec};
+    use super::{
+        find_backchannel_audio, parse_sdp, pick_g711_codec, pick_send_codec, pick_send_track,
+    };
 
     #[test]
     fn finds_receive_tracks_and_prefers_pcma_on_the_sendonly_track() {
@@ -683,5 +735,50 @@ mod tests {
         assert!(error.contains("MP4A-LATM"));
         assert!(error.contains("unsupported"));
         assert!(error.contains("MPEG4-GENERIC"));
+    }
+
+    #[test]
+    fn reaches_pcma_offered_in_a_later_sendonly_section() {
+        // A Zycoo IPS-M1-BW splits its two G.711 variants across two sendonly
+        // sections that share one control URI, rather than listing both
+        // payload types on a single m= line. Reading only the first section
+        // pinned every session to PCMU and failed an explicit PCMA request.
+        let parsed = parse_sdp(
+            "v=0\r\n\
+             m=video 0 RTP/AVP 96\r\n\
+             a=recvonly\r\n\
+             a=control:stream=0\r\n\
+             m=audio 0 RTP/AVP 0\r\n\
+             a=sendonly\r\n\
+             a=control:stream=1\r\n\
+             a=rtpmap:0 PCMU/8000\r\n\
+             m=audio 0 RTP/AVP 8\r\n\
+             a=sendonly\r\n\
+             a=control:stream=1\r\n\
+             a=rtpmap:8 PCMA/8000\r\n",
+        );
+
+        let (index, codec) = pick_send_track(&parsed, CodecPreference::Pcma).unwrap();
+        assert_eq!(codec.codec, AudioCodec::Pcma);
+        assert_eq!(codec.payload_type, 8);
+        assert_eq!(parsed[index].control.as_deref(), Some("stream=1"));
+
+        let (_, automatic) = pick_send_track(&parsed, CodecPreference::Auto).unwrap();
+        assert_eq!(automatic.codec, AudioCodec::Pcma);
+    }
+
+    #[test]
+    fn picks_the_only_sendonly_section_when_one_is_offered() {
+        let parsed = parse_sdp(
+            "v=0\r\n\
+             m=audio 0 RTP/AVP 0\r\n\
+             a=sendonly\r\n\
+             a=control:stream=1\r\n\
+             a=rtpmap:0 PCMU/8000\r\n",
+        );
+
+        let (index, codec) = pick_send_track(&parsed, CodecPreference::Auto).unwrap();
+        assert_eq!(index, 0);
+        assert_eq!(codec.codec, AudioCodec::Pcmu);
     }
 }

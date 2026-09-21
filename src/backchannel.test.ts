@@ -1004,3 +1004,89 @@ test('sets up companion tracks whose SDP omits a direction attribute', async () 
     `${base}/audioback`,
   ]);
 });
+
+test('reaches a PCMA offer that the device puts in a second sendonly section', async () => {
+  // Recorded from a Zycoo IPS-M1-BW speaker. It splits its two G.711 variants
+  // across two sendonly audio sections that share one a=control URL instead of
+  // listing both payload types on one m= line. Selecting the codec inside the
+  // first sendonly section alone pinned every session to PCMU and made an
+  // explicit --codec pcma fail against a device that plays PCMA perfectly.
+  const setupUris: string[] = [];
+  const server = net.createServer((socket) => {
+    let input = Buffer.alloc(0);
+    socket.on('data', (chunk) => {
+      input = Buffer.concat([input, Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)]);
+      while (true) {
+        const end = input.indexOf('\r\n\r\n');
+        if (end < 0) return;
+        const request = input.subarray(0, end).toString('utf8');
+        input = input.subarray(end + 4);
+        const [requestLine, ...headerLines] = request.split('\r\n');
+        const [method, uri] = requestLine.split(' ');
+        const cseq = headerLines
+          .find((line) => line.toLowerCase().startsWith('cseq:'))
+          ?.slice('cseq:'.length)
+          .trim();
+        if (method === 'DESCRIBE') {
+          const body = [
+            'v=0',
+            'o=- 0 0 IN IP4 127.0.0.1',
+            'c=IN IP4 0.0.0.0',
+            't=0 0',
+            's=Session streamed with GStreamer',
+            'a=control:*',
+            'm=video 0 RTP/AVP 96',
+            'a=rtpmap:96 H264/90000',
+            'a=control:stream=0',
+            'a=recvonly',
+            'm=audio 0 RTP/AVP 0',
+            'a=rtpmap:0 PCMU/8000',
+            'a=control:stream=1',
+            'a=sendonly',
+            'm=audio 0 RTP/AVP 8',
+            'a=rtpmap:8 PCMA/8000',
+            'a=control:stream=1',
+            'a=sendonly',
+            '',
+          ].join('\r\n');
+          socket.write(
+            `RTSP/1.0 200 OK\r\nCSeq: ${cseq}\r\nContent-Type: application/sdp\r\n` +
+              `Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`,
+          );
+        } else if (method === 'SETUP') {
+          setupUris.push(uri);
+          const interleaved = headerLines
+            .find((line) => line.toLowerCase().startsWith('transport:'))
+            ?.match(/interleaved=(\d+-\d+)/)?.[1] ?? '0-1';
+          socket.write(
+            `RTSP/1.0 200 OK\r\nCSeq: ${cseq}\r\nSession: zycoo-session;timeout=60\r\n` +
+              `Transport: RTP/AVP/TCP;unicast;interleaved=${interleaved}\r\n` +
+              'Content-Length: 0\r\n\r\n',
+          );
+        } else {
+          socket.write(`RTSP/1.0 200 OK\r\nCSeq: ${cseq}\r\nContent-Length: 0\r\n\r\n`);
+        }
+      }
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+  const base = `rtsp://127.0.0.1:${address.port}/MainStream`;
+
+  try {
+    const session = await backchannel.openBackchannel(base);
+    try {
+      assert.equal(session.codec.name, 'pcma');
+      assert.equal(session.codec.payloadType, 8);
+    } finally {
+      await session.close();
+    }
+  } finally {
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
+
+  assert.deepEqual(setupUris, [`${base}/stream=0`, `${base}/stream=1`]);
+});

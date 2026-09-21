@@ -881,3 +881,76 @@ test('keeps credential-like hosts and service URLs out of final connect errors',
     /viewer|secret|@camera/,
   );
 });
+
+test('connects to a device that demands credentials for GetSystemDateAndTime', async () => {
+  // A Zycoo SW15 answers 401 to the clock probe that ONVIF says must work
+  // unauthenticated. Without a retry the probe fails, every candidate URL is
+  // exhausted, and an otherwise healthy speaker is reported unreachable.
+  const clockProbesWithoutAuth: number[] = [];
+  const server = http.createServer((request, response) => {
+    let body = '';
+    request.setEncoding('utf8');
+    request.on('data', (chunk) => {
+      body += chunk;
+    });
+    request.on('end', () => {
+      const authenticated = body.includes('UsernameToken');
+      if (!authenticated) {
+        if (body.includes('GetSystemDateAndTime')) clockProbesWithoutAuth.push(1);
+        response.writeHead(401, { 'Content-Type': 'application/soap+xml' });
+        response.end('');
+        return;
+      }
+      response.writeHead(200, { 'Content-Type': 'application/soap+xml' });
+      if (body.includes('GetSystemDateAndTime')) {
+        response.end(
+          '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" '
+            + 'xmlns:tt="http://www.onvif.org/ver10/schema">'
+            + '<s:Body><tds:GetSystemDateAndTimeResponse '
+            + 'xmlns:tds="http://www.onvif.org/ver10/device/wsdl">'
+            + '<tt:UTCDateTime>'
+            + '<tt:Time><tt:Hour>8</tt:Hour><tt:Minute>3</tt:Minute>'
+            + '<tt:Second>34</tt:Second></tt:Time>'
+            + '<tt:Date><tt:Year>2026</tt:Year><tt:Month>9</tt:Month>'
+            + '<tt:Day>21</tt:Day></tt:Date></tt:UTCDateTime>'
+            + '</tds:GetSystemDateAndTimeResponse></s:Body></s:Envelope>',
+        );
+        return;
+      }
+      if (body.includes('GetDeviceInformation')) {
+        response.end(
+          '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">'
+            + '<s:Body><tds:GetDeviceInformationResponse '
+            + 'xmlns:tds="http://www.onvif.org/ver10/device/wsdl">'
+            + '<tds:Manufacturer>ZYCOO</tds:Manufacturer>'
+            + '<tds:Model>SW15</tds:Model>'
+            + '</tds:GetDeviceInformationResponse></s:Body></s:Envelope>',
+        );
+        return;
+      }
+      response.end(
+        '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">'
+          + '<s:Body><tds:GetCapabilitiesResponse '
+          + 'xmlns:tds="http://www.onvif.org/ver10/device/wsdl"/>'
+          + '</s:Body></s:Envelope>',
+      );
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+  const url = `http://127.0.0.1:${address.port}/onvif/device_service`;
+
+  try {
+    const device = new OnvifDevice('camera', 'admin', 'admin', { deviceUrls: [url] });
+    const info = await device.connect();
+    assert.equal(info.manufacturer, 'ZYCOO');
+    assert.equal(info.model, 'SW15');
+    // The spec-compliant unauthenticated probe is still tried first.
+    assert.equal(clockProbesWithoutAuth.length, 1);
+  } finally {
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
+});

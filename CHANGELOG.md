@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The backchannel codec is now chosen across every `a=sendonly` audio section
+  rather than inside the first one, in all three packages. A device may split
+  one offer over several `m=audio` lines instead of listing every payload type
+  on one: a Zycoo IPS-M1-BW (firmware s1.0.1) advertises PCMU and PCMA as two
+  sendonly sections that share a single `a=control` URL. Every session was
+  pinned to whichever codec came first, and an explicit `pcma` preference
+  failed with "not offered" against a speaker that plays PCMA correctly. The
+  ONVIF capability probe likewise accepts a control URI found on any sendonly
+  section. Devices that list their payload types on one `m=` line negotiate
+  exactly as before.
+- `GetSystemDateAndTime` is retried with credentials when a device answers
+  `401`, in all three packages. ONVIF keeps that call unauthenticated because
+  the WS-Security digest is signed with the device clock it returns, but a
+  Zycoo SW15 (firmware s2.1.4) demands credentials anyway, so every candidate
+  device service URL failed and a reachable speaker was reported unreachable.
+  The retry signs with local time, which the digest would have used before any
+  offset is known.
+- The Python `play` path resolves the ONVIF device service over the same
+  candidate URLs as the packaged client instead of assuming port 80, and
+  derives the media service from whichever device URL answered. A Zycoo SW15
+  serves ONVIF on `:8000` and answers `:80` with its web UI, which left the
+  speaker unreachable from that entry point.
+
 ## [0.5.0] - 2026-09-21
 
 ### Changed

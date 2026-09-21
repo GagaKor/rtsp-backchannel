@@ -5,7 +5,7 @@ use crate::audio::{AudioCodec, AudioFrame, CodecPreference, G711Variant, frame_g
 use crate::onvif::OnvifDevice;
 use crate::rtp::{PacingState, RtpPacketizer, interleave};
 use crate::rtsp::{RtspClient, has_rtsp_scheme, sanitize_rtsp_uri};
-use crate::sdp::{find_backchannel_audio, parse_sdp, pick_send_codec};
+use crate::sdp::{parse_sdp, pick_send_track};
 
 pub const SAMPLE_RATE: u64 = 8000;
 pub const PACKET_MS: u64 = 40;
@@ -207,17 +207,14 @@ impl BackchannelSession {
             let sdp = String::from_utf8(describe.body)
                 .map_err(|_| "RTSP DESCRIBE returned non-UTF-8 SDP".to_owned())?;
             let tracks = parse_sdp(&sdp);
-            let send_index = tracks
-                .iter()
-                .position(|track| track.media == "audio" && track.direction == "sendonly")
-                .ok_or("no sendonly audio backchannel track")?;
-            let send_track =
-                find_backchannel_audio(&tracks).ok_or("no sendonly audio backchannel track")?;
+            // Track and codec are resolved together: the codec may live in any
+            // sendonly section, not only the first one.
+            let (send_index, codec) = pick_send_track(&tracks, preference)?;
+            let send_track = &tracks[send_index];
             let send_control = send_track
                 .control
                 .clone()
                 .ok_or("backchannel track has no control URI")?;
-            let codec = pick_send_codec(send_track, preference)?;
             let content_base = describe.headers.get("content-base").map(String::as_str);
 
             let mut requested_channel = 0u8;
