@@ -70,12 +70,42 @@ jobs:
           echo "version=$(printf '%s' "$summary" | jq -r '.version')" >> "$GITHUB_OUTPUT"
           printf '%s\n' "$summary" >> "$GITHUB_STEP_SUMMARY"
 
-      # A GITHUB_TOKEN push starts no workflow run, so the pull request's own
-      # checks will not re-run against the bump commit. This is the only place
-      # the rewritten version assertion is exercised before master.
-      - name: Verify the bumped tree
+      # A GITHUB_TOKEN push starts no workflow run, and when GitHub does create
+      # one it can park it behind an approval, so the pull request's own checks
+      # cannot be relied on to re-run against the bump commit. This job is
+      # therefore the only place the bumped tree is actually tested before it
+      # reaches master, where release.yml runs the same suites immediately
+      # before publishing -- and a suite that fails there publishes some
+      # registries and not others.
+      #
+      # Both suites that read release-managed files run here. The TypeScript
+      # one is not optional: src/index.test.ts reads CHANGELOG.md, package.json
+      # and package-lock.json, and its engines guard broke on the very first
+      # automated bump. Python's suite asserts the version in pyproject.toml and
+      # round-trips the real CHANGELOG.md.
+      #
+      # Rust is deliberately left to CI. Nothing under rust/ asserts
+      # CARGO_PKG_VERSION or reads CHANGELOG.md, so a version-only rewrite
+      # cannot break it, and Cargo.toml/Cargo.lock agreement is already checked
+      # structurally by the bump script's own gate. Running it here would add
+      # about ninety seconds of toolchain and build for no coverage.
+      - name: Verify the bumped tree (Python)
         if: steps.bump.outputs.bumped == 'true'
-        run: PYTHONPATH=python:. python -m unittest test_library_api
+        run: PYTHONPATH=python:. python -m unittest discover -s python -p 'test_*.py'
+
+      - uses: actions/setup-node@v7
+        if: steps.bump.outputs.bumped == 'true'
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Verify the bumped tree (TypeScript)
+        if: steps.bump.outputs.bumped == 'true'
+        run: |
+          set -euo pipefail
+          npm ci
+          npm test
+          npm run typecheck
 
       - name: Commit and push the bump
         if: steps.bump.outputs.bumped == 'true'
