@@ -22,7 +22,7 @@ import { RtspClient, BACKCHANNEL_REQUIRE } from './rtsp/backchannelClient.ts';
 import {
   parseSdp,
   findBackchannelAudio,
-  pickSendCodec,
+  pickSendTrack,
   type CodecPreference,
   type MediaDescription,
 } from './rtsp/sdp.ts';
@@ -234,7 +234,8 @@ async function main(): Promise<void> {
     log('---------------\n');
 
     const sdp = parseSdp(desc.body);
-    const track = findBackchannelAudio(sdp);
+    const chosen = pickSendTrack(sdp, codecPreference);
+    const track = chosen?.track ?? findBackchannelAudio(sdp);
     log('[*] SDP tracks as this library parses them');
     for (const m of sdp.media) log(describeTrack(m, m === track));
     if (!track?.control) {
@@ -248,7 +249,7 @@ async function main(): Promise<void> {
       return;
     }
 
-    const codec = pickSendCodec(track, codecPreference);
+    const codec = chosen?.codec;
     if (!codec) throw new Error('no supported backchannel codec offered');
     log(`\n[*] codec chosen: ${codec.name} pt=${codec.payloadType} ` +
       `clock=${codec.clockRate}`);

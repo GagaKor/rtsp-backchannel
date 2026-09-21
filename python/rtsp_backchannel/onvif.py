@@ -996,18 +996,37 @@ class OnvifDevice:
             include_status=True,
         )
         assert isinstance(response, _SoapResponse)
+        return self._require_ok(response)
+
+    @staticmethod
+    def _require_ok(response: _SoapResponse) -> _SoapResponse:
         if response.status_code in (401, 403):
             raise RuntimeError("ONVIF authentication failed")
         if not 200 <= response.status_code < 300:
             raise RuntimeError(f"HTTP {response.status_code}")
         return response
 
+    def _system_time_xml(self, url: str) -> str:
+        """Read the device clock, retrying with credentials if it demands them.
+
+        ONVIF keeps GetSystemDateAndTime unauthenticated on purpose: the
+        WS-Security digest is signed with the device's own clock, so asking
+        for that clock cannot itself require it. Devices that answer 401
+        anyway -- a Zycoo SW15 does -- are retried with credentials signed by
+        local time, the same time the digest would use before any offset is
+        known. That retry needs both clocks inside the device's replay window.
+        """
+        body = f'<GetSystemDateAndTime xmlns="{_DEVICE_NS}"/>'
+        response = self._request(
+            url, body, authenticated=False, include_status=True
+        )
+        assert isinstance(response, _SoapResponse)
+        if response.status_code == 401 and (self.user or self.password):
+            return self._call_response(url, body, authenticated=True).xml
+        return self._require_ok(response).xml
+
     def _system_time(self, url: str) -> datetime.datetime:
-        xml = self._call_response(
-            url,
-            f'<GetSystemDateAndTime xmlns="{_DEVICE_NS}"/>',
-            authenticated=False,
-        ).xml
+        xml = self._system_time_xml(url)
         root = _safe_xml_fromstring(xml)
         utc = next(
             (

@@ -105,60 +105,69 @@ export function findBackchannelAudio(sdp: Sdp): MediaDescription | undefined {
   return sdp.media.find((m) => m.media === 'audio' && m.direction === 'sendonly');
 }
 
+/** Every sendonly audio track, in the order the SDP offered them. */
+export function findBackchannelAudioTracks(sdp: Sdp): MediaDescription[] {
+  return sdp.media.filter((m) => m.media === 'audio' && m.direction === 'sendonly');
+}
+
 /** Static RTP payload types we may use without an explicit rtpmap. */
 const STATIC: Record<number, RtpMap> = {
   0: { payloadType: 0, encoding: 'PCMU', clockRate: 8000 },
   8: { payloadType: 8, encoding: 'PCMA', clockRate: 8000 },
 };
 
-/**
- * Choose which codec to send on the backchannel. Auto mode preserves the
- * historical PCMA then PCMU preference before considering G.726 and AAC.
- * Explicit preferences never fall back to a different codec.
- */
-export function pickSendCodec(
-  track: MediaDescription,
-  preference: CodecPreference = 'auto',
-): SendCodec | undefined {
-  const offered = track.formats.map(Number);
-  const supported: Array<{
-    name: AudioCodecName;
-    encoding: string;
-    clockRate?: number;
-  }> = [
-    { name: 'pcma', encoding: 'PCMA', clockRate: 8000 },
-    { name: 'pcmu', encoding: 'PCMU', clockRate: 8000 },
-    { name: 'g726-32', encoding: 'G726-32', clockRate: 8000 },
-    { name: 'g726-24', encoding: 'G726-24', clockRate: 8000 },
-    { name: 'g726-16', encoding: 'G726-16', clockRate: 8000 },
-    { name: 'g726-40', encoding: 'G726-40', clockRate: 8000 },
-    { name: 'aac', encoding: 'MPEG4-GENERIC' },
-  ];
-  const candidates = preference === 'auto'
-    ? supported
-    : supported.filter((candidate) => candidate.name === preference);
+interface CodecCandidate {
+  name: AudioCodecName;
+  encoding: string;
+  clockRate?: number;
+}
 
-  for (const candidate of candidates) {
-    for (const pt of offered) {
-      const rm = track.rtpmaps[pt] ?? STATIC[pt];
-      if (
-        rm &&
-        rm.encoding.toUpperCase() === candidate.encoding &&
-        (candidate.clockRate === undefined || rm.clockRate === candidate.clockRate) &&
-        (candidate.name === 'aac' || (rm.channels ?? 1) === 1)
-      ) {
-        const fmtp = track.fmtps[pt];
-        if (candidate.name === 'aac') validateAacHbrFmtp(fmtp, rm);
-        return {
-          name: candidate.name,
-          ...rm,
-          ...(fmtp ? { fmtp } : {}),
-        };
-      }
+/** Compatibility order: PCMA, then PCMU, then G.726, then AAC. */
+const CODEC_CANDIDATES: CodecCandidate[] = [
+  { name: 'pcma', encoding: 'PCMA', clockRate: 8000 },
+  { name: 'pcmu', encoding: 'PCMU', clockRate: 8000 },
+  { name: 'g726-32', encoding: 'G726-32', clockRate: 8000 },
+  { name: 'g726-24', encoding: 'G726-24', clockRate: 8000 },
+  { name: 'g726-16', encoding: 'G726-16', clockRate: 8000 },
+  { name: 'g726-40', encoding: 'G726-40', clockRate: 8000 },
+  { name: 'aac', encoding: 'MPEG4-GENERIC' },
+];
+
+function codecCandidates(preference: CodecPreference): CodecCandidate[] {
+  return preference === 'auto'
+    ? CODEC_CANDIDATES
+    : CODEC_CANDIDATES.filter((candidate) => candidate.name === preference);
+}
+
+/** Match one codec candidate against a single track's payload types. */
+function matchCandidate(
+  track: MediaDescription,
+  candidate: CodecCandidate,
+): SendCodec | undefined {
+  for (const pt of track.formats.map(Number)) {
+    const rm = track.rtpmaps[pt] ?? STATIC[pt];
+    if (
+      rm &&
+      rm.encoding.toUpperCase() === candidate.encoding &&
+      (candidate.clockRate === undefined || rm.clockRate === candidate.clockRate) &&
+      (candidate.name === 'aac' || (rm.channels ?? 1) === 1)
+    ) {
+      const fmtp = track.fmtps[pt];
+      if (candidate.name === 'aac') validateAacHbrFmtp(fmtp, rm);
+      return {
+        name: candidate.name,
+        ...rm,
+        ...(fmtp ? { fmtp } : {}),
+      };
     }
   }
+  return undefined;
+}
 
-  const latm = offered
+/** Turn a recognized-but-unusable AAC offer into a clear error, not silence. */
+function rejectLatm(track: MediaDescription, preference: CodecPreference): void {
+  const latm = track.formats
+    .map(Number)
     .map((pt) => track.rtpmaps[pt] ?? STATIC[pt])
     .find((rtpmap) => rtpmap?.encoding.toUpperCase() === 'MP4A-LATM');
   if (latm && (preference === 'auto' || preference === 'aac')) {
@@ -166,6 +175,52 @@ export function pickSendCodec(
       'MP4A-LATM is recognized but not supported; use RFC 3640 MPEG4-GENERIC AAC-hbr',
     );
   }
+}
+
+export interface SendTrackChoice {
+  track: MediaDescription;
+  codec: SendCodec;
+}
+
+/**
+ * Choose the sendonly track and the codec to transmit on it.
+ *
+ * A device may split one backchannel offer across several sendonly audio
+ * sections instead of listing every payload type on a single m= line: a Zycoo
+ * IPS-M1-BW advertises PCMU and PCMA as two m= lines that share one a=control
+ * URL. Applying the codec preference across all of them — rather than within
+ * whichever section happens to come first — is what makes the later section
+ * reachable at all.
+ */
+export function pickSendTrack(
+  sdp: Sdp,
+  preference: CodecPreference = 'auto',
+): SendTrackChoice | undefined {
+  const tracks = findBackchannelAudioTracks(sdp);
+  for (const candidate of codecCandidates(preference)) {
+    for (const track of tracks) {
+      const codec = matchCandidate(track, candidate);
+      if (codec) return { track, codec };
+    }
+  }
+  for (const track of tracks) rejectLatm(track, preference);
+  return undefined;
+}
+
+/**
+ * Choose which codec to send on one already-selected backchannel track. Auto
+ * mode preserves the historical PCMA then PCMU preference before considering
+ * G.726 and AAC. Explicit preferences never fall back to a different codec.
+ */
+export function pickSendCodec(
+  track: MediaDescription,
+  preference: CodecPreference = 'auto',
+): SendCodec | undefined {
+  for (const candidate of codecCandidates(preference)) {
+    const codec = matchCandidate(track, candidate);
+    if (codec) return codec;
+  }
+  rejectLatm(track, preference);
   return undefined;
 }
 

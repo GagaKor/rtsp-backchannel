@@ -655,7 +655,7 @@ class LibraryApiTests(unittest.TestCase):
         )
 
         self.assertEqual(metadata["project"]["name"], "rtsp-backchannel")
-        self.assertEqual(metadata["project"]["version"], "0.5.0")
+        self.assertEqual(metadata["project"]["version"], "0.5.1")
         self.assertEqual(metadata["project"]["requires-python"], ">=3.11")
         self.assertEqual(metadata["project"]["license"], "MIT OR Apache-2.0")
         self.assertEqual(metadata["project"]["readme"], "README.md")
@@ -1607,3 +1607,31 @@ class LibraryApiTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SplitSendonlySectionsTests(unittest.TestCase):
+    """A Zycoo IPS-M1-BW splits G.711 across two sendonly sections."""
+
+    TRACK = (
+        "m=audio 0 RTP/AVP 0\r\n"
+        "a=control:stream=1\r\n"
+        "a=sendonly\r\n"
+        "a=rtpmap:0 PCMU/8000\r\n"
+        "m=audio 0 RTP/AVP 8\r\n"
+        "a=control:stream=1\r\n"
+        "a=sendonly\r\n"
+        "a=rtpmap:8 PCMA/8000\r\n"
+    )
+
+    def test_reaches_pcma_offered_in_a_later_section(self):
+        from rtsp_backchannel import playback
+
+        selected = playback._select_codec(self.TRACK, "pcma")
+        self.assertEqual(selected.codec, "pcma")
+        self.assertEqual(selected.payload_type, 8)
+
+    def test_auto_prefers_pcma_across_sections(self):
+        from rtsp_backchannel import playback
+
+        self.assertEqual(playback._select_codec(self.TRACK, "auto").codec, "pcma")
+

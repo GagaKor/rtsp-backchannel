@@ -316,11 +316,7 @@ impl OnvifDevice {
         self.clock_offset = ChronoDuration::zero();
         for device_url in self.device_urls.clone() {
             let result = (|| {
-                let time_xml = self.soap(
-                    &device_url,
-                    &format!("<GetSystemDateAndTime xmlns=\"{DEVICE_NS}\"/>"),
-                    false,
-                )?;
+                let time_xml = self.system_time_xml(&device_url)?;
                 let device_time = parse_device_time(&time_xml)?;
                 self.clock_offset = device_time.signed_duration_since(Utc::now());
 
@@ -395,6 +391,31 @@ impl OnvifDevice {
         self.media_url
             .as_deref()
             .ok_or_else(|| "call ONVIF connect() first".to_owned())
+    }
+
+    /// Read the device clock, retrying with credentials if it demands them.
+    ///
+    /// ONVIF keeps GetSystemDateAndTime unauthenticated on purpose: the
+    /// WS-Security digest is signed with the device's own clock, so asking for
+    /// that clock cannot itself require it. Devices that answer 401 anyway --
+    /// a Zycoo SW15 does -- are retried with credentials signed by local time,
+    /// the same time the digest would use before any offset is known. That
+    /// retry needs both clocks inside the device's replay window.
+    fn system_time_xml(&self, device_url: &str) -> Result<String, String> {
+        let body = format!("<GetSystemDateAndTime xmlns=\"{DEVICE_NS}\"/>");
+        let (status, xml) = self.soap_response(device_url, &body, false)?;
+        if status == reqwest::StatusCode::UNAUTHORIZED
+            && !(self.user.is_empty() && self.password.is_empty())
+        {
+            return self.soap(device_url, &body, true);
+        }
+        if !status.is_success() {
+            return Err(format!(
+                "ONVIF request to {} returned HTTP {status}",
+                safe_url(device_url)
+            ));
+        }
+        Ok(xml)
     }
 
     fn soap(&self, url: &str, body: &str, authenticated: bool) -> Result<String, String> {
@@ -1126,5 +1147,63 @@ mod tests {
             request.extend_from_slice(&chunk[..read]);
         }
         String::from_utf8(request[..total].to_vec()).unwrap()
+    }
+
+    #[test]
+    fn connect_retries_the_clock_probe_when_the_device_demands_credentials() {
+        // A Zycoo SW15 answers 401 to the clock probe ONVIF says must work
+        // without credentials, so the unauthenticated-only probe failed every
+        // candidate URL and reported a healthy speaker as unreachable.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let device_url = format!("http://127.0.0.1:{port}/onvif/device_service");
+        let media_url = format!("http://127.0.0.1:{port}/onvif/media_service");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server_requests = Arc::clone(&requests);
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            server_requests
+                .lock()
+                .unwrap()
+                .push(read_http_request(&mut stream));
+            write!(
+                stream,
+                "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+
+            let responses = [
+                "<Envelope><UTCDateTime><Time><Hour>8</Hour><Minute>3</Minute><Second>34</Second></Time><Date><Year>2026</Year><Month>9</Month><Day>21</Day></Date></UTCDateTime></Envelope>".to_owned(),
+                "<Envelope><GetDeviceInformationResponse><Model>SW15</Model></GetDeviceInformationResponse></Envelope>".to_owned(),
+                format!("<Envelope><Capabilities><Media><XAddr>{media_url}</XAddr></Media></Capabilities></Envelope>"),
+            ];
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                server_requests
+                    .lock()
+                    .unwrap()
+                    .push(read_http_request(&mut stream));
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/soap+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response.len(),
+                    response
+                )
+                .unwrap();
+            }
+        });
+
+        let mut device =
+            OnvifDevice::with_device_urls("camera", "admin", "admin", vec![device_url]).unwrap();
+        device.connect().unwrap();
+        server.join().unwrap();
+
+        let requests = requests.lock().unwrap();
+        // The spec-compliant unauthenticated probe is still tried first.
+        assert!(requests[0].contains("GetSystemDateAndTime"));
+        assert!(!requests[0].contains("wsse:Security"));
+        // Then the same call is retried with credentials.
+        assert!(requests[1].contains("GetSystemDateAndTime"));
+        assert!(requests[1].contains("wsse:Security"));
     }
 }

@@ -4,6 +4,7 @@ import {
   findBackchannelAudio,
   parseSdp,
   pickSendCodec,
+  pickSendTrack,
   type CodecPreference,
   type MediaDescription,
 } from './sdp.ts';
@@ -292,4 +293,63 @@ test('rejects non-mono PCMA, PCMU, and G.726 offers', () => {
   for (const [preference] of codecs) {
     assert.equal(pickSendCodec(track, preference), undefined);
   }
+});
+
+// A Zycoo IPS-M1-BW speaker splits its two G.711 variants across two separate
+// sendonly audio sections that share one a=control URL, rather than listing
+// both payload types on a single m= line.
+function splitG711Sdp(): ReturnType<typeof parseSdp> {
+  return parseSdp([
+    'v=0',
+    'm=video 0 RTP/AVP 96',
+    'a=control:stream=0',
+    'a=recvonly',
+    'a=rtpmap:96 H264/90000',
+    'm=audio 0 RTP/AVP 0',
+    'a=control:stream=1',
+    'a=sendonly',
+    'a=rtpmap:0 PCMU/8000',
+    'm=audio 0 RTP/AVP 8',
+    'a=control:stream=1',
+    'a=sendonly',
+    'a=rtpmap:8 PCMA/8000',
+    '',
+  ].join('\r\n'));
+}
+
+test('picks PCMA when it is offered in a later sendonly section', () => {
+  const chosen = pickSendTrack(splitG711Sdp(), 'pcma');
+
+  assert.ok(chosen);
+  assert.equal(chosen.codec.name, 'pcma');
+  assert.equal(chosen.codec.payloadType, 8);
+  assert.equal(chosen.track.control, 'stream=1');
+});
+
+test('auto preference reaches PCMA in a later sendonly section', () => {
+  const chosen = pickSendTrack(splitG711Sdp(), 'auto');
+
+  assert.ok(chosen);
+  assert.equal(chosen.codec.name, 'pcma');
+});
+
+test('picks PCMU when it is the only sendonly section offered', () => {
+  const sdp = parseSdp([
+    'v=0',
+    'm=audio 0 RTP/AVP 0',
+    'a=control:stream=1',
+    'a=sendonly',
+    'a=rtpmap:0 PCMU/8000',
+    '',
+  ].join('\r\n'));
+
+  const chosen = pickSendTrack(sdp, 'auto');
+
+  assert.ok(chosen);
+  assert.equal(chosen.codec.name, 'pcmu');
+  assert.equal(chosen.track.control, 'stream=1');
+});
+
+test('reports no track when the requested codec is in no sendonly section', () => {
+  assert.equal(pickSendTrack(splitG711Sdp(), 'g726-32'), undefined);
 });

@@ -373,8 +373,7 @@ export class OnvifDevice {
     });
   }
 
-  private async soap(url: string, body: string, withAuth: boolean): Promise<string> {
-    const response = await this.soapResponse(url, body, withAuth);
+  private unwrapSoap(response: OnvifRawResponse): string {
     if (response.statusCode >= 200 && response.statusCode < 300) {
       if (isSoapFaultEnvelope(response.xml)) throw new Error(SOAP_FAULT_ERROR);
       return response.xml;
@@ -390,8 +389,29 @@ export class OnvifDevice {
     throw new Error(HTTP_RESPONSE_ERROR);
   }
 
+  private async soap(url: string, body: string, withAuth: boolean): Promise<string> {
+    return this.unwrapSoap(await this.soapResponse(url, body, withAuth));
+  }
+
+  /**
+   * ONVIF keeps GetSystemDateAndTime unauthenticated on purpose: the
+   * WS-Security digest is signed with the device's own clock, so asking for
+   * that clock cannot itself require it. Devices that answer 401 anyway — a
+   * Zycoo SW15 does — are retried with credentials signed by local time, the
+   * same time the digest would use before any offset is known. That retry
+   * needs the two clocks to agree within the device's replay window.
+   */
+  private async systemDateAndTimeXml(url: string): Promise<string> {
+    const body = `<GetSystemDateAndTime xmlns="${DEV_NS}"/>`;
+    const response = await this.soapResponse(url, body, false);
+    if (response.statusCode !== 401 || (!this.user && !this.pass)) {
+      return this.unwrapSoap(response);
+    }
+    return this.unwrapSoap(await this.soapResponse(url, body, true));
+  }
+
   async getSystemDateAndTime(url: string): Promise<Date> {
-    const xml = await this.soap(url, `<GetSystemDateAndTime xmlns="${DEV_NS}"/>`, false);
+    const xml = await this.systemDateAndTimeXml(url);
     const utc = /<[^>]*UTCDateTime>([\s\S]*?)<\/[^>]*UTCDateTime>/.exec(xml);
     if (!utc) throw new Error('no UTCDateTime in response');
     const seg = utc[1];

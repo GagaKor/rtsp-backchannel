@@ -59,19 +59,40 @@ MAX_SESSION_TIMEOUT_CYCLES = 100
 
 
 # ---------- ONVIF ----------
-def soap(url, body, header=""):
+def soap_response(url, body, header=""):
+    """POST one SOAP body and return (status_code, text)."""
     env = ('<?xml version="1.0"?><s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">'
            f'<s:Header>{header}</s:Header><s:Body>{body}</s:Body></s:Envelope>')
     req = urllib.request.Request(url, data=env.encode(),
                                  headers={"Content-Type": "application/soap+xml; charset=utf-8"})
     try:
-        return urllib.request.urlopen(req, timeout=8, context=CTX).read().decode("utf-8", "replace")
+        response = urllib.request.urlopen(req, timeout=8, context=CTX)
+        status = getattr(response, "status", None) or response.getcode()
+        return status, response.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
-        return e.read().decode("utf-8", "replace")
+        return e.code, e.read().decode("utf-8", "replace")
 
 
-def dev_time(url):
-    t = soap(url, f'<GetSystemDateAndTime xmlns="{DEV}"/>')
+def soap(url, body, header=""):
+    return soap_response(url, body, header)[1]
+
+
+def dev_time(url, user="", pw=""):
+    """Read the device clock, retrying with credentials if it demands them.
+
+    ONVIF keeps GetSystemDateAndTime unauthenticated on purpose: the
+    WS-Security digest is signed with the device's own clock, so asking for
+    that clock cannot itself require it. Devices that answer 401 anyway -- a
+    Zycoo SW15 does -- are retried with credentials signed by local time, the
+    same time the digest would use before any offset is known.
+    """
+    probe = f'<GetSystemDateAndTime xmlns="{DEV}"/>'
+    status, t = soap_response(url, probe)
+    if status == 401 and (user or pw):
+        now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+        status, t = soap_response(url, probe, wsse(user, pw, now))
+    if "UTCDateTime" not in t:
+        raise RuntimeError(f"no UTCDateTime in ONVIF response (HTTP {status})")
     seg = t.split("UTCDateTime", 1)[1]
     g = lambda n: int(re.search(rf"<[^>]*{n}>(\d+)<", seg).group(1))
     return datetime.datetime(g("Year"), g("Month"), g("Day"), g("Hour"), g("Minute"), g("Second"))
@@ -88,9 +109,32 @@ def wsse(user, pw, when):
             f'</wsse:UsernameToken></wsse:Security>')
 
 
+def device_service_candidates(host):
+    """Device service URLs to try, cheapest and most common first."""
+    return [
+        f"http://{host}/onvif/device_service",
+        f"https://{host}/onvif/device_service",
+        f"http://{host}:8000/onvif/device_service",
+    ]
+
+
 def onvif_stream_uri(host, user, pw):
-    durl = f"http://{host}/onvif/device_service"
-    when = dev_time(durl)
+    # The device service is not always on port 80: a Zycoo SW15 serves ONVIF
+    # on :8000 and answers :80 with its web UI, so a single hardcoded URL
+    # leaves the speaker unreachable.
+    last_error = None
+    for durl in device_service_candidates(host):
+        try:
+            return _onvif_stream_uri_at(host, durl, user, pw)
+        except Exception as error:  # try the next candidate URL
+            last_error = error
+    raise last_error if last_error is not None else RuntimeError(
+        "no ONVIF device service responded"
+    )
+
+
+def _onvif_stream_uri_at(host, durl, user, pw):
+    when = dev_time(durl, user, pw)
 
     def security_header():
         return wsse(user, pw, when) if user or pw else ""
@@ -109,7 +153,9 @@ def onvif_stream_uri(host, user, pw):
         security_header(),
     )
     m = re.search(r'XAddr>(https?://[^<]*media[^<]*)<', cap)
-    murl = m.group(1) if m else f"http://{host}/onvif/media_service"
+    # Derive the media service from the device URL that answered, so a device
+    # service on a non-default port keeps that port here too.
+    murl = m.group(1) if m else durl.replace("device_service", "media_service")
     prof = soap(murl, f'<GetProfiles xmlns="{MED}"/>', security_header())
     tok = unescape(
         re.search(r'token="([^"]+)"', prof).group(1),
@@ -1024,15 +1070,27 @@ def open_backchannel_transport(
         result.sdp = sdp
 
         tracks = sdp_tracks(sdp)
-        send_track = next((
+        sendonly_tracks = [
             track for track in tracks
             if track.startswith("m=audio") and "a=sendonly" in track
-        ), None)
-        if send_track is None:
+        ]
+        if not sendonly_tracks:
             raise RuntimeError("sendonly audio backchannel track not found")
-        send_control = track_control(send_track)
-        if send_control is None:
+        setup_track = next(
+            (track for track in sendonly_tracks if track_control(track) is not None),
+            None,
+        )
+        if setup_track is None:
             raise RuntimeError("backchannel track has no control URI")
+        send_control = track_control(setup_track)
+        # A device may split one offer across several sendonly sections that
+        # share a control URI (a Zycoo IPS-M1-BW advertises PCMU and PCMA that
+        # way). Everything reachable through the track we set up is one offer,
+        # so keep those sections together when the codec is chosen.
+        send_track = "\r\n".join(
+            track for track in sendonly_tracks
+            if track_control(track) == send_control
+        )
         try:
             send_control_parts = urllib.parse.urlsplit(send_control)
         except ValueError as error:
@@ -1052,7 +1110,7 @@ def open_backchannel_transport(
         if transport == "tcp":
             requested_channel = 0
             for receive_track in tracks:
-                if receive_track == send_track:
+                if receive_track == setup_track:
                     continue
                 # RFC 4566 leaves an absent direction as sendrecv, so a track
                 # stays out of the session only when it says so itself.

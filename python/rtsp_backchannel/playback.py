@@ -62,18 +62,22 @@ class _CodecSelection:
 
 
 def _media_payload_types(send_track):
-    media = re.search(
+    # One backchannel offer may span several m=audio lines: a Zycoo IPS-M1-BW
+    # advertises PCMU and PCMA as two sendonly sections sharing one control
+    # URI, so reading only the first line hides the second codec entirely.
+    pattern = re.compile(
         r"^m=audio[ \t]+\d+[ \t]+\S+[ \t]+([^\r\n]+)",
-        send_track,
         re.IGNORECASE | re.MULTILINE,
     )
-    if media is None:
-        return []
-    return [
-        int(value)
-        for value in media.group(1).split()
-        if value.isdecimal() and 0 <= int(value) <= 127
-    ]
+    payload_types = []
+    for media in pattern.finditer(send_track):
+        for value in media.group(1).split():
+            if not value.isdecimal():
+                continue
+            payload_type = int(value)
+            if 0 <= payload_type <= 127 and payload_type not in payload_types:
+                payload_types.append(payload_type)
+    return payload_types
 
 
 def _rtp_mappings(send_track):
