@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-09-21
+
 ### Fixed
 
 - The backchannel codec is now chosen across every `a=sendonly` audio section
@@ -209,7 +211,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - External FFmpeg decoding for common input audio formats.
 - MIT OR Apache-2.0 dual licensing.
 
-[Unreleased]: https://github.com/GagaKor/rtsp-backchannel/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/GagaKor/rtsp-backchannel/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/GagaKor/rtsp-backchannel/releases/tag/v0.5.1
 [0.5.0]: https://github.com/GagaKor/rtsp-backchannel/releases/tag/v0.5.0
 [0.4.0]: https://github.com/GagaKor/rtsp-backchannel/releases/tag/v0.4.0
 [0.3.1]: https://github.com/GagaKor/rtsp-backchannel/releases/tag/v0.3.1
