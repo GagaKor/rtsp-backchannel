@@ -1659,3 +1659,52 @@ test('the backchannel probe finds a control URI in a later sendonly section', as
 
   assert.equal(found, true);
 });
+
+test('probes audio send before the Media2 call a device may not survive', async () => {
+  // Both Zycoo speakers drop the socket on Media2
+  // GetVideoEncoderConfigurationOptions and take their whole ONVIF service
+  // down with it for 8-13 seconds. Video encoder options are an optional
+  // detail; audio send is the capability this library exists to report, so
+  // running the optional call first left real backchannel speakers reported
+  // as "unknown" for a fault that had nothing to do with audio.
+  let onvifDown = false;
+  const calls: RecordedCapabilityCall[] = [];
+  const dependencies: CameraCapabilityDependencies = {
+    ...fakeCapabilityDependencies(
+      calls,
+      async (body, endpoint) => {
+        if (onvifDown) throw new Error('request failed');
+        if (body === GET_SERVICES) {
+          return response(
+            `<tds:GetServicesResponse>${service(MEDIA2_NS, 'http://camera/media2', 2, 0)}`
+            + '</tds:GetServicesResponse>',
+          );
+        }
+        if (body === MEDIA2_GET_PROFILES && endpoint === 'http://camera/media2') {
+          return response(
+            '<tr2:GetProfilesResponse><tr2:Profiles token="MainStream"/>'
+            + '</tr2:GetProfilesResponse>',
+          );
+        }
+        if (body === MEDIA2_GET_OPTIONS && endpoint === 'http://camera/media2') {
+          // The speaker answers this one by dying.
+          onvifDown = true;
+          throw new Error('socket hang up');
+        }
+        throw new Error('onvif call not stubbed for this fixture');
+      },
+      { connect: async () => ({ manufacturer: 'ZYCOO', model: 'SW15' }) },
+    ),
+    probeOnvifBackchannel: async () => {
+      if (onvifDown) throw new Error('request failed');
+      return true;
+    },
+    probeVigiTalk: async () => false,
+  };
+
+  const report = await getCameraCapabilitiesWithDependencies({ host: 'camera' }, dependencies);
+
+  assert.equal(report.audioSend.onvifBackchannel, true);
+  assert.equal(report.audioSend.detected, true);
+  assert.equal(report.audioSend.transport, 'onvif');
+});
