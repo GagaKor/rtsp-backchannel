@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-09-22
+
+### Fixed
+
+- A device that drops the connection mid-call no longer takes the process down
+  with an unhandled `'error'` event, in the TypeScript package. The request was
+  settled with `destroy(error)`, which re-emitted the error after the one-shot
+  `'error'` listener had already been consumed, leaving nothing to receive it.
+  Both Zycoo speakers reach that path: they answer Media2
+  `GetVideoEncoderConfigurationOptions` by dropping the socket.
+- The camera capability report probes audio send before asking for Media2
+  video encoder configuration options. Both Zycoo speakers answer that optional
+  call by dropping the socket and taking their whole ONVIF service down for
+  8-13 seconds, so the audio-send probe that ran next could not reach them and
+  `audioSend` came back entirely `null` for speakers that play audio correctly.
+  Video encoder options are an optional detail; audio send is the capability
+  this library exists to report, so the fragile call now runs last.
+
 ## [0.5.1] - 2026-09-21
 
 ### Fixed
@@ -211,7 +229,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - External FFmpeg decoding for common input audio formats.
 - MIT OR Apache-2.0 dual licensing.
 
-[Unreleased]: https://github.com/GagaKor/rtsp-backchannel/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/GagaKor/rtsp-backchannel/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/GagaKor/rtsp-backchannel/releases/tag/v0.5.2
 [0.5.1]: https://github.com/GagaKor/rtsp-backchannel/releases/tag/v0.5.1
 [0.5.0]: https://github.com/GagaKor/rtsp-backchannel/releases/tag/v0.5.0
 [0.4.0]: https://github.com/GagaKor/rtsp-backchannel/releases/tag/v0.4.0

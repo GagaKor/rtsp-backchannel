@@ -328,8 +328,14 @@ export class OnvifDevice {
         settled = true;
         if (timer) clearTimeout(timer);
         if (error) {
-          req?.destroy(error);
-          res?.destroy(error);
+          // Tear the request down without handing it the error again. When the
+          // error came from the request's own one-shot 'error' listener that
+          // listener is already gone, so destroy(error) would re-emit it with
+          // nothing left to receive it and take the process down. A device
+          // that drops the socket mid-call (both Zycoo speakers do, for Media2
+          // GetVideoEncoderConfigurationOptions) hits exactly that path.
+          req?.destroy();
+          res?.destroy();
           reject(error);
         } else {
           resolve(result ?? { statusCode: 0, xml: '' });
