@@ -1,6 +1,6 @@
 {
   "name": "rtsp-backchannel",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "type": "module",
   "description": "Discover ONVIF cameras, resolve RTSP streams, and play backchannel audio without GStreamer",
   "keywords": [
