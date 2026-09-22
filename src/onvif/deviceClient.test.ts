@@ -954,3 +954,33 @@ test('connects to a device that demands credentials for GetSystemDateAndTime', a
     );
   }
 });
+
+test('rejects instead of crashing when a device drops the connection', async () => {
+  // Both Zycoo speakers answer Media2 GetVideoEncoderConfigurationOptions by
+  // dropping the socket rather than returning a fault. Settling that request
+  // with `destroy(error)` re-emitted the error after the one-shot 'error'
+  // listener had already been consumed, so nothing was left to receive it and
+  // the whole process died on an unhandled 'error' event.
+  const server = http.createServer((request) => {
+    request.on('data', () => {});
+    request.on('end', () => request.socket.destroy());
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+  const url = `http://127.0.0.1:${address.port}/onvif/device_service`;
+
+  try {
+    await assert.rejects(
+      new OnvifDevice('camera', 'admin', 'admin', { deviceUrls: [url] })
+        .getDeviceInformation(url),
+    );
+    // Give any late socket error a turn to surface before the test ends.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  } finally {
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
+});
+

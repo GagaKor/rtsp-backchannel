@@ -983,16 +983,6 @@ export async function getCameraCapabilitiesWithDependencies(
     } catch (error) {
       warn('Media2 GetProfiles', error);
     }
-    try {
-      encodings = await call(
-        MEDIA2_GET_OPTIONS,
-        parseMedia2OptionsResponse,
-        media2Service.xaddr,
-      );
-      h265Supported = encodings.some((encoding) => encoding.toUpperCase() === 'H265');
-    } catch (error) {
-      warn('Media2 GetVideoEncoderConfigurationOptions', error);
-    }
   }
 
   profiles.sort(profileReportComparator);
@@ -1078,6 +1068,24 @@ export async function getCameraCapabilitiesWithDependencies(
     // else: onvifBackchannel === null (the probe threw) — the ONVIF fact
     // itself could not be established, so VIGI must not be attempted and
     // every audioSend field beyond onvifBackchannel stays null.
+  }
+
+  // Video encoder options are an optional detail, and some devices cannot
+  // survive being asked for them: both Zycoo speakers drop the socket on this
+  // call and take their whole ONVIF service down with it for several seconds.
+  // Asking last keeps that fault from erasing the audio-send answer, which is
+  // the capability this library exists to report.
+  if (media2Service) {
+    try {
+      encodings = await call(
+        MEDIA2_GET_OPTIONS,
+        parseMedia2OptionsResponse,
+        media2Service.xaddr,
+      );
+      h265Supported = encodings.some((encoding) => encoding.toUpperCase() === 'H265');
+    } catch (error) {
+      warn('Media2 GetVideoEncoderConfigurationOptions', error);
+    }
   }
 
   return {

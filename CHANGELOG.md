@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A device that drops the connection mid-call no longer takes the process down
+  with an unhandled `'error'` event, in the TypeScript package. The request was
+  settled with `destroy(error)`, which re-emitted the error after the one-shot
+  `'error'` listener had already been consumed, leaving nothing to receive it.
+  Both Zycoo speakers reach that path: they answer Media2
+  `GetVideoEncoderConfigurationOptions` by dropping the socket.
+- The camera capability report probes audio send before asking for Media2
+  video encoder configuration options. Both Zycoo speakers answer that optional
+  call by dropping the socket and taking their whole ONVIF service down for
+  8-13 seconds, so the audio-send probe that ran next could not reach them and
+  `audioSend` came back entirely `null` for speakers that play audio correctly.
+  Video encoder options are an optional detail; audio send is the capability
+  this library exists to report, so the fragile call now runs last.
+
+### Fixed
+
 - The backchannel codec is now chosen across every `a=sendonly` audio section
   rather than inside the first one, in all three packages. A device may split
   one offer over several `m=audio` lines instead of listing every payload type
