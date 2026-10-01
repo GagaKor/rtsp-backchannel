@@ -650,6 +650,15 @@ The first ONVIF Media Profile must expose a `sendonly` supported audio track. Au
 output and decoder configuration are camera-specific; a successful RTSP
 session does not override disabled or misrouted camera audio output settings.
 
+When ONVIF supplies the stream URI, RTSP connects to the host the camera
+advertises in `GetStreamUri`. A camera behind NAT, or one whose own network
+settings name another address, can advertise a host this machine cannot reach.
+If the TCP connection to that host fails before any RTSP response, the
+connection is retried once on the host of the ONVIF device service URL that
+answered, keeping the advertised port, path, and query. A failure after the
+camera has answered is not retried, and a direct `rtsp://` target is always
+used as given.
+
 ## Development
 
 From the repository root:
