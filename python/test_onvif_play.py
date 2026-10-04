@@ -1,4 +1,5 @@
 import base64
+import errno
 import hashlib
 import json
 import math
@@ -1643,6 +1644,169 @@ class BackchannelTransportTest(unittest.TestCase):
         )
         self.assertEqual(target[0], "rtsp://[2001:db8::10]:8554/live")
         self.assertEqual(target[2:], (8554, "operator@site", "p@ss@word"))
+
+    def _unreachable_factory(self, unreachable, created, rtsp_type=None):
+        def factory(host, port, user, password):
+            created.append((host, port, user, password))
+            if host in unreachable:
+                raise OSError(errno.EHOSTUNREACH, f"No route to host {host}:{port}")
+            return (rtsp_type or FakeRtsp)(host, port, user, password)
+        return factory
+
+    @staticmethod
+    def _advertising(uri):
+        return lambda host, user, password: (uri, "Model")
+
+    def test_retries_the_device_host_when_the_advertised_rtsp_host_is_unreachable(self):
+        created = []
+        with onvif_play.open_backchannel_transport(
+            "10.10.50.3",
+            "admin",
+            "secret",
+            onvif_uri_resolver=self._advertising("rtsp://192.168.225.20:554/stream1"),
+            rtsp_factory=self._unreachable_factory({"192.168.225.20"}, created),
+        ) as transport:
+            self.assertEqual(transport.stream_uri, "rtsp://10.10.50.3:554/stream1")
+            self.assertEqual(transport.camera_host, "10.10.50.3")
+            self.assertEqual(transport.model, "Model")
+
+        self.assertEqual(
+            created,
+            [
+                ("192.168.225.20", 554, "admin", "secret"),
+                ("10.10.50.3", 554, "admin", "secret"),
+            ],
+        )
+        client = FakeRtsp.instances[0]
+        self.assertEqual(
+            [(method, uri) for method, uri, _ in client.requests[:2]],
+            [
+                ("OPTIONS", "rtsp://10.10.50.3:554/stream1"),
+                ("DESCRIBE", "rtsp://10.10.50.3:554/stream1"),
+            ],
+        )
+
+    def test_device_host_retry_keeps_port_path_query_and_brackets_ipv6(self):
+        created = []
+        with onvif_play.open_backchannel_transport(
+            "[fd00::3]",
+            "admin",
+            "secret",
+            onvif_uri_resolver=self._advertising(
+                "rtsp://192.168.225.20:8554/live/ch1?subtype=0&unicast=true"
+            ),
+            rtsp_factory=self._unreachable_factory({"192.168.225.20"}, created),
+        ) as transport:
+            self.assertEqual(
+                transport.stream_uri,
+                "rtsp://[fd00::3]:8554/live/ch1?subtype=0&unicast=true",
+            )
+
+        self.assertEqual(
+            [(host, port) for host, port, _, _ in created],
+            [("192.168.225.20", 8554), ("fd00::3", 8554)],
+        )
+
+    def test_device_host_retry_carries_stream_uri_credentials_without_exposing_them(self):
+        created = []
+        with onvif_play.open_backchannel_transport(
+            "10.10.50.3",
+            "",
+            "",
+            onvif_uri_resolver=self._advertising(
+                "rtsp://viewer:s3cret@192.168.225.20:554/stream1"
+            ),
+            rtsp_factory=self._unreachable_factory({"192.168.225.20"}, created),
+        ) as transport:
+            self.assertEqual(transport.stream_uri, "rtsp://10.10.50.3:554/stream1")
+
+        self.assertEqual(
+            [(host, user, password) for host, _, user, password in created],
+            [
+                ("192.168.225.20", "viewer", "s3cret"),
+                ("10.10.50.3", "viewer", "s3cret"),
+            ],
+        )
+
+    def test_device_host_retry_failure_chains_the_advertised_failure(self):
+        created = []
+        with self.assertRaisesRegex(OSError, r"10\.10\.50\.3:554") as raised:
+            onvif_play.open_backchannel_transport(
+                "10.10.50.3",
+                "admin",
+                "secret",
+                onvif_uri_resolver=self._advertising("rtsp://192.168.225.20:554/stream1"),
+                rtsp_factory=self._unreachable_factory(
+                    {"192.168.225.20", "10.10.50.3"}, created
+                ),
+            )
+
+        cause = raised.exception.__cause__
+        self.assertIsInstance(cause, OSError)
+        self.assertIn("192.168.225.20:554", str(cause))
+        self.assertEqual(len(created), 2)
+
+    def test_no_retry_when_the_advertised_host_is_the_device_host(self):
+        for host, uri in (
+            ("192.168.225.20", "rtsp://192.168.225.20:554/stream1"),
+            ("cam.local", "rtsp://CAM.local.:554/stream1"),
+        ):
+            created = []
+            with self.subTest(uri=uri):
+                with self.assertRaises(OSError):
+                    onvif_play.open_backchannel_transport(
+                        host,
+                        "admin",
+                        "secret",
+                        onvif_uri_resolver=self._advertising(uri),
+                        rtsp_factory=self._unreachable_factory(
+                            {"192.168.225.20", "cam.local."}, created
+                        ),
+                    )
+                self.assertEqual(len(created), 1)
+
+    def test_no_retry_once_the_advertised_host_has_answered(self):
+        class RejectingOptionsRtsp(FakeRtsp):
+            def request(self, method, uri, headers=None):
+                if method == "OPTIONS":
+                    self.requests.append((method, uri, headers or {}))
+                    return 404, {}, ""
+                return super().request(method, uri, headers)
+
+        created = []
+        with self.assertRaisesRegex(RuntimeError, "OPTIONS failed with RTSP status 404"):
+            onvif_play.open_backchannel_transport(
+                "10.10.50.3",
+                "admin",
+                "secret",
+                onvif_uri_resolver=self._advertising("rtsp://192.168.225.20:554/stream1"),
+                rtsp_factory=self._unreachable_factory(
+                    set(), created, RejectingOptionsRtsp
+                ),
+            )
+        self.assertEqual([host for host, _, _, _ in created], ["192.168.225.20"])
+
+    def test_no_retry_for_a_caller_supplied_rtsp_target(self):
+        for host, stream_uri in (
+            ("rtsp://192.168.225.20:554/stream1", None),
+            ("10.10.50.3", "rtsp://192.168.225.20:554/stream1"),
+        ):
+            created = []
+            resolver = Mock(side_effect=AssertionError("ONVIF must not be consulted"))
+            with self.subTest(host=host):
+                with self.assertRaises(OSError):
+                    onvif_play.open_backchannel_transport(
+                        host,
+                        "admin",
+                        "secret",
+                        stream_uri=stream_uri,
+                        onvif_uri_resolver=resolver,
+                        rtsp_factory=self._unreachable_factory(
+                            {"192.168.225.20"}, created
+                        ),
+                    )
+                resolver.assert_not_called()
+                self.assertEqual([host for host, _, _, _ in created], ["192.168.225.20"])
 
     def test_udp_ipv6_is_rejected_before_rtsp_factory_side_effects(self):
         factory = Mock(side_effect=lambda host, port, user, password: FakeRtsp(

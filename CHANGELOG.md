@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A backchannel whose ONVIF stream URI names a host the client cannot reach is
+  now opened on the ONVIF device host instead of failing, in all three
+  packages. A camera behind NAT, or one whose own network settings name an
+  address other than the one it is reached at, puts that configured address in
+  `GetStreamUri`: a camera reached at `10.10.50.3` advertised
+  `rtsp://192.168.225.20:554/...`, and every ONVIF call succeeded before the
+  RTSP connect failed with `EHOSTUNREACH`. When the TCP connection to the
+  advertised host fails before any RTSP response, it is now retried once on the
+  host of the device service URL that answered, keeping the advertised port,
+  path and query. The TypeScript capability report's audio-send probe connects
+  the same way, so such a camera no longer reports `audioSend` as entirely
+  `null`. Advertised hosts that accept the connection, failures after the
+  camera has answered (authentication, `OPTIONS` or `DESCRIBE` errors) and
+  direct `rtsp://` targets behave exactly as before, and the stream URI lookup
+  (`getStreamUris`, `get_stream_uris`) still returns the URI the camera
+  advertised. If the retry fails too, its error is raised with the
+  advertised-host failure kept as its `cause` (TypeScript), `__cause__`
+  (Python), or appended to the message (Rust).
+
 ## [0.5.2] - 2026-09-22
 
 ### Fixed

@@ -152,6 +152,51 @@ pub fn rtsp_endpoint(uri: &str) -> Result<(String, u16), String> {
     Ok((host, port))
 }
 
+fn canonical_host(host: &str) -> String {
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.')
+        .to_ascii_lowercase()
+}
+
+fn on_device_host(advertised: &RtspTarget, device_host: &str) -> Option<RtspTarget> {
+    let device_host = canonical_host(device_host);
+    if device_host.is_empty() || device_host == canonical_host(&advertised.host) {
+        return None;
+    }
+    let mut uri = url::Url::parse(&advertised.uri).ok()?;
+    // Without brackets set_host cuts an IPv6 literal at its first colon.
+    let host = if device_host.contains(':') {
+        format!("[{device_host}]")
+    } else {
+        device_host.clone()
+    };
+    uri.set_host(Some(host.as_str())).ok()?;
+    let retry = parse_rtsp_target(uri.as_str(), &advertised.user, &advertised.password).ok()?;
+    (canonical_host(&retry.host) == device_host).then_some(retry)
+}
+
+pub(crate) fn connect_advertised_rtsp<T>(
+    advertised: RtspTarget,
+    device_host: Option<&str>,
+    mut connect: impl FnMut(&RtspTarget) -> Result<T, String>,
+) -> Result<(T, RtspTarget), String> {
+    let advertised_error = match connect(&advertised) {
+        Ok(client) => return Ok((client, advertised)),
+        Err(error) => error,
+    };
+    let Some(retry) = device_host.and_then(|host| on_device_host(&advertised, host)) else {
+        return Err(advertised_error);
+    };
+    match connect(&retry) {
+        Ok(client) => Ok((client, retry)),
+        Err(retry_error) => Err(format!(
+            "{retry_error} (after advertised RTSP host {} failed: {advertised_error})",
+            advertised.host
+        )),
+    }
+}
+
 pub struct BackchannelSession {
     rtsp: RtspClient,
     stream_uri: String,
@@ -178,8 +223,8 @@ impl BackchannelSession {
         password: &str,
         preference: CodecPreference,
     ) -> Result<Self, String> {
-        let target = if has_rtsp_scheme(host) {
-            parse_rtsp_target(host, user, password)?
+        let (advertised, device_host) = if has_rtsp_scheme(host) {
+            (parse_rtsp_target(host, user, password)?, None)
         } else {
             let mut device = OnvifDevice::new(host, user, password)?;
             device.connect()?;
@@ -188,15 +233,21 @@ impl BackchannelSession {
                 .into_iter()
                 .next()
                 .ok_or("ONVIF returned no media profile")?;
-            parse_rtsp_target(&device.stream_uri(&profile)?, user, password)?
+            (
+                parse_rtsp_target(&device.stream_uri(&profile)?, user, password)?,
+                Some(device.connected_device_host()?),
+            )
         };
-        let mut rtsp = RtspClient::connect(
-            &target.host,
-            target.port,
-            &target.user,
-            &target.password,
-            Duration::from_secs(8),
-        )?;
+        let (mut rtsp, target) =
+            connect_advertised_rtsp(advertised, device_host.as_deref(), |target| {
+                RtspClient::connect(
+                    &target.host,
+                    target.port,
+                    &target.user,
+                    &target.password,
+                    Duration::from_secs(8),
+                )
+            })?;
         let stream_uri = target.uri;
 
         let established = (|| {
@@ -468,6 +519,132 @@ mod tests {
             ),
             "rtsp://other/track"
         );
+    }
+
+    fn unreachable_at<'a>(
+        unreachable: &'static [&'static str],
+        attempts: &'a mut Vec<(String, u16, String, String)>,
+    ) -> impl FnMut(&super::RtspTarget) -> Result<String, String> + 'a {
+        move |target| {
+            attempts.push((
+                target.host.clone(),
+                target.port,
+                target.user.clone(),
+                target.password.clone(),
+            ));
+            if unreachable.iter().any(|host| *host == target.host) {
+                Err(format!(
+                    "RTSP connect failed: No route to host {}:{}",
+                    target.host, target.port
+                ))
+            } else {
+                Ok(target.uri.clone())
+            }
+        }
+    }
+
+    #[test]
+    fn retries_the_device_host_when_the_advertised_rtsp_host_is_unreachable() {
+        let mut attempts = Vec::new();
+        let advertised =
+            super::parse_rtsp_target("rtsp://192.168.225.20:554/stream1", "admin", "secret")
+                .unwrap();
+        let (connected, target) = super::connect_advertised_rtsp(
+            advertised,
+            Some("10.10.50.3"),
+            unreachable_at(&["192.168.225.20"], &mut attempts),
+        )
+        .unwrap();
+        assert_eq!(connected, "rtsp://10.10.50.3:554/stream1");
+        assert_eq!(target.uri, "rtsp://10.10.50.3:554/stream1");
+        assert_eq!(
+            attempts,
+            vec![
+                (
+                    "192.168.225.20".to_owned(),
+                    554,
+                    "admin".to_owned(),
+                    "secret".to_owned()
+                ),
+                (
+                    "10.10.50.3".to_owned(),
+                    554,
+                    "admin".to_owned(),
+                    "secret".to_owned()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn device_host_retry_keeps_port_path_query_brackets_ipv6_and_drops_userinfo() {
+        let mut attempts = Vec::new();
+        let advertised = super::parse_rtsp_target(
+            "rtsp://viewer:s3cret@192.168.225.20:8554/live/ch1?subtype=0&unicast=true",
+            "",
+            "",
+        )
+        .unwrap();
+        let (_, target) = super::connect_advertised_rtsp(
+            advertised,
+            Some("fd00::3"),
+            unreachable_at(&["192.168.225.20"], &mut attempts),
+        )
+        .unwrap();
+        assert_eq!(
+            target.uri,
+            "rtsp://[fd00::3]:8554/live/ch1?subtype=0&unicast=true"
+        );
+        assert_eq!(
+            attempts[1],
+            (
+                "fd00::3".to_owned(),
+                8554,
+                "viewer".to_owned(),
+                "s3cret".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn device_host_retry_failure_keeps_the_advertised_failure() {
+        let mut attempts = Vec::new();
+        let advertised =
+            super::parse_rtsp_target("rtsp://192.168.225.20:554/stream1", "admin", "secret")
+                .unwrap();
+        let error = super::connect_advertised_rtsp(
+            advertised,
+            Some("10.10.50.3"),
+            unreachable_at(&["192.168.225.20", "10.10.50.3"], &mut attempts),
+        )
+        .unwrap_err();
+        assert!(error.starts_with("RTSP connect failed: No route to host 10.10.50.3:554"));
+        assert!(error.contains("No route to host 192.168.225.20:554"));
+        assert!(!error.contains("secret"));
+        assert_eq!(attempts.len(), 2);
+    }
+
+    #[test]
+    fn does_not_retry_when_the_advertised_host_is_the_device_host_or_none_is_known() {
+        for (uri, device_host) in [
+            ("rtsp://192.168.225.20:554/stream1", Some("192.168.225.20")),
+            ("rtsp://CAM.local.:554/stream1", Some("cam.local")),
+            ("rtsp://192.168.225.20:554/stream1", None),
+        ] {
+            let mut attempts = Vec::new();
+            let advertised = super::parse_rtsp_target(uri, "admin", "secret").unwrap();
+            let error = super::connect_advertised_rtsp(
+                advertised,
+                device_host,
+                unreachable_at(
+                    &["192.168.225.20", "CAM.local.", "cam.local."],
+                    &mut attempts,
+                ),
+            )
+            .unwrap_err();
+            assert!(error.starts_with("RTSP connect failed"), "{uri}: {error}");
+            assert_eq!(attempts.len(), 1, "{uri}");
+        }
     }
 
     #[test]

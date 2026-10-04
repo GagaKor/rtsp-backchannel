@@ -991,6 +991,54 @@ def _rtsp_target(uri, user, password):
     )
 
 
+def _device_service_hostname(host):
+    try:
+        return urllib.parse.urlsplit(device_service_candidates(host)[0]).hostname
+    except ValueError:
+        return None
+
+
+def _canonical_host(host):
+    return host.removeprefix("[").removesuffix("]").rstrip(".").lower()
+
+
+def _on_device_host(target, device_host):
+    stream_uri, camera_host, _, rtsp_user, rtsp_password = target
+    if not device_host:
+        return None
+    device_host = _canonical_host(device_host)
+    if not device_host or device_host == _canonical_host(camera_host):
+        return None
+    try:
+        parsed = urllib.parse.urlsplit(stream_uri)
+        netloc = f"[{device_host}]" if ":" in device_host else device_host
+        if parsed.port is not None:
+            netloc += f":{parsed.port}"
+        retry = _rtsp_target(
+            urllib.parse.urlunsplit(
+                (parsed.scheme, netloc, parsed.path, parsed.query, "")
+            ),
+            rtsp_user,
+            rtsp_password,
+        )
+    except ValueError:
+        return None
+    return retry if _canonical_host(retry[1]) == device_host else None
+
+
+def _connect_advertised_rtsp(connect, target, device_host):
+    try:
+        return connect(target), target
+    except OSError as advertised_error:
+        retry = _on_device_host(target, device_host)
+        if retry is None:
+            raise
+        try:
+            return connect(retry), retry
+        except OSError as retry_error:
+            raise retry_error from advertised_error
+
+
 def open_backchannel_transport(
     host,
     user="",
@@ -1010,34 +1058,37 @@ def open_backchannel_transport(
     """Open and PLAY an ONVIF backchannel, returning a closable RTP transport."""
     if transport not in {"tcp", "udp"}:
         raise ValueError(f"unsupported backchannel transport: {transport}")
+    device_host = None
     if stream_uri is None and urllib.parse.urlsplit(host).scheme.lower() == "rtsp":
         stream_uri = host
         model = None
     elif stream_uri is None:
         resolver = onvif_uri_resolver or onvif_stream_uri
         stream_uri, model = resolver(host, user, password)
+        device_host = _device_service_hostname(host)
     else:
         model = None
 
-    (
-        stream_uri,
-        camera_host,
-        camera_port,
-        rtsp_user,
-        rtsp_password,
-    ) = _rtsp_target(stream_uri, user, password)
-    if transport == "udp":
-        try:
-            is_ipv6 = ipaddress.ip_address(camera_host).version == 6
-        except ValueError:
-            is_ipv6 = ":" in camera_host
-        if is_ipv6:
-            raise ValueError("IPv6 UDP backchannel is not supported")
-    rtsp = (rtsp_factory or Rtsp)(
-        camera_host,
-        camera_port,
-        rtsp_user,
-        rtsp_password,
+    def connect(target):
+        _, target_host, target_port, target_user, target_password = target
+        if transport == "udp":
+            try:
+                is_ipv6 = ipaddress.ip_address(target_host).version == 6
+            except ValueError:
+                is_ipv6 = ":" in target_host
+            if is_ipv6:
+                raise ValueError("IPv6 UDP backchannel is not supported")
+        return (rtsp_factory or Rtsp)(
+            target_host,
+            target_port,
+            target_user,
+            target_password,
+        )
+
+    rtsp, (stream_uri, camera_host, *_) = _connect_advertised_rtsp(
+        connect,
+        _rtsp_target(stream_uri, user, password),
+        device_host,
     )
     result = BackchannelTransport(
         stream_uri,

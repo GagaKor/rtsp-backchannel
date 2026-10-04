@@ -299,6 +299,57 @@ export function parseRtspTarget(
   };
 }
 
+function canonicalHost(host: string): string {
+  return host.replace(/^\[(.*)\]$/, '$1').replace(/\.$/, '').toLowerCase();
+}
+
+function onDeviceHost(
+  advertised: ParsedRtspTarget,
+  deviceServiceUrl: string,
+): ParsedRtspTarget | undefined {
+  try {
+    const deviceHost = canonicalHost(new URL(deviceServiceUrl).hostname);
+    if (!deviceHost || deviceHost === canonicalHost(advertised.host)) return undefined;
+    const url = new URL(advertised.uri);
+    // Without brackets the setter silently keeps the old host for an IPv6 literal.
+    url.hostname = deviceHost.includes(':') ? `[${deviceHost}]` : deviceHost;
+    const retry = parseRtspTarget(url.toString(), advertised.user, advertised.pass);
+    return canonicalHost(retry.host) === deviceHost ? retry : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** @internal Retries the device host only when connect() failed, never after a response. */
+export async function connectAdvertisedRtsp<
+  T extends { connect(): Promise<void>; close(): void },
+>(
+  advertised: ParsedRtspTarget,
+  deviceServiceUrl: string,
+  createRtsp: (endpoint: ParsedRtspTarget) => T,
+): Promise<{ rtsp: T; endpoint: ParsedRtspTarget }> {
+  const first = createRtsp(advertised);
+  let advertisedError: unknown;
+  try {
+    await first.connect();
+    return { rtsp: first, endpoint: advertised };
+  } catch (error) {
+    first.close();
+    advertisedError = error;
+  }
+  const retryEndpoint = onDeviceHost(advertised, deviceServiceUrl);
+  if (!retryEndpoint) throw advertisedError;
+  const retry = createRtsp(retryEndpoint);
+  try {
+    await retry.connect();
+    return { rtsp: retry, endpoint: retryEndpoint };
+  } catch (error) {
+    retry.close();
+    if (error instanceof Error && error.cause === undefined) error.cause = advertisedError;
+    throw error;
+  }
+}
+
 export function resolveTrackUri(
   baseUri: string,
   contentBase: string | undefined,
@@ -320,26 +371,64 @@ export function resolveTrackUri(
   }
 }
 
-export async function openOnvifBackchannel(
+/** @internal The ONVIF calls `openOnvifBackchannel` makes on a device. */
+export interface OnvifBackchannelDevice {
+  connect(): Promise<unknown>;
+  getProfiles(): Promise<{ token: string }[]>;
+  getStreamUri(profileToken: string): Promise<string>;
+  connectedDeviceUrl(): string;
+}
+
+/** @internal Exported for tests; the ONVIF device and the RTSP client are injected. */
+export interface OnvifBackchannelDependencies {
+  createDevice(host: string, user: string, pass: string): OnvifBackchannelDevice;
+  createRtsp(host: string, port: number, user: string, pass: string): RtspClient;
+}
+
+const defaultOnvifBackchannelDependencies: OnvifBackchannelDependencies = {
+  createDevice: (host, user, pass) => new OnvifDevice(host, user, pass),
+  createRtsp: (host, port, user, pass) => new RtspClient(host, port, user, pass),
+};
+
+export function openOnvifBackchannel(
   host: string,
   user = '',
   pass = '',
   options: BackchannelOptions = {},
 ): Promise<BackchannelSession> {
+  return openOnvifBackchannelWithDependencies(
+    host, user, pass, options, defaultOnvifBackchannelDependencies,
+  );
+}
+
+/** @internal Exported for tests; see OnvifBackchannelDependencies. */
+export async function openOnvifBackchannelWithDependencies(
+  host: string,
+  user: string,
+  pass: string,
+  options: BackchannelOptions,
+  dependencies: OnvifBackchannelDependencies,
+): Promise<BackchannelSession> {
+  const createRtsp = (target: ParsedRtspTarget) =>
+    dependencies.createRtsp(target.host, target.port, target.user, target.pass);
   let endpoint: ParsedRtspTarget;
+  let rtsp: RtspClient;
   if (/^rtsp:\/\//i.test(host)) {
     endpoint = parseRtspTarget(host, user, pass);
+    rtsp = createRtsp(endpoint);
+    await rtsp.connect();
   } else {
-    const dev = new OnvifDevice(host, user, pass);
+    const dev = dependencies.createDevice(host, user, pass);
     await dev.connect();
     const profiles = await dev.getProfiles();
     if (profiles.length === 0) throw new Error('no media profiles');
-    endpoint = parseRtspTarget(await dev.getStreamUri(profiles[0].token), user, pass);
+    const advertised = parseRtspTarget(await dev.getStreamUri(profiles[0].token), user, pass);
+    ({ rtsp, endpoint } = await connectAdvertisedRtsp(
+      advertised, dev.connectedDeviceUrl(), createRtsp,
+    ));
   }
 
   const { uri: streamUri } = endpoint;
-  const rtsp = new RtspClient(endpoint.host, endpoint.port, endpoint.user, endpoint.pass);
-  await rtsp.connect();
 
   try {
     const optionsResponse = await rtsp.options(streamUri);

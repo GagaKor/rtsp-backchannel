@@ -393,6 +393,19 @@ impl OnvifDevice {
             .ok_or_else(|| "call ONVIF connect() first".to_owned())
     }
 
+    pub(crate) fn connected_device_host(&self) -> Result<String, String> {
+        let device_url = url::Url::parse(self.require_device_url()?)
+            .map_err(|_| "invalid ONVIF device service URL".to_owned())?;
+        device_url
+            .host_str()
+            .map(|host| {
+                host.trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .to_owned()
+            })
+            .ok_or_else(|| "ONVIF device service URL has no host".to_owned())
+    }
+
     /// Read the device clock, retrying with credentials if it demands them.
     ///
     /// ONVIF keeps GetSystemDateAndTime unauthenticated on purpose: the
@@ -858,7 +871,9 @@ mod tests {
 
         let mut device =
             OnvifDevice::with_device_urls("camera", "admin", "pass", vec![device_url]).unwrap();
+        assert!(device.connected_device_host().is_err());
         device.connect().unwrap();
+        assert_eq!(device.connected_device_host().unwrap(), "127.0.0.1");
         assert_eq!(device.profile_tokens().unwrap(), ["main", "sub"]);
         assert_eq!(device.stream_uri("main").unwrap(), "rtsp://127.0.0.1/live");
         server.join().unwrap();
