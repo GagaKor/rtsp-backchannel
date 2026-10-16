@@ -14,7 +14,7 @@ import {
   textOf,
   type XmlElement,
 } from './xml.ts';
-import { parseRtspTarget } from '../backchannel.ts';
+import { connectAdvertisedRtsp, parseRtspTarget } from '../backchannel.ts';
 import { RtspClient } from '../rtsp/backchannelClient.ts';
 import { findBackchannelAudioTracks, parseSdp } from '../rtsp/sdp.ts';
 import { openVigiControl } from '../vigi/control.ts';
@@ -657,6 +657,7 @@ export interface BackchannelProbeDevice {
   connect(): Promise<unknown>;
   getProfiles(): Promise<{ token: string }[]>;
   getStreamUri(profileToken: string): Promise<string>;
+  connectedDeviceUrl(): string;
 }
 
 /** @internal The RTSP calls the backchannel probe makes. */
@@ -714,12 +715,15 @@ export async function probeOnvifBackchannelWithDependencies(
   await device.connect();
   const profiles = await device.getProfiles();
   if (profiles.length === 0) throw new Error('no media profiles');
-  const endpoint = parseRtspTarget(await device.getStreamUri(profiles[0].token), user, pass);
-  const rtsp = dependencies.createRtsp(
-    endpoint.host, endpoint.port, endpoint.user, endpoint.pass, options.timeoutMs,
+  const advertised = parseRtspTarget(await device.getStreamUri(profiles[0].token), user, pass);
+  const { rtsp, endpoint } = await connectAdvertisedRtsp(
+    advertised,
+    device.connectedDeviceUrl(),
+    (target) => dependencies.createRtsp(
+      target.host, target.port, target.user, target.pass, options.timeoutMs,
+    ),
   );
   try {
-    await rtsp.connect();
     const desc = await rtsp.describe(endpoint.uri, { backchannel: true });
     if (desc.status !== 200) throw new Error(`backchannel DESCRIBE ${desc.statusLine}`);
     // The control URI may sit on any sendonly section, not just the first.

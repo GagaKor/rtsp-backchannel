@@ -7,6 +7,7 @@ import {
   selectBackchannelTransport,
 } from './backchannel.ts';
 import { RtpPacketizer } from './rtp/sender.ts';
+import { RtspClient } from './rtsp/backchannelClient.ts';
 import { createVigiTalkSessionWithDependencies, type VigiTalkSocket } from './vigi/talk.ts';
 
 interface TestClock {
@@ -1089,4 +1090,239 @@ test('reaches a PCMA offer that the device puts in a second sendonly section', a
   }
 
   assert.deepEqual(setupUris, [`${base}/stream=0`, `${base}/stream=1`]);
+});
+
+interface FakeRtspServer {
+  port: number;
+  requests: Array<{ method: string; uri: string }>;
+  close(): Promise<void>;
+}
+
+async function startFakeRtspServer(
+  options: { optionsStatus?: string; sendonly?: boolean } = {},
+): Promise<FakeRtspServer> {
+  const requests: Array<{ method: string; uri: string }> = [];
+  const server = net.createServer((socket) => {
+    let input = Buffer.alloc(0);
+    socket.on('data', (chunk) => {
+      input = Buffer.concat([input, Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)]);
+      while (true) {
+        const end = input.indexOf('\r\n\r\n');
+        if (end < 0) return;
+        const request = input.subarray(0, end).toString('utf8');
+        input = input.subarray(end + 4);
+        const [requestLine, ...headerLines] = request.split('\r\n');
+        const [method, uri] = requestLine.split(' ');
+        requests.push({ method, uri });
+        const cseq = headerLines
+          .find((line) => line.toLowerCase().startsWith('cseq:'))
+          ?.slice('cseq:'.length)
+          .trim();
+        if (method === 'OPTIONS' && options.optionsStatus) {
+          socket.write(`RTSP/1.0 ${options.optionsStatus}\r\nCSeq: ${cseq}\r\nContent-Length: 0\r\n\r\n`);
+        } else if (method === 'DESCRIBE') {
+          const body = [
+            'v=0',
+            'o=- 0 0 IN IP4 192.168.225.20',
+            't=0 0',
+            'm=video 0 RTP/AVP 96',
+            'a=rtpmap:96 H264/90000',
+            'a=control:video',
+            'a=recvonly',
+            'm=audio 0 RTP/AVP 8',
+            'a=rtpmap:8 PCMA/8000',
+            'a=control:audioback',
+            (options.sendonly ?? true) ? 'a=sendonly' : 'a=recvonly',
+            '',
+          ].join('\r\n');
+          socket.write(
+            `RTSP/1.0 200 OK\r\nCSeq: ${cseq}\r\nContent-Type: application/sdp\r\n` +
+              `Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`,
+          );
+        } else if (method === 'SETUP') {
+          const interleaved = headerLines
+            .find((line) => line.toLowerCase().startsWith('transport:'))
+            ?.match(/interleaved=(\d+-\d+)/)?.[1] ?? '0-1';
+          socket.write(
+            `RTSP/1.0 200 OK\r\nCSeq: ${cseq}\r\nSession: nat-session;timeout=60\r\n` +
+              `Transport: RTP/AVP/TCP;unicast;interleaved=${interleaved}\r\n` +
+              'Content-Length: 0\r\n\r\n',
+          );
+        } else {
+          socket.write(`RTSP/1.0 200 OK\r\nCSeq: ${cseq}\r\nContent-Length: 0\r\n\r\n`);
+        }
+      }
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+  return {
+    port: address.port,
+    requests,
+    close: () => new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve()))),
+  };
+}
+
+function hostUnreachable(host: string, port: number): Error {
+  return Object.assign(new Error(`connect EHOSTUNREACH ${host}:${port}`), {
+    code: 'EHOSTUNREACH', syscall: 'connect', address: host, port,
+  });
+}
+
+interface OnvifBackchannelHarness {
+  dependencies: backchannel.OnvifBackchannelDependencies;
+  devices: string[];
+  rtsp: Array<{ host: string; port: number; user: string; pass: string }>;
+}
+
+function onvifBackchannelHarness(
+  device: { url: string; streamUri: string },
+  reachable: Record<string, FakeRtspServer>,
+): OnvifBackchannelHarness {
+  const devices: string[] = [];
+  const rtsp: OnvifBackchannelHarness['rtsp'] = [];
+  return {
+    devices,
+    rtsp,
+    dependencies: {
+      createDevice: (host) => {
+        devices.push(host);
+        return {
+          connect: async () => ({}),
+          getProfiles: async () => [{ token: 'MainStream' }],
+          getStreamUri: async () => device.streamUri,
+          connectedDeviceUrl: () => device.url,
+        };
+      },
+      createRtsp: (host, port, user, pass) => {
+        rtsp.push({ host, port, user, pass });
+        const server = reachable[host];
+        const client = new RtspClient(server ? '127.0.0.1' : host, server?.port ?? port, user, pass);
+        if (!server) client.connect = () => Promise.reject(hostUnreachable(host, port));
+        return client;
+      },
+    },
+  };
+}
+
+test('reopens the backchannel on the ONVIF device host when the advertised RTSP host is unreachable', async () => {
+  const server = await startFakeRtspServer();
+  const harness = onvifBackchannelHarness(
+    { url: 'http://10.10.50.3/onvif/device_service', streamUri: 'rtsp://192.168.225.20:554/stream1' },
+    { '10.10.50.3': server },
+  );
+  try {
+    const session = await backchannel.openOnvifBackchannelWithDependencies(
+      '10.10.50.3', 'admin', 'secret', {}, harness.dependencies,
+    );
+    try {
+      assert.equal(session.codec.name, 'pcma');
+    } finally {
+      await session.close();
+    }
+  } finally {
+    await server.close();
+  }
+
+  assert.deepEqual(harness.rtsp, [
+    { host: '192.168.225.20', port: 554, user: 'admin', pass: 'secret' },
+    { host: '10.10.50.3', port: 554, user: 'admin', pass: 'secret' },
+  ]);
+  assert.deepEqual(
+    server.requests.filter(({ method }) => method !== 'SETUP').map(({ method, uri }) => `${method} ${uri}`),
+    [
+      'OPTIONS rtsp://10.10.50.3:554/stream1',
+      'DESCRIBE rtsp://10.10.50.3:554/stream1',
+      'PLAY rtsp://10.10.50.3:554/stream1',
+      'TEARDOWN rtsp://10.10.50.3:554/stream1',
+    ],
+  );
+});
+
+test('a retried ONVIF session without a sendonly track still reports the VIGI fallback condition', async () => {
+  const server = await startFakeRtspServer({ sendonly: false });
+  const harness = onvifBackchannelHarness(
+    { url: 'http://10.10.50.3/onvif/device_service', streamUri: 'rtsp://192.168.225.20:554/stream1' },
+    { '10.10.50.3': server },
+  );
+  try {
+    await assert.rejects(
+      backchannel.openOnvifBackchannelWithDependencies(
+        '10.10.50.3', 'admin', 'secret', {}, harness.dependencies,
+      ),
+      BackchannelUnavailableError,
+    );
+  } finally {
+    await server.close();
+  }
+  assert.equal(harness.rtsp.length, 2);
+});
+
+test('the device-host retry failure keeps the advertised-host failure as its cause', async () => {
+  const harness = onvifBackchannelHarness(
+    { url: 'http://10.10.50.3/onvif/device_service', streamUri: 'rtsp://192.168.225.20:554/stream1' },
+    {},
+  );
+  const error = await backchannel.openOnvifBackchannelWithDependencies(
+    '10.10.50.3', 'admin', 'secret', {}, harness.dependencies,
+  ).then(
+    () => assert.fail('the session should not have opened'),
+    (caught: unknown) => caught,
+  );
+
+  assert.ok(error instanceof Error);
+  assert.match(error.message, /EHOSTUNREACH 10\.10\.50\.3:554/);
+  assert.ok(error.cause instanceof Error);
+  assert.match(error.cause.message, /EHOSTUNREACH 192\.168\.225\.20:554/);
+  assert.equal(harness.rtsp.length, 2);
+});
+
+test('does not retry the backchannel when the advertised host is the device host', async () => {
+  const harness = onvifBackchannelHarness(
+    { url: 'http://192.168.225.20/onvif/device_service', streamUri: 'rtsp://192.168.225.20:554/stream1' },
+    {},
+  );
+  await assert.rejects(
+    backchannel.openOnvifBackchannelWithDependencies(
+      '192.168.225.20', 'admin', 'secret', {}, harness.dependencies,
+    ),
+    /EHOSTUNREACH 192\.168\.225\.20:554/,
+  );
+  assert.equal(harness.rtsp.length, 1);
+});
+
+test('does not retry the backchannel once the advertised host has answered', async () => {
+  const server = await startFakeRtspServer({ optionsStatus: '404 Not Found' });
+  const harness = onvifBackchannelHarness(
+    { url: 'http://10.10.50.3/onvif/device_service', streamUri: 'rtsp://192.168.225.20:554/stream1' },
+    { '192.168.225.20': server },
+  );
+  try {
+    await assert.rejects(
+      backchannel.openOnvifBackchannelWithDependencies(
+        '10.10.50.3', 'admin', 'secret', {}, harness.dependencies,
+      ),
+      /OPTIONS RTSP\/1\.0 404 Not Found/,
+    );
+  } finally {
+    await server.close();
+  }
+  assert.deepEqual(harness.rtsp.map(({ host }) => host), ['192.168.225.20']);
+});
+
+test('a direct rtsp:// target neither consults ONVIF nor retries another host', async () => {
+  const harness = onvifBackchannelHarness(
+    { url: 'http://10.10.50.3/onvif/device_service', streamUri: 'rtsp://10.10.50.3:554/stream1' },
+    {},
+  );
+  await assert.rejects(
+    backchannel.openOnvifBackchannelWithDependencies(
+      'rtsp://192.168.225.20:554/stream1', 'admin', 'secret', {}, harness.dependencies,
+    ),
+    /EHOSTUNREACH 192\.168\.225\.20:554/,
+  );
+  assert.deepEqual(harness.devices, []);
+  assert.deepEqual(harness.rtsp.map(({ host }) => host), ['192.168.225.20']);
 });

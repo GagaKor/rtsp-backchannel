@@ -469,6 +469,11 @@ export class OnvifDevice {
   }
 
   /** @internal */
+  connectedDeviceUrl(): string {
+    return this.requireDeviceUrl();
+  }
+
+  /** @internal */
   serviceCall(body: string, endpoint?: string): Promise<OnvifRawResponse> {
     const deviceUrl = this.requireDeviceUrl();
     return this.soapResponse(endpoint ?? deviceUrl, body, true);

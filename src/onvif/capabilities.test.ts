@@ -1517,7 +1517,8 @@ function probeHarness(
     profiles?: () => Promise<{ token: string }[]>;
     streamUri?: string;
     describe?: BackchannelProbeRtsp['describe'];
-    rtspConnect?: () => Promise<void>;
+    rtspConnect?: (host: string, port: number) => Promise<void>;
+    deviceUrl?: string;
   } = {},
 ): BackchannelProbeDependencies {
   return {
@@ -1530,12 +1531,14 @@ function probeHarness(
           calls.streamUriTokens.push(token);
           return overrides.streamUri ?? 'rtsp://cam:554/stream1';
         },
+        connectedDeviceUrl: () => overrides.deviceUrl ?? `http://${host}/onvif/device_service`,
       };
     },
     createRtsp: (host, port, user, pass, timeoutMs) => {
       calls.rtsp.push({ host, port, user, pass, ...(timeoutMs !== undefined ? { timeoutMs } : {}) });
+      const rtspConnect = overrides.rtspConnect;
       return {
-        connect: overrides.rtspConnect ?? (async () => {}),
+        connect: rtspConnect ? () => rtspConnect(host, port) : (async () => {}),
         describe: overrides.describe
           ?? (async (uri) => {
             calls.described.push(uri);
@@ -1658,6 +1661,152 @@ test('the backchannel probe finds a control URI in a later sendonly section', as
   );
 
   assert.equal(found, true);
+});
+
+function hostUnreachable(host: string, port: number): Error {
+  return Object.assign(new Error(`connect EHOSTUNREACH ${host}:${port}`), {
+    code: 'EHOSTUNREACH', syscall: 'connect', address: host, port,
+  });
+}
+
+function unreachableAt(unreachable: string[]): (host: string, port: number) => Promise<void> {
+  return async (host, port) => {
+    if (unreachable.includes(host)) throw hostUnreachable(host, port);
+  };
+}
+
+test('the backchannel probe retries the device host when the advertised RTSP host is unreachable', async () => {
+  const calls = emptyCalls();
+  const found = await probeOnvifBackchannelWithDependencies(
+    '10.10.50.3', 'admin', 'secret', { timeoutMs: 4000 },
+    probeHarness(calls, {
+      streamUri: 'rtsp://192.168.225.20:554/stream1',
+      rtspConnect: unreachableAt(['192.168.225.20']),
+    }),
+  );
+
+  assert.equal(found, true);
+  assert.deepEqual(calls.rtsp, [
+    { host: '192.168.225.20', port: 554, user: 'admin', pass: 'secret', timeoutMs: 4000 },
+    { host: '10.10.50.3', port: 554, user: 'admin', pass: 'secret', timeoutMs: 4000 },
+  ]);
+  assert.deepEqual(calls.described, ['rtsp://10.10.50.3:554/stream1']);
+  assert.equal(calls.closes, 2, 'the failed advertised client is closed as well');
+});
+
+test('the backchannel probe retries the host of the device URL that answered, not the constructor host', async () => {
+  const calls = emptyCalls();
+  await probeOnvifBackchannelWithDependencies(
+    'camera.local', '', '', {},
+    probeHarness(calls, {
+      deviceUrl: 'http://10.10.50.3:8000/onvif/device_service',
+      streamUri: 'rtsp://192.168.225.20:554/stream1',
+      rtspConnect: unreachableAt(['192.168.225.20']),
+    }),
+  );
+
+  assert.deepEqual(calls.rtsp.map(({ host, port }) => `${host}:${port}`), [
+    '192.168.225.20:554',
+    '10.10.50.3:554',
+  ]);
+});
+
+test('the backchannel probe keeps port, path and query and brackets an IPv6 device host', async () => {
+  const calls = emptyCalls();
+  await probeOnvifBackchannelWithDependencies(
+    'fd00::3', 'admin', 'secret', {},
+    probeHarness(calls, {
+      deviceUrl: 'http://[fd00::3]/onvif/device_service',
+      streamUri: 'rtsp://192.168.225.20:8554/live/ch1?subtype=0&unicast=true',
+      rtspConnect: unreachableAt(['192.168.225.20']),
+    }),
+  );
+
+  assert.deepEqual(calls.rtsp.map(({ host, port }) => `${host}|${port}`), [
+    '192.168.225.20|8554',
+    'fd00::3|8554',
+  ]);
+  assert.deepEqual(calls.described, [
+    'rtsp://[fd00::3]:8554/live/ch1?subtype=0&unicast=true',
+  ]);
+});
+
+test('the backchannel probe carries stream URI credentials to the retry without exposing them', async () => {
+  const calls = emptyCalls();
+  await probeOnvifBackchannelWithDependencies(
+    '10.10.50.3', '', '', {},
+    probeHarness(calls, {
+      streamUri: 'rtsp://viewer:s3cret@192.168.225.20:554/stream1',
+      rtspConnect: unreachableAt(['192.168.225.20']),
+    }),
+  );
+
+  assert.deepEqual(calls.rtsp.map(({ host, user, pass }) => [host, user, pass]), [
+    ['192.168.225.20', 'viewer', 's3cret'],
+    ['10.10.50.3', 'viewer', 's3cret'],
+  ]);
+  assert.deepEqual(calls.described, ['rtsp://10.10.50.3:554/stream1']);
+});
+
+test('the backchannel probe surfaces the device-host failure with the advertised one as its cause', async () => {
+  const calls = emptyCalls();
+  const error = await probeOnvifBackchannelWithDependencies(
+    '10.10.50.3', 'admin', 'secret', {},
+    probeHarness(calls, {
+      streamUri: 'rtsp://192.168.225.20:554/stream1',
+      rtspConnect: unreachableAt(['192.168.225.20', '10.10.50.3']),
+    }),
+  ).then(
+    () => assert.fail('the probe should have failed'),
+    (caught: unknown) => caught,
+  );
+
+  assert.ok(error instanceof Error);
+  assert.match(error.message, /EHOSTUNREACH 10\.10\.50\.3:554/);
+  assert.ok(error.cause instanceof Error);
+  assert.match(error.cause.message, /EHOSTUNREACH 192\.168\.225\.20:554/);
+  assert.equal(calls.rtsp.length, 2);
+  assert.equal(calls.closes, 2);
+});
+
+test('the backchannel probe does not retry when the advertised host is the device host', async () => {
+  for (const [deviceUrl, streamUri] of [
+    ['http://192.168.225.20/onvif/device_service', 'rtsp://192.168.225.20:554/stream1'],
+    ['http://cam.local/onvif/device_service', 'rtsp://CAM.local.:554/stream1'],
+  ]) {
+    const calls = emptyCalls();
+    await assert.rejects(
+      probeOnvifBackchannelWithDependencies(
+        'camera', 'admin', 'secret', {},
+        probeHarness(calls, {
+          deviceUrl,
+          streamUri,
+          rtspConnect: async (host, port) => { throw hostUnreachable(host, port); },
+        }),
+      ),
+      /EHOSTUNREACH/,
+    );
+    assert.equal(calls.rtsp.length, 1, `${streamUri} is the device host`);
+    assert.equal(calls.closes, 1);
+  }
+});
+
+test('the backchannel probe does not retry once the advertised host has answered', async () => {
+  const calls = emptyCalls();
+  await assert.rejects(
+    probeOnvifBackchannelWithDependencies(
+      '10.10.50.3', 'admin', 'secret', {},
+      probeHarness(calls, {
+        streamUri: 'rtsp://192.168.225.20:554/stream1',
+        describe: async () => ({
+          status: 401, statusLine: 'RTSP/1.0 401 Unauthorized', body: '',
+        }),
+      }),
+    ),
+    /backchannel DESCRIBE RTSP\/1\.0 401 Unauthorized/,
+  );
+  assert.deepEqual(calls.rtsp.map(({ host }) => host), ['192.168.225.20']);
+  assert.equal(calls.closes, 1);
 });
 
 test('probes audio send before the Media2 call a device may not survive', async () => {
