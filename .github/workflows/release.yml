@@ -645,7 +645,7 @@ jobs:
 
       - name: Authenticate with crates.io
         id: crates-auth
-        uses: rust-lang/crates-io-auth-action@v1.0.5
+        uses: rust-lang/crates-io-auth-action@v1.0.6
 
       - name: Publish to crates.io
         run: cargo +1.86.0 publish --manifest-path rust/Cargo.toml --locked
